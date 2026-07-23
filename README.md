@@ -43,21 +43,6 @@ Pi extensions live in [`extensions`](extensions):
 - [`translate.ts`](extensions/translate.ts) - `/translate` live speech-to-speech translation via `gpt-realtime-translate`.
 - [`uv.ts`](extensions/uv.ts) - Replaces bash with a `uv`-aware version.
 
-## Local Models (gpt-oss)
-
-Pi supports OpenAI's open-weight `gpt-oss` models through the llama.cpp router
-(`brew install llama.cpp`). Start the router, then download/load and select the
-model from inside pi:
-
-```bash
-llama-server --models-dir ~/models --no-models-autoload --jinja \
-  --host 127.0.0.1 --port 8080 -ngl 999 -c 32768
-```
-
-In pi: `/login llama.cpp` (default URL `http://127.0.0.1:8080`), then `/llama`
-→ *Download model…* → search `gpt-oss-20b` (GGUF), load it, and pick it with
-`/model`. `gpt-oss-120b` works the same on machines with enough memory.
-
 ## Theme
 
 - [`nightowl.json`](themes/nightowl.json) - Night Owl-inspired theme.
