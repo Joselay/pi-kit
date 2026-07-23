@@ -1,0 +1,22 @@
+# Credentials and secrets
+auth.json
+
+# Runtime and generated state
+sessions/
+models-store.json
+trust.json
+fast.json
+dictate.json
+recall.json*
+pi-debug.log
+__pycache__/
+
+# Downloaded tools and packages
+bin/
+git/
+npm/
+
+# OS/editor files
+.DS_Store
+*.swp
+*~
