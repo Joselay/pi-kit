@@ -5,12 +5,15 @@
 // user/assistant messages of every session under ~/.pi/agent/sessions and
 // searches them by meaning, not keywords.
 //
-//   /recall <query>    search past sessions and post the top matches
-//   /recall reindex    force a full rebuild of the index
+//   /recall <query>       search past sessions and post the top matches
+//   /recall reindex       force a full rebuild of the index
+//   /recall large|small   switch embedding tier (persisted; small = mini model)
 //
 // The index lives at ~/.pi/agent/recall-index.json (vectors stored as base64
 // Float32Array at 512 dimensions to keep it small) and refreshes incrementally
-// by file mtime on each search. OAuth only — no API-key fallback.
+// by file mtime on each search. The embedding tier (text-embedding-3-large by
+// default, text-embedding-3-small as the mini) is a persisted, in-product
+// choice — no env var required. OAuth only — no API-key fallback.
 
 import { existsSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -24,9 +27,42 @@ import {
 const PROVIDER_ID = "openai-codex";
 const EMBEDDINGS_URL =
 	process.env.PI_RECALL_ENDPOINT?.trim() || "https://api.openai.com/v1/embeddings";
-const MODEL = process.env.PI_RECALL_MODEL?.trim() || "text-embedding-3-large";
+
+const CONFIG_PATH = join(getAgentDir(), "recall-config.json");
+/**
+ * Embedding tier is a first-class, persisted choice (not just an env var) so the
+ * mini model is discoverable via `/recall small`:
+ *   - large: text-embedding-3-large (best quality; default)
+ *   - small: text-embedding-3-small (cheaper/faster indexing)
+ * Both support 512-dim shortened vectors. PI_RECALL_MODEL still overrides for
+ * power users. Switching tiers changes the stored index.model, so the next
+ * search transparently rebuilds the index.
+ */
+const MODEL_TIERS: Record<string, string> = {
+	large: "text-embedding-3-large",
+	small: "text-embedding-3-small",
+};
+const DEFAULT_MODEL = MODEL_TIERS.large!;
 /** text-embedding-3 supports shortened vectors; 512 dims keeps the index small. */
 const DIMENSIONS = 512;
+
+function readModel(): string {
+	const override = process.env.PI_RECALL_MODEL?.trim();
+	if (override) return override;
+	try {
+		const cfg = JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as { model?: string };
+		if (typeof cfg.model === "string" && cfg.model) return cfg.model;
+	} catch {}
+	return DEFAULT_MODEL;
+}
+
+function writeModel(model: string): void {
+	const temporaryPath = `${CONFIG_PATH}.${process.pid}.tmp`;
+	writeFileSync(temporaryPath, JSON.stringify({ model }, null, 2), { mode: 0o600 });
+	renameSync(temporaryPath, CONFIG_PATH);
+}
+
+let activeModel = readModel();
 
 const SESSIONS_DIR = join(getAgentDir(), "sessions");
 const INDEX_PATH = join(getAgentDir(), "recall-index.json");
@@ -99,7 +135,7 @@ async function embed(
 	const response = await fetch(EMBEDDINGS_URL, {
 		method: "POST",
 		headers,
-		body: JSON.stringify({ model: MODEL, input: inputs, dimensions: DIMENSIONS }),
+		body: JSON.stringify({ model: activeModel, input: inputs, dimensions: DIMENSIONS }),
 	});
 	if (!response.ok) {
 		const body = clip(await response.text(), 300);
@@ -189,11 +225,11 @@ function listSessionFiles(): string[] {
 function loadIndex(): RecallIndex {
 	try {
 		const index = JSON.parse(readFileSync(INDEX_PATH, "utf8")) as RecallIndex;
-		if (index.version === INDEX_VERSION && index.model === MODEL && index.dimensions === DIMENSIONS) {
+		if (index.version === INDEX_VERSION && index.model === activeModel && index.dimensions === DIMENSIONS) {
 			return index;
 		}
 	} catch {}
-	return { version: INDEX_VERSION, model: MODEL, dimensions: DIMENSIONS, files: {} };
+	return { version: INDEX_VERSION, model: activeModel, dimensions: DIMENSIONS, files: {} };
 }
 
 function saveIndex(index: RecallIndex): void {
@@ -293,13 +329,46 @@ export default function semanticRecall(pi: ExtensionAPI) {
 	let busy = false;
 
 	pi.registerCommand("recall", {
-		description: "Semantic search over past sessions (text-embedding-3-large)",
+		description: "Semantic search over past sessions (text-embedding-3-large / -small)",
 		handler: async (args, ctx: ExtensionCommandContext) => {
 			const query = args.trim();
+			activeModel = readModel();
 			if (!query) {
-				ctx.ui.notify("Usage: /recall <query> (or /recall reindex)", "info");
+				ctx.ui.notify(
+					`Usage: /recall <query> | /recall reindex | /recall large|small (current: ${activeModel})`,
+					"info",
+				);
 				return;
 			}
+
+			// First-class embedding-tier toggle so the mini model is discoverable.
+			const lower = query.toLowerCase();
+			let tierArg: string | undefined;
+			if (lower === "large" || lower === "small") tierArg = lower;
+			else if (lower === "model") tierArg = "show";
+			else if (lower.startsWith("model ")) tierArg = query.slice(6).trim();
+			if (tierArg !== undefined) {
+				if (tierArg === "" || tierArg === "show") {
+					ctx.ui.notify(
+						`Recall embedding model: ${activeModel}. Switch with /recall large or /recall small`,
+						"info",
+					);
+					return;
+				}
+				const resolved = MODEL_TIERS[tierArg.toLowerCase()] ?? tierArg;
+				if (resolved === activeModel) {
+					ctx.ui.notify(`Recall already using ${resolved}`, "info");
+					return;
+				}
+				writeModel(resolved);
+				activeModel = resolved;
+				ctx.ui.notify(
+					`Recall embedding model set to ${resolved}; next search rebuilds the index`,
+					"info",
+				);
+				return;
+			}
+
 			if (busy) {
 				ctx.ui.notify("Recall is already running", "warning");
 				return;
@@ -311,7 +380,7 @@ export default function semanticRecall(pi: ExtensionAPI) {
 			try {
 				const auth = await resolveOAuth();
 				const index = query.toLowerCase() === "reindex"
-					? { version: INDEX_VERSION, model: MODEL, dimensions: DIMENSIONS, files: {} }
+					? { version: INDEX_VERSION, model: activeModel, dimensions: DIMENSIONS, files: {} }
 					: loadIndex();
 
 				status("◉ recall: indexing…");
