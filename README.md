@@ -15,22 +15,25 @@ Skills live in [`skills`](skills):
 - [`transcribe`](skills/transcribe) - Transcribe audio and video with cached MLX Whisper models.
 - [`uv`](skills/uv) - Prefer `uv` for Python workflows.
 - [`web-search`](skills/web-search) - Search the live web for current facts.
+- [`youtube`](skills/youtube) - Summarize and answer questions about YouTube videos from their captions.
 
 ## Extensions
 
 Pi extensions live in [`extensions`](extensions):
 
+- [`account.ts`](extensions/account.ts) - `/account` Codex plan, real rate-limit windows, credits, and profile stats.
 - [`answer.ts`](extensions/answer.ts) - `/answer` interactive Q&A from the last assistant message.
 - [`autoreview.ts`](extensions/autoreview.ts) - `/autoreview` one-shot diff review by the `codex-auto-review` model (no agent turn).
 - [`btw.ts`](extensions/btw.ts) - Side-chat popover for tangential questions.
 - [`continue.ts`](extensions/continue.ts) - Shortcut to send `continue` when the agent stops.
-- [`cosmetic.ts`](extensions/cosmetic.ts) - All UI chrome: random image header, custom footer (model, context, Codex usage), whimsical working messages, and the completion sound.
+- [`cosmetic.ts`](extensions/cosmetic.ts) - All UI chrome: random image header, custom footer (model, context, Codex plan and usage), whimsical working messages, and the completion sound.
 - [`dictate.ts`](extensions/dictate.ts) - `/dictate` push-to-talk voice input via `gpt-realtime-whisper`.
 - [`fast.ts`](extensions/fast.ts) - `/fast` for Codex priority mode.
 - [`files.ts`](extensions/files.ts) - `/files` browser for Git and session-referenced files.
 - [`dupe.ts`](extensions/dupe.ts) - Duplicate the current session into a new Ghostty split.
 - [`emoji.ts`](extensions/emoji.ts) - `:shortcode:` autocomplete and `/emoji` picker.
 - [`goal.ts`](extensions/goal.ts) - Long-running goals with budgets and progress tracking.
+- [`models.ts`](extensions/models.ts) - `/models` live Codex model catalog with per-model capability flags.
 - [`recall.ts`](extensions/recall.ts) - Project-scoped prompt history.
 - [`reset.ts`](extensions/reset.ts) - `/reset` for Codex usage-limit resets.
 - [`review.ts`](extensions/review.ts) - `/review` workflow for code changes and folders.

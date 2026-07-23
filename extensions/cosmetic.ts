@@ -107,10 +107,49 @@ const footerColors = {
 	codexWeekly: "#F38BA8", // Catppuccin red
 	codexSpark: "#A6E3A1", // Catppuccin green (same as normal Codex usage)
 	codexSparkWeekly: "#EBA0AC", // Catppuccin maroon
+	codexPlan: "#B4BEFE", // Catppuccin lavender
 } as const;
 
 const CODEX_SPARK_MODEL_ID = "gpt-5.3-codex-spark";
 const CODEX_USAGE_CHANGED_EVENT = "codex:usage-changed";
+
+/**
+ * Plan tier comes free with the OAuth token: the ChatGPT access token is a JWT
+ * carrying `chatgpt_plan_type` under the OpenAI auth claim, so the footer can
+ * show the tier without spending a request on /wham/usage.
+ */
+const CODEX_PLAN_LABELS: Record<string, string> = {
+	free: "free",
+	go: "go",
+	plus: "plus",
+	pro: "pro",
+	prolite: "pro lite",
+	team: "team",
+	business: "business",
+	enterprise: "enterprise",
+	hc: "enterprise",
+	edu: "edu",
+	education: "edu",
+	free_workspace: "free ws",
+	self_serve_business_usage_based: "business",
+	enterprise_cbp_usage_based: "enterprise",
+};
+
+function codexPlanFromAccessToken(access: string): string | undefined {
+	try {
+		const payloadPart = access.split(".")[1];
+		if (!payloadPart) return undefined;
+		const payload = JSON.parse(Buffer.from(payloadPart, "base64url").toString("utf8")) as unknown;
+		if (typeof payload !== "object" || payload === null) return undefined;
+		const claim = (payload as Record<string, unknown>)["https://api.openai.com/auth"];
+		if (typeof claim !== "object" || claim === null) return undefined;
+		const plan = (claim as Record<string, unknown>).chatgpt_plan_type;
+		if (typeof plan !== "string" || !plan) return undefined;
+		return CODEX_PLAN_LABELS[plan.toLowerCase()] ?? plan.toLowerCase();
+	} catch {
+		return undefined;
+	}
+}
 
 type Model = ExtensionContext["model"];
 type CodexBucket = { usedPercent?: number; resetsAt?: number | null; windowDurationMins?: number | null };
@@ -391,6 +430,27 @@ export default function (pi: ExtensionAPI) {
 	let codexCountdownTimer: NodeJS.Timeout | undefined;
 	let codexRestartTimer: NodeJS.Timeout | undefined;
 	let codexRestartDelayMs = 1_000;
+	let codexPlan: string | undefined;
+	let codexPlanRequested = false;
+
+	// Resolved once per session: the tier only changes on re-login, and the
+	// footer must stay synchronous.
+	function loadCodexPlan(ctx: ExtensionContext) {
+		if (codexPlanRequested) return;
+		codexPlanRequested = true;
+		void (async () => {
+			try {
+				const access = await ctx.modelRegistry.getApiKeyForProvider("openai-codex");
+				const plan = access ? codexPlanFromAccessToken(access) : undefined;
+				if (plan && plan !== codexPlan) {
+					codexPlan = plan;
+					requestFooterRender?.();
+				}
+			} catch {
+				// Not logged into Codex, or credentials can't refresh: no plan segment.
+			}
+		})();
+	}
 
 	function updateCodexCountdownTimer() {
 		// Tick once a minute only while a reset countdown is on screen.
@@ -464,6 +524,7 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setFooter((tui, theme, footerData) => {
 			requestFooterRender = () => tui.requestRender();
 			refreshCodexUsageClient();
+			loadCodexPlan(ctx);
 			const unsubscribeBranch = footerData.onBranchChange(requestFooterRender);
 
 			const dim = (text: string) => theme.fg("dim", text);
@@ -525,13 +586,12 @@ export default function (pi: ExtensionAPI) {
 
 			function codexSegment(model: Model | undefined): string {
 				const groups = visibleCodexUsageGroups(codexUsage, model);
-				if (groups.length === 0) return "";
-				return (
-					separator() +
-					groups
-						.map((group) => group.parts.map((part) => fg(part.color, formatCodexUsagePart(part))).join(separator()))
-						.join(separator())
-				);
+				const planText = isCodexModel(model) && codexPlan ? fg(footerColors.codexPlan, codexPlan) : "";
+				if (groups.length === 0) return planText ? separator() + planText : "";
+				const usageText = groups
+					.map((group) => group.parts.map((part) => fg(part.color, formatCodexUsagePart(part))).join(separator()))
+					.join(separator());
+				return separator() + (planText ? planText + separator() : "") + usageText;
 			}
 
 			function statusLine(extensionStatuses: ReadonlyMap<string, string>, width: number): string | undefined {
