@@ -12,6 +12,7 @@ Skills live in [`skills`](skills):
 - [`google-workspace`](skills/google-workspace) - Read and edit Google Docs and Sheets.
 - [`imagegen`](skills/imagegen) - Generate and edit raster images.
 - [`librarian`](skills/librarian) - Cache and refresh GitHub repositories.
+- [`realtime-voice`](skills/realtime-voice) - Live spoken voice conversation via the OpenAI Realtime API over OAuth.
 - [`transcribe`](skills/transcribe) - Transcribe audio and video with cached MLX Whisper models.
 - [`uv`](skills/uv) - Prefer `uv` for Python workflows.
 - [`web-search`](skills/web-search) - Search the live web for current facts.
@@ -37,6 +38,7 @@ Pi extensions live in [`extensions`](extensions):
 - [`todos.ts`](extensions/todos.ts) - File-based todo management and task refinement.
 - [`unified-edit.ts`](extensions/unified-edit.ts) - Replaces `edit` with row edit scripts and Codex-style patches.
 - [`usage.ts`](extensions/usage.ts) - Session usage and cost breakdown.
+- [`voice.ts`](extensions/voice.ts) - `/voice` live voice conversation driving the agent (Codex-style realtime intermediary over OAuth).
 - [`uv.ts`](extensions/uv.ts) - Replaces bash with a `uv`-aware version.
 - [`whimsical.ts`](extensions/whimsical.ts) - Random working messages.
 
@@ -48,5 +50,6 @@ Pi extensions live in [`extensions`](extensions):
 
 - [`analyze-edits.py`](analyze-edits.py) - `uv run analyze-edits.py` for edit-tool usage and failure stats from session logs.
 - [`shims`](shims) - Python command shims used by the uv extension.
+- [`voice`](voice) - Swift echo-cancellation audio helper for the voice extension (compiled on demand).
 - [`images`](images) - Header artwork.
 - [`sounds`](sounds) - Completion notification sound.
