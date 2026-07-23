@@ -38,10 +38,20 @@ const AUTH_HINT = "run /login if this persists";
 const REALTIME_URL =
 	process.env.PI_DICTATE_ENDPOINT?.trim() || "wss://api.openai.com/v1/realtime?intent=transcription";
 // gpt-realtime-whisper emits transcript deltas as you speak; the gpt-4o-*-transcribe
-// models only produce text once the turn is committed.
-const MODEL = process.env.PI_DICTATE_MODEL?.trim() || "gpt-realtime-whisper";
+// models only produce text once the turn is committed. Streaming mode uses the
+// former; batch mode uses the mini transcriber (codex's choice) and best mode the
+// full gpt-4o-transcribe for maximum accuracy.
+const MODEL_OVERRIDE = process.env.PI_DICTATE_MODEL?.trim();
+const STREAMING_MODEL = "gpt-realtime-whisper";
+const BATCH_MODEL = "gpt-4o-mini-transcribe";
+const BEST_MODEL = "gpt-4o-transcribe";
 const LANGUAGE = process.env.PI_DICTATE_LANGUAGE?.trim() || "en";
 const DELAY = process.env.PI_DICTATE_DELAY?.trim() || "low";
+// Non-streaming modes transcribe the whole utterance on commit, so their
+// finalize wait scales far past the streaming tail.
+const BATCH_FINALIZE_TIMEOUT_MS = 60 * 1000;
+
+type DictateMode = "streaming" | "batch" | "best";
 
 const RECORDING_FRAMES = ["▁▁▂▃▂▁▁", "▁▂▃▅▃▂▁", "▂▃▅▇▅▃▂", "▃▅▇█▇▅▃", "▂▃▅▇▅▃▂", "▁▂▃▅▃▂▁"];
 const TRANSCRIBING_FRAMES = ["·  ", "·· ", "···"];
@@ -198,7 +208,13 @@ type LiveSession = {
  * `gpt-realtime-whisper` streams natively and does not support VAD, so end-of-turn is
  * driven by an explicit commit on key release.
  */
-async function openLiveTranscription(onDelta: (delta: string) => void): Promise<LiveSession> {
+async function openLiveTranscription(mode: DictateMode, onDelta: (delta: string) => void): Promise<LiveSession> {
+	const model =
+		MODEL_OVERRIDE || (mode === "batch" ? BATCH_MODEL : mode === "best" ? BEST_MODEL : STREAMING_MODEL);
+	// `delay` only exists on the streaming whisper models; the batch models reject it.
+	const transcription: Record<string, string> = { model, language: LANGUAGE };
+	if (model.includes("whisper")) transcription.delay = DELAY;
+	const finalizeTimeoutMs = mode === "streaming" ? FINALIZE_TIMEOUT_MS : BATCH_FINALIZE_TIMEOUT_MS;
 	const { token, accountId } = await credentials();
 	const headers: Record<string, string> = {
 		Authorization: `Bearer ${token}`,
@@ -251,7 +267,7 @@ async function openLiveTranscription(onDelta: (delta: string) => void): Promise<
 					audio: {
 						input: {
 							format: { type: "audio/pcm", rate: SAMPLE_RATE },
-							transcription: { model: MODEL, language: LANGUAGE, delay: DELAY },
+							transcription,
 							noise_reduction: { type: "near_field" },
 							turn_detection: null,
 						},
@@ -263,13 +279,26 @@ async function openLiveTranscription(onDelta: (delta: string) => void): Promise<
 
 	ws.addEventListener("error", () => fail(new Error(`could not reach the realtime API (${AUTH_HINT})`)));
 
-	ws.addEventListener("close", () => {
+	ws.addEventListener("close", (event: { code?: number; reason?: string }) => {
+		// A close after `session.updated` is a normal end of stream; before it, the
+		// server rejected the session (bad token, model, ...) and would otherwise
+		// surface as a bogus "no speech detected".
+		if (!ready && !done) {
+			const reason = event.reason?.trim();
+			fail(new Error(`realtime connection closed${reason ? ` (${reason})` : ""}; ${AUTH_HINT}`));
+		}
 		done = true;
 		settle?.();
 	});
 
 	ws.addEventListener("message", (event: { data: string }) => {
-		let message: { type?: string; delta?: string; transcript?: string; error?: { message?: string } };
+		let message: {
+			type?: string;
+			delta?: string;
+			transcript?: string;
+			message?: string;
+			error?: { message?: string };
+		};
 		try {
 			message = JSON.parse(event.data);
 		} catch {
@@ -292,7 +321,9 @@ async function openLiveTranscription(onDelta: (delta: string) => void): Promise<
 				break;
 			case "conversation.item.input_audio_transcription.failed":
 			case "error":
-				fail(new Error(message.error?.message ?? "realtime transcription failed"));
+				// Same fallback chain as codex's parse_error_event: error.message, then
+				// the top-level message field.
+				fail(new Error(message.error?.message ?? message.message ?? "realtime transcription failed"));
 				break;
 		}
 	});
@@ -314,7 +345,7 @@ async function openLiveTranscription(onDelta: (delta: string) => void): Promise<
 				send({ type: "input_audio_buffer.commit" });
 				await new Promise<void>((resolve) => {
 					settle = resolve;
-					finishTimer.set(FINALIZE_TIMEOUT_MS, resolve);
+					finishTimer.set(finalizeTimeoutMs, resolve);
 					if (failure || done) resolve();
 				});
 				settle = undefined;
@@ -327,16 +358,22 @@ async function openLiveTranscription(onDelta: (delta: string) => void): Promise<
 	};
 }
 
-function readEnabled(): boolean {
+type PersistedState = { enabled: boolean; mode: DictateMode };
+
+function readState(): PersistedState {
 	try {
-		return JSON.parse(readFileSync(STATE_PATH, "utf8")).enabled === true;
+		const raw = JSON.parse(readFileSync(STATE_PATH, "utf8"));
+		return {
+			enabled: raw.enabled === true,
+			mode: raw.mode === "batch" || raw.mode === "best" ? raw.mode : "streaming",
+		};
 	} catch {
-		return false;
+		return { enabled: false, mode: "streaming" };
 	}
 }
 
-function writeEnabled(enabled: boolean): void {
-	writeFileSync(STATE_PATH, `${JSON.stringify({ enabled }, null, 2)}\n`, "utf8");
+function writeState(state: PersistedState): void {
+	writeFileSync(STATE_PATH, `${JSON.stringify(state, null, 2)}\n`, "utf8");
 }
 
 class DictationEditor extends CustomEditor {
@@ -470,7 +507,7 @@ class DictationEditor extends CustomEditor {
 const SUPPORTED = process.platform === "darwin";
 
 export default function dictate(pi: ExtensionAPI) {
-	let enabled = readEnabled();
+	let { enabled, mode } = readState();
 	let currentEditor: DictationEditor | undefined;
 	let ctx: ExtensionContext | undefined;
 	let generation = 0;
@@ -541,9 +578,10 @@ export default function dictate(pi: ExtensionAPI) {
 
 				child.stdout?.on("data", (chunk: Buffer) => {
 					item.bytes += chunk.length;
-					// Before the hold is confirmed there is no session yet, so hold the
-					// audio back rather than losing the first words.
-					if (item.session) item.session.push(chunk);
+					// The mic may be rolling for a hold that turns out to be a
+					// passthrough space, so nothing goes to the API before the hold is
+					// confirmed even when the session is already open.
+					if (item.armed && item.session) item.session.push(chunk);
 					else item.buffered.push(chunk);
 				});
 				child.stderr?.on("data", (chunk) => (item.stderr = tail(item.stderr, chunk)));
@@ -561,6 +599,32 @@ export default function dictate(pi: ExtensionAPI) {
 					return;
 				}
 				recording = item;
+
+				// Connect the transcription session during the hold delay instead of
+				// after it, so the OAuth resolve + TLS + session.updated round trip
+				// (several hundred ms) overlaps the hold instead of delaying the
+				// first deltas. Audio stays buffered until the hold is confirmed.
+				let atStart = true;
+				const sessionPending = (async () => {
+					// No `recording` check in the delta handler: transcription runs
+					// ~1.4s behind speech, so for a short hold every delta lands after
+					// release has already cleared `recording`.
+					const session = await openLiveTranscription(mode, (delta) => {
+						if (token !== generation || !item.armed) return;
+						editor.insertTranscription(delta, atStart);
+						atStart = false;
+						item.transcribed = true;
+					});
+					if (token !== generation) {
+						session.cancel();
+						return;
+					}
+					item.session = session;
+					if (item.armed) for (const chunk of item.buffered.splice(0)) session.push(chunk);
+				})();
+				item.sessionPending = sessionPending;
+				// Failures surface when arm()/stop() await the session, not here.
+				sessionPending.catch(() => {});
 			} catch (error) {
 				editor.setDictationState("idle");
 				if (token === generation) notify(`Could not start dictation: ${errorText(error)}`, "error");
@@ -585,33 +649,18 @@ export default function dictate(pi: ExtensionAPI) {
 		editor.setDictationState("recording");
 
 		const token = generation;
-		let atStart = true;
-		// Opening the session is async (OAuth resolve), so publish the in-flight
-		// promise: a quick release must wait for it rather than drop the utterance.
-		const pending = (async () => {
-			// No `recording` check here: transcription runs ~1.4s behind speech, so for a
-			// short hold every delta lands after release has already cleared `recording`.
-			const session = await openLiveTranscription((delta) => {
-				if (token !== generation) return;
-				editor.insertTranscription(delta, atStart);
-				atStart = false;
-				item.transcribed = true;
-			});
-			if (token !== generation) {
-				session.cancel();
-				return;
-			}
-			item.session = session;
-			for (const chunk of item.buffered.splice(0)) session.push(chunk);
-		})();
-		item.sessionPending = pending;
 		try {
-			await pending;
+			// Usually already resolved: the session started connecting at prespawn.
+			await item.sessionPending;
 		} catch (error) {
 			notify(`Dictation failed: ${errorText(error)}`, "error");
 			void discard();
 			return;
 		}
+		if (token !== generation) return;
+		// Release the audio that was held back while the hold was unconfirmed. If
+		// the session opened after arming, its own open path already flushed.
+		if (item.session) for (const chunk of item.buffered.splice(0)) item.session.push(chunk);
 
 		maxTimer.set(MAX_RECORDING_MS, () => {
 			notify("Dictation stopped at 5-minute limit", "warning");
@@ -798,15 +847,46 @@ export default function dictate(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("dictate", {
-		description: "Toggle dictation, or explicitly turn it on/off",
+		description: "Toggle dictation on/off, or pick streaming/batch/best transcription",
 		handler: async (args, context) => {
 			if (!SUPPORTED) {
 				context.ui.notify("Dictation requires macOS", "warning");
 				return;
 			}
 			const action = args.trim().toLowerCase();
+
+			const nextMode: DictateMode | undefined =
+				action === "streaming" || action === "stream"
+					? "streaming"
+					: action === "batch" || action === "non-streaming" || action === "nonstreaming"
+						? "batch"
+						: action === "best" || action === "quality" || action === "4o"
+							? "best"
+							: undefined;
+			if (nextMode) {
+				if (nextMode === mode) {
+					context.ui.notify(`Dictation already in ${mode} mode`, "info");
+					return;
+				}
+				mode = nextMode;
+				try {
+					writeState({ enabled, mode });
+				} catch (error) {
+					context.ui.notify(`Dictation mode changed but was not saved: ${errorText(error)}`, "warning");
+				}
+				context.ui.notify(
+					mode === "streaming"
+						? "Dictation mode: streaming (text appears as you speak)"
+						: mode === "batch"
+							? "Dictation mode: batch (mini model, text after release)"
+							: "Dictation mode: best (gpt-4o-transcribe, text after release)",
+					"info",
+				);
+				return;
+			}
+
 			if (action && action !== "on" && action !== "off") {
-				context.ui.notify("Use /dictate, /dictate on, or /dictate off", "warning");
+				context.ui.notify("Use /dictate, /dictate on|off, or /dictate streaming|batch|best", "warning");
 				return;
 			}
 
@@ -817,7 +897,7 @@ export default function dictate(pi: ExtensionAPI) {
 			}
 			enabled = nextEnabled;
 			try {
-				writeEnabled(enabled);
+				writeState({ enabled, mode });
 			} catch (error) {
 				context.ui.notify(`Dictation changed but state was not saved: ${errorText(error)}`, "warning");
 			}

@@ -30,9 +30,14 @@ const PROVIDER_ID = "openai-codex";
 const REALTIME_URL = "wss://api.openai.com/v1/realtime";
 // Newest realtime model (July 2026); upstream Codex still pins gpt-realtime-1.5.
 // Verified to accept the ChatGPT OAuth bearer on the public GA endpoint.
+// 2.1 is the reasoning-and-tools line; 1.5 remains OpenAI's best pure voice
+// model for audio in/out, selectable with `/talk voice` (and is what upstream
+// Codex runs with these same tools).
 const DEFAULT_MODEL = "gpt-realtime-2.1";
 // Cheaper/faster variant, selectable with `/talk mini`.
 const DEFAULT_MINI_MODEL = "gpt-realtime-2.1-mini";
+// Best audio quality, selectable with `/talk voice`.
+const DEFAULT_VOICE_MODEL = "gpt-realtime-1.5";
 const DEFAULT_VOICE = "marin";
 // Newest streaming speech-to-text model; upstream Codex still pins
 // gpt-4o-mini-transcribe (methods_v2.rs REALTIME_V2_INPUT_TRANSCRIPTION_MODEL).
@@ -60,6 +65,7 @@ const AEC_BINARY = join(TALK_DIR, "talk-audio");
 
 const MODEL = process.env.PI_TALK_MODEL?.trim() || DEFAULT_MODEL;
 const MINI_MODEL = process.env.PI_TALK_MINI_MODEL?.trim() || DEFAULT_MINI_MODEL;
+const VOICE_MODEL = process.env.PI_TALK_VOICE_MODEL?.trim() || DEFAULT_VOICE_MODEL;
 const VOICE = process.env.PI_TALK_VOICE?.trim() || DEFAULT_VOICE;
 const AUDIO_DEVICE = process.env.PI_TALK_DEVICE?.trim() || "0";
 const DISABLE_AEC = process.env.PI_TALK_NO_AEC === "1";
@@ -1046,12 +1052,16 @@ export default function talk(pi: ExtensionAPI) {
 				return;
 			}
 			const action = args.trim().toLowerCase();
-			if (action && !["on", "off", "mini", "fast"].includes(action)) {
-				ctx.ui.notify("Use /talk, /talk on, /talk off, or /talk mini (cheaper/faster model)", "warning");
+			if (action && !["on", "off", "mini", "fast", "voice", "1.5", "audio"].includes(action)) {
+				ctx.ui.notify(
+					"Use /talk, /talk on|off, /talk mini (cheaper/faster), or /talk voice (best audio, gpt-realtime-1.5)",
+					"warning",
+				);
 				return;
 			}
 			const mini = action === "mini" || action === "fast";
-			const turnOn = action === "on" || mini ? true : action === "off" ? false : !active;
+			const voice = action === "voice" || action === "1.5" || action === "audio";
+			const turnOn = action === "on" || mini || voice ? true : action === "off" ? false : !active;
 
 			if (!turnOn) {
 				if (!active) {
@@ -1067,7 +1077,7 @@ export default function talk(pi: ExtensionAPI) {
 				return;
 			}
 
-			const session = new TalkSession(pi, ctx, mini ? MINI_MODEL : MODEL, () => {
+			const session = new TalkSession(pi, ctx, voice ? VOICE_MODEL : mini ? MINI_MODEL : MODEL, () => {
 				if (active === session) {
 					active = undefined;
 					session.clearWidget();

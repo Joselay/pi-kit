@@ -1,12 +1,12 @@
 ---
 name: transcribe
-description: "Transcribe audio/video locally with cached MLX Whisper models. Use when the user wants a recording or Voice Memo transcribed, or mentions bad/low-quality audio."
+description: "Transcribe audio/video locally with cached MLX Whisper models, or with speaker labels via cloud diarization. Use when the user wants a recording or Voice Memo transcribed, needs to know who said what, or mentions bad/low-quality audio."
 ---
 
 ## Core rules
 
 1. **Stage inputs first.** Voice Memo share-sheet paths under `~/Library/Containers/com.apple.VoiceMemos/Data/tmp/…` can vanish at any moment. The script stages a copy in `/private/tmp/audio-transcription-inputs/` before anything else; if you must probe the file before running it, copy it there yourself first.
-2. **Transcribe locally.** MLX Whisper via `uvx --from mlx-whisper mlx_whisper`, models cached in `~/.cache/huggingface/hub/` — never a cloud API.
+2. **Transcribe locally.** MLX Whisper via `uvx --from mlx-whisper mlx_whisper`, models cached in `~/.cache/huggingface/hub/` — never a cloud API. The one exception is speaker diarization (below), which local Whisper cannot do: only when the user wants speaker labels, use `./diarize-audio.py`, which uploads the audio to OpenAI on the codex subscription.
 3. **Force the language when known.** Get it from the user or the conversation; a filename is not evidence of language.
 4. **Deliver a cleaned transcript.** Remove hallucination loops, lightly punctuate and paragraph, and mark uncertain spans `[unclear]` rather than inventing words.
 
@@ -34,6 +34,16 @@ Variants:
 ```
 
 If the script is unsuitable, read `run_whisper()` in `transcribe-audio.py` for the exact `mlx_whisper` invocation; every run also records the command it used in `command.txt` next to the outputs.
+
+## Speaker diarization (cloud)
+
+When the user needs to know **who said what** (meetings, interviews, multi-speaker memos):
+
+```bash
+./diarize-audio.py "/path/to/meeting.m4a" --language en
+```
+
+Uses `gpt-4o-transcribe-diarize` through the codex OAuth subscription (no API key). The script stages the input, transcodes to 16 kHz mono opus (fits ~2.5 h under the 25 MB upload cap), and writes `diarized.json`, `transcript.txt` (turns labelled `Speaker A/B/…` with timestamps), and `transcript.srt` to `/private/tmp/audio-transcriptions/<name>-diarized-<timestamp>/`. The audio leaves the machine — do not use it for plain transcription, and say so in your reply when you use it. If the token is expired the script says so; a running pi session refreshes it.
 
 ## Models
 
