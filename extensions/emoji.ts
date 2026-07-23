@@ -28,24 +28,46 @@ type EmojiEntry = {
 	keywords: string[];
 };
 
-let cachedEntries: EmojiEntry[] | null = null;
+type Match = { entry: EmojiEntry; code: string };
 
+let cachedEntries: EmojiEntry[] | null = null;
+let cachedItems: SelectItem[] | null = null;
+let loadError: string | null = null;
+
+/** Never throws: a broken dataset must not take down the autocomplete chain. */
 const loadEntries = (): EmojiEntry[] => {
 	if (!cachedEntries) {
-		cachedEntries = JSON.parse(readFileSync(DATA_URL, "utf8")) as EmojiEntry[];
+		try {
+			cachedEntries = JSON.parse(readFileSync(DATA_URL, "utf8")) as EmojiEntry[];
+			loadError = null;
+		} catch (error) {
+			cachedEntries = [];
+			loadError = error instanceof Error ? error.message : String(error);
+		}
 	}
 	return cachedEntries;
 };
 
-const matchShortcodes = (query: string): { entry: EmojiEntry; code: string }[] => {
-	const entries = loadEntries();
-	const prefixMatches: { entry: EmojiEntry; code: string }[] = [];
-	const otherMatches: { entry: EmojiEntry; code: string }[] = [];
+const loadItems = (): SelectItem[] => {
+	if (!cachedItems) {
+		cachedItems = loadEntries().map((entry) => ({
+			value: entry.emoji,
+			label: `${entry.emoji}  :${entry.codes[0]}:`,
+			description: entry.keywords.slice(0, 5).join(", "),
+		}));
+	}
+	return cachedItems;
+};
 
-	for (const entry of entries) {
+const matchShortcodes = (query: string): Match[] => {
+	const prefixMatches: Match[] = [];
+	const otherMatches: Match[] = [];
+
+	for (const entry of loadEntries()) {
 		const prefixCode = entry.codes.find((code) => code.startsWith(query));
 		if (prefixCode) {
 			prefixMatches.push({ entry, code: prefixCode });
+			if (prefixMatches.length >= MAX_SUGGESTIONS) break;
 			continue;
 		}
 		const looseCode = entry.codes.find((code) => code.includes(query));
@@ -58,12 +80,14 @@ const matchShortcodes = (query: string): { entry: EmojiEntry; code: string }[] =
 		}
 	}
 
-	prefixMatches.sort((a, b) => a.code.localeCompare(b.code));
+	const byCode = (a: Match, b: Match) => a.code.localeCompare(b.code);
+	prefixMatches.sort(byCode);
+	otherMatches.sort(byCode);
 	return [...prefixMatches, ...otherMatches].slice(0, MAX_SUGGESTIONS);
 };
 
 const insertIntoPrompt = (ctx: ExtensionContext, emoji: string): void => {
-	ctx.ui.setEditorText(`${ctx.ui.getEditorText()}${emoji}`);
+	ctx.ui.pasteToEditor(emoji);
 };
 
 const registerAutocomplete = (ctx: ExtensionContext): void => {
@@ -71,7 +95,7 @@ const registerAutocomplete = (ctx: ExtensionContext): void => {
 		triggerCharacters: [":"],
 		async getSuggestions(lines, cursorLine, cursorCol, options) {
 			const beforeCursor = (lines[cursorLine] ?? "").slice(0, cursorCol);
-			const match = beforeCursor.match(/(?:^|[\s([{])(:([a-z0-9_+-]{2,}))$/);
+			const match = beforeCursor.match(/(?:^|[\s([{])(:([A-Za-z0-9_+-]{2,}))$/);
 			if (!match) {
 				return current.getSuggestions(lines, cursorLine, cursorCol, options);
 			}
@@ -106,11 +130,11 @@ const showEmojiPicker = async (ctx: ExtensionContext, initialQuery: string): Pro
 		return;
 	}
 
-	const items: SelectItem[] = loadEntries().map((entry) => ({
-		value: entry.emoji,
-		label: `${entry.emoji}  :${entry.codes[0]}:`,
-		description: entry.keywords.slice(0, 5).join(", "),
-	}));
+	const items = loadItems();
+	if (items.length === 0) {
+		ctx.ui.notify(`Could not load emoji data: ${loadError ?? "dataset is empty"}`, "error");
+		return;
+	}
 
 	const selection = await ctx.ui.custom<string | null>((tui, theme, keybindings, done) => {
 		const container = new Container();
@@ -206,7 +230,7 @@ export default function (pi: ExtensionAPI): void {
 	pi.registerCommand("emoji", {
 		description: "Pick an emoji and insert it into the prompt",
 		handler: async (args, ctx) => {
-			await showEmojiPicker(ctx, args.trim());
+			await showEmojiPicker(ctx, args.trim().replace(/^:+|:+$/g, ""));
 		},
 	});
 }
