@@ -36,6 +36,9 @@ const BTW_SYSTEM_PROMPT = [
 
 /** Terminal rows/cols left free around the overlay (all four sides). */
 const BTW_OVERLAY_MARGIN = 1;
+const BTW_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const BTW_SPINNER_INTERVAL_MS = 80;
+
 /** Overlay size as a fraction of the terminal. Kept in sync with the frame drawn in render(). */
 const BTW_OVERLAY_WIDTH_PCT = 62;
 const BTW_OVERLAY_HEIGHT_PCT = 85;
@@ -136,6 +139,30 @@ function extractEventAssistantText(message: unknown): string {
 		.trim();
 }
 
+/** Reasoning text the model actually emitted, if the provider streams thinking parts. */
+function extractEventThinkingText(message: unknown): string {
+	if (!message || typeof message !== "object") {
+		return "";
+	}
+
+	const maybeMessage = message as { role?: unknown; content?: unknown };
+	if (maybeMessage.role !== "assistant" || !Array.isArray(maybeMessage.content)) {
+		return "";
+	}
+
+	return maybeMessage.content
+		.filter((part): part is { type: "thinking"; thinking: string } => {
+			if (!part || typeof part !== "object") {
+				return false;
+			}
+			const candidate = part as { type?: unknown; thinking?: unknown };
+			return candidate.type === "thinking" && typeof candidate.thinking === "string";
+		})
+		.map((part) => part.thinking)
+		.join("\n")
+		.trim();
+}
+
 function getLastAssistantMessage(session: AgentSession): AssistantMessage | null {
 	for (let i = session.state.messages.length - 1; i >= 0; i--) {
 		const message = session.state.messages[i];
@@ -208,7 +235,6 @@ class BtwOverlay extends Container implements Focusable {
 	private readonly theme: ExtensionContext["ui"]["theme"];
 	private readonly keybindings: KeybindingsManager;
 	private readonly getTranscript: (width: number, theme: ExtensionContext["ui"]["theme"]) => string[];
-	private readonly getStatus: () => string;
 	private readonly onSubmitCallback: (value: string) => void;
 	private readonly onDismissCallback: () => void;
 	private _focused = false;
@@ -227,7 +253,6 @@ class BtwOverlay extends Container implements Focusable {
 		theme: ExtensionContext["ui"]["theme"],
 		keybindings: KeybindingsManager,
 		getTranscript: (width: number, theme: ExtensionContext["ui"]["theme"]) => string[],
-		getStatus: () => string,
 		onSubmit: (value: string) => void,
 		onDismiss: () => void,
 	) {
@@ -236,7 +261,6 @@ class BtwOverlay extends Container implements Focusable {
 		this.theme = theme;
 		this.keybindings = keybindings;
 		this.getTranscript = getTranscript;
-		this.getStatus = getStatus;
 		this.onSubmitCallback = onSubmit;
 		this.onDismissCallback = onDismiss;
 
@@ -306,16 +330,14 @@ class BtwOverlay extends Container implements Focusable {
 		// Same floor()-rounding story vertically: match the leftover rows' parity so the
 		// top and bottom gaps come out equal.
 		const dialogHeight = (availRows - wantedHeight) % 2 === 1 ? wantedHeight - 1 : wantedHeight;
-		// 4 header lines + separator + status + input + hint + bottom border
-		const chromeHeight = 9;
+		// 4 header lines + separator + input + hint + bottom border
+		const chromeHeight = 8;
 		const transcriptHeight = Math.max(3, dialogHeight - chromeHeight);
 
 		// Markdown renders to contentWidth already — no manual wrapping needed
 		const transcript = this.getTranscript(contentWidth, this.theme);
 		const visibleTranscript = transcript.slice(-transcriptHeight);
 		const transcriptPadding = Math.max(0, transcriptHeight - visibleTranscript.length);
-
-		const status = this.getStatus();
 
 		const previousFocused = this.input.focused;
 		this.input.focused = false;
@@ -337,7 +359,6 @@ class BtwOverlay extends Container implements Focusable {
 		}
 
 		lines.push(this.borderLine(innerWidth, "middle"));
-		lines.push(this.frameLine(this.theme.fg("warning", status), contentWidth));
 		lines.push(this.frameLine(inputLine, contentWidth));
 		lines.push(this.frameLine(this.theme.fg("dim", "Enter submit · Esc close"), contentWidth));
 		lines.push(this.borderLine(innerWidth, "bottom"));
@@ -351,15 +372,40 @@ export default function (pi: ExtensionAPI) {
 	let pendingQuestion: string | null = null;
 	let pendingAnswer = "";
 	let pendingError: string | null = null;
+	let pendingThinking = "";
 	let pendingToolCalls: ToolCallInfo[] = [];
 	let sideBusy = false;
-	let overlayStatus = "Ready";
 	let overlayDraft = "";
 	let overlayRuntime: OverlayRuntime | null = null;
 	let activeSideSession: SideSessionRuntime | null = null;
 	let overlayRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+	let spinnerFrame = 0;
+	let spinnerTimer: ReturnType<typeof setInterval> | null = null;
 
 	const mdTheme = getMarkdownTheme();
+
+	function spinner(): string {
+		return BTW_SPINNER_FRAMES[spinnerFrame % BTW_SPINNER_FRAMES.length];
+	}
+
+	function startSpinner(): void {
+		if (spinnerTimer) {
+			return;
+		}
+		spinnerFrame = 0;
+		spinnerTimer = setInterval(() => {
+			spinnerFrame = (spinnerFrame + 1) % BTW_SPINNER_FRAMES.length;
+			syncOverlay();
+		}, BTW_SPINNER_INTERVAL_MS);
+		spinnerTimer.unref?.();
+	}
+
+	function stopSpinner(): void {
+		if (spinnerTimer) {
+			clearInterval(spinnerTimer);
+			spinnerTimer = null;
+		}
+	}
 
 	function getModelKey(ctx: ExtensionContext): string {
 		const model = ctx.model;
@@ -405,8 +451,8 @@ export default function (pi: ExtensionAPI) {
 	function renderToolCallLines(toolCalls: ToolCallInfo[], theme: ExtensionContext["ui"]["theme"], width: number): string[] {
 		const lines: string[] = [];
 		for (const tc of toolCalls) {
-			const icon = tc.status === "running" ? "⚙" : tc.status === "error" ? "✗" : "✓";
-			const color = tc.status === "error" ? "error" : tc.status === "done" ? "success" : "dim";
+			const icon = tc.status === "running" ? spinner() : tc.status === "error" ? "✗" : "✓";
+			const color = tc.status === "error" ? "error" : tc.status === "done" ? "success" : "accent";
 			const label = theme.fg(color, `${icon} `) + theme.fg("toolTitle", tc.toolName);
 			const argsText = tc.args ? theme.fg("dim", ` ${tc.args}`) : "";
 			lines.push(truncateToWidth(`  ${label}${argsText}`, width, ""));
@@ -457,7 +503,20 @@ export default function (pi: ExtensionAPI) {
 				const mdLines = renderMarkdownLines(pendingAnswer, width);
 				lines.push(...mdLines);
 			} else if (pendingToolCalls.length === 0) {
-				lines.push(theme.fg("dim", "…"));
+				// Sits on the exact line the answer will occupy (same leading blank line and
+				// same column as the markdown body) so the text replaces it in place.
+				lines.push("");
+				// Only claim "Thinking" when the model actually streamed reasoning parts;
+				// otherwise we're just waiting on the request.
+				const reasoningTail = pendingThinking
+					.split("\n")
+					.map((line) => line.trim())
+					.filter(Boolean)
+					.pop();
+				lines.push(theme.fg("accent", spinner()) + theme.fg("dim", reasoningTail ? " Thinking…" : " Waiting for model…"));
+				if (reasoningTail) {
+					lines.push(theme.fg("dim", truncateToWidth(reasoningTail, width, "…")));
+				}
 			}
 		}
 
@@ -483,18 +542,10 @@ export default function (pi: ExtensionAPI) {
 		}, 16);
 	}
 
-	function setOverlayStatus(status: string, throttled = false): void {
-		overlayStatus = status;
-		if (throttled) {
-			scheduleOverlayRefresh();
-		} else {
-			syncOverlay();
-		}
-	}
-
 	function dismissOverlay(): void {
 		overlayRuntime?.close?.();
 		overlayRuntime = null;
+		stopSpinner();
 		if (overlayRefreshTimer) {
 			clearTimeout(overlayRefreshTimer);
 			overlayRefreshTimer = null;
@@ -526,6 +577,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		current.session.dispose();
 
+		stopSpinner();
 		if (overlayRefreshTimer) {
 			clearTimeout(overlayRefreshTimer);
 			overlayRefreshTimer = null;
@@ -537,10 +589,10 @@ export default function (pi: ExtensionAPI) {
 		pendingQuestion = null;
 		pendingAnswer = "";
 		pendingError = null;
+		pendingThinking = "";
 		pendingToolCalls = [];
 		sideBusy = false;
 		setOverlayDraft("");
-		setOverlayStatus("Ready");
 		await disposeSideSession();
 		if (persist) {
 			const details: BtwResetDetails = { timestamp: Date.now() };
@@ -555,9 +607,9 @@ export default function (pi: ExtensionAPI) {
 		pendingQuestion = null;
 		pendingAnswer = "";
 		pendingError = null;
+		pendingThinking = "";
 		pendingToolCalls = [];
 		sideBusy = false;
-		overlayStatus = "Ready";
 		overlayDraft = "";
 		const branch = ctx.sessionManager.getBranch();
 		let lastResetIndex = -1;
@@ -614,7 +666,11 @@ export default function (pi: ExtensionAPI) {
 						pendingAnswer = streamed;
 						pendingError = null;
 					}
-					setOverlayStatus(event.type === "message_end" ? "Finalizing side response..." : "Streaming side response...", true);
+					const reasoning = extractEventThinkingText(event.message);
+					if (reasoning) {
+						pendingThinking = reasoning;
+					}
+					scheduleOverlayRefresh();
 					return;
 				}
 				case "tool_execution_start": {
@@ -624,7 +680,7 @@ export default function (pi: ExtensionAPI) {
 						args: formatToolArgs(event.toolName, event.args),
 						status: "running",
 					});
-					setOverlayStatus(`Running tool: ${event.toolName}...`, true);
+					scheduleOverlayRefresh();
 					return;
 				}
 				case "tool_execution_end": {
@@ -632,11 +688,11 @@ export default function (pi: ExtensionAPI) {
 					if (tc) {
 						tc.status = event.isError ? "error" : "done";
 					}
-					setOverlayStatus("Streaming side response...", true);
+					scheduleOverlayRefresh();
 					return;
 				}
 				case "turn_end": {
-					setOverlayStatus("Finalizing side response...", true);
+					scheduleOverlayRefresh();
 					return;
 				}
 				default:
@@ -705,7 +761,6 @@ export default function (pi: ExtensionAPI) {
 						theme,
 						keybindings,
 						(width, t) => getTranscriptLines(width, t),
-						() => overlayStatus,
 						(value) => {
 							void submitFromOverlay(ctx, value);
 						},
@@ -807,7 +862,6 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		setOverlayStatus("Summarizing BTW thread for injection...");
 		try {
 			const summary = await summarizeThread(ctx, thread);
 			const message = `Summary of my BTW side conversation:\n\n${summary}`;
@@ -848,7 +902,6 @@ export default function (pi: ExtensionAPI) {
 
 		const model = ctx.model;
 		if (!model) {
-			setOverlayStatus("No active model selected.");
 			notify(ctx, "No active model selected.", "error");
 			return;
 		}
@@ -859,7 +912,6 @@ export default function (pi: ExtensionAPI) {
 			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 			if (auth.ok === false) {
 				const message = auth.error;
-				setOverlayStatus(message);
 				notify(ctx, message, "error");
 				return;
 			}
@@ -873,8 +925,10 @@ export default function (pi: ExtensionAPI) {
 			pendingQuestion = question;
 			pendingAnswer = "";
 			pendingError = null;
+			pendingThinking = "";
 			pendingToolCalls = [];
-			setOverlayStatus("Streaming side response...");
+			// Started here, after ensureSideSession(): disposing a session stops the spinner.
+			startSpinner();
 			syncOverlay();
 
 			await side.session.prompt(question, { source: "extension" });
@@ -906,14 +960,13 @@ export default function (pi: ExtensionAPI) {
 			pendingQuestion = null;
 			pendingAnswer = "";
 			pendingToolCalls = [];
-			setOverlayStatus("Ready for the next side question.");
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			pendingError = message;
-			setOverlayStatus("BTW request failed.");
 			notify(ctx, message, "error");
 		} finally {
 			sideBusy = false;
+			stopSpinner();
 			syncOverlay();
 		}
 	}
@@ -921,12 +974,11 @@ export default function (pi: ExtensionAPI) {
 	async function submitFromOverlay(ctx: ExtensionContext | ExtensionCommandContext, rawValue: string): Promise<void> {
 		const question = rawValue.trim();
 		if (!question) {
-			setOverlayStatus("Enter a question first.");
 			return;
 		}
 
 		if (!("waitForIdle" in ctx)) {
-			setOverlayStatus("BTW submit requires command context. Re-open with /btw.");
+			notify(ctx, "BTW submit requires command context. Re-open with /btw.", "warning");
 			return;
 		}
 
@@ -948,18 +1000,15 @@ export default function (pi: ExtensionAPI) {
 					if (choice === "Continue previous conversation") {
 						// Dispose session so it's recreated with fresh main context on next submit
 						await disposeSideSession();
-						setOverlayStatus("Continuing BTW thread.");
 						await ensureOverlay(ctx);
 					} else if (choice === "Start fresh") {
 						await resetThread(ctx, true);
-						setOverlayStatus("Ready");
 						await ensureOverlay(ctx);
 					}
 					// null = user cancelled (Esc), do nothing
 				} else {
 					// No reset entry needed when the thread is already empty.
 					await resetThread(ctx, thread.length > 0);
-					setOverlayStatus("Ready");
 					await ensureOverlay(ctx);
 				}
 				return;
