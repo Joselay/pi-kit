@@ -1,8 +1,72 @@
-import type { ExtensionAPI, ExtensionContext, ThemeColor } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+/**
+ * Cosmetic chrome, none of which changes what the agent does: the random image
+ * header, the custom footer (project, model, context, Codex usage), whimsical
+ * working messages, and the completion chime.
+ */
+
+import { getAgentDir, type ExtensionAPI, type ExtensionContext, type ThemeColor } from "@earendil-works/pi-coding-agent";
+import { Image, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { spawn, type ChildProcess } from "node:child_process";
 import type { EventEmitter } from "node:events";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { CODEX_FAST_STATUS_KEY, modelSupportsCodexFastMode } from "./fast";
+
+const IMAGES_DIR = new URL("../images/", import.meta.url);
+const WORKING_MESSAGES_PATH = new URL("../cosmetic/working-messages.json", import.meta.url);
+const SOUND_PATH = join(getAgentDir(), "sounds", "notification.mp3");
+const AUDIO_PLAYER = "/usr/bin/afplay";
+
+function pickRandom<T>(items: readonly T[]): T {
+	return items[Math.floor(Math.random() * items.length)]!;
+}
+
+function pickRandomImage() {
+	const filename = pickRandom(readdirSync(IMAGES_DIR).filter((f) => f.endsWith(".png")));
+	return {
+		filename,
+		base64: readFileSync(new URL(filename, IMAGES_DIR), "base64"),
+	};
+}
+
+function installHeader(ctx: ExtensionContext) {
+	const image = pickRandomImage();
+	ctx.ui.setHeader((tui, theme) => {
+		const component = new Image(
+			image.base64,
+			"image/png",
+			{ fallbackColor: (text) => theme.fg("muted", text) },
+			{
+				filename: image.filename,
+				maxWidthCells: 34,
+				maxHeightCells: 18,
+			},
+		);
+		return {
+			render(width: number): string[] {
+				const lines = component.render(width);
+				// Terminal graphics always draw over text, so overlays (e.g. /btw)
+				// can't cover the image. Blank it out while an overlay is open,
+				// keeping the same height so the layout doesn't jump.
+				if (tui.hasOverlay()) {
+					return lines.map(() => "");
+				}
+				return lines;
+			},
+			invalidate: () => component.invalidate(),
+		};
+	});
+}
+
+function loadWorkingMessages(): string[] {
+	try {
+		const parsed = JSON.parse(readFileSync(WORKING_MESSAGES_PATH, "utf8")) as unknown;
+		if (Array.isArray(parsed)) return parsed.filter((message): message is string => typeof message === "string");
+	} catch {
+		// Fall through: a missing or corrupt asset just means Pi's default message.
+	}
+	return [];
+}
 
 function sanitizeStatusText(text: string): string {
 	return text
@@ -317,6 +381,8 @@ class CodexUsageClient {
 }
 
 export default function (pi: ExtensionAPI) {
+	const workingMessages = loadWorkingMessages();
+	let soundWarned = false;
 	let activeModel: Model;
 	// Doubles as the footer-active flag: set while the footer is installed.
 	let requestFooterRender: (() => void) | undefined;
@@ -519,6 +585,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		installFooter(ctx);
+		if (ctx.mode === "tui") installHeader(ctx);
 	});
 
 	pi.on("session_shutdown", async () => {
@@ -547,5 +614,35 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_compact", async () => {
 		requestFooterRender?.();
+	});
+
+	pi.on("turn_start", async (_event, ctx) => {
+		if (workingMessages.length > 0) ctx.ui.setWorkingMessage(pickRandom(workingMessages));
+	});
+
+	pi.on("turn_end", async (_event, ctx) => {
+		ctx.ui.setWorkingMessage(); // Reset for next time
+	});
+
+	pi.on("agent_settled", async (_event, ctx) => {
+		if (ctx.mode !== "tui") return;
+
+		const warn = (message: string) => {
+			if (soundWarned) return;
+			ctx.ui.notify(message, "warning");
+			soundWarned = true;
+		};
+
+		if (!existsSync(SOUND_PATH)) {
+			warn(`Notification sound missing: ${SOUND_PATH}`);
+			return;
+		}
+
+		try {
+			const result = await pi.exec(AUDIO_PLAYER, [SOUND_PATH], { timeout: 5_000 });
+			if (result.code !== 0) warn("Failed to play notification sound");
+		} catch {
+			warn("Failed to play notification sound");
+		}
 	});
 }

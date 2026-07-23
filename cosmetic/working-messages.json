@@ -1,7 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-
-const messages = [
-  // Short
+[
   "Schlepping...",
   "Combobulating...",
   "Doing...",
@@ -248,8 +245,6 @@ const messages = [
   "Singling...",
   "Ringling...",
   "Kingling...",
-
-  // Long
   "Consulting the void...",
   "Asking the electrons...",
   "Bribing the compiler...",
@@ -416,8 +411,8 @@ const messages = [
   "Barbecuing the bugs...",
   "Roasting the race conditions...",
   "Grilling the glitches...",
-  "Sautéing the syntax errors...",
-  "Flambéing the failures...",
+  "SautÃ©ing the syntax errors...",
+  "FlambÃ©ing the failures...",
   "Caramelizing the callbacks...",
   "Braising the breakpoints...",
   "Poaching the pointers...",
@@ -456,19 +451,5 @@ const messages = [
   "Icing the interfaces...",
   "Glazing the graphics...",
   "Topping with tests...",
-  "Cherry-picking the commits...",
-];
-
-function pickRandom(): string {
-  return messages[Math.floor(Math.random() * messages.length)];
-}
-
-export default function (pi: ExtensionAPI) {
-  pi.on("turn_start", async (_event, ctx) => {
-    ctx.ui.setWorkingMessage(pickRandom());
-  });
-
-  pi.on("turn_end", async (_event, ctx) => {
-    ctx.ui.setWorkingMessage(); // Reset for next time
-  });
-}
+  "Cherry-picking the commits..."
+]
