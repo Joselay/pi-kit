@@ -354,7 +354,7 @@ class BtwOverlay extends Container implements Focusable {
 		const lines = [
 			this.borderLine(innerWidth, "top"),
 			this.frameLine(this.theme.fg("accent", this.theme.bold("BTW side chat")), contentWidth),
-			this.frameLine(this.theme.fg("dim", "Separate side conversation · Enter submit · Esc close"), contentWidth),
+			this.frameLine(this.theme.fg("muted", "Separate side conversation · Enter submit · Esc close"), contentWidth),
 			this.borderLine(innerWidth, "middle"),
 		];
 
@@ -460,7 +460,7 @@ export default function (pi: ExtensionAPI) {
 			const icon = tc.status === "running" ? spinner() : tc.status === "error" ? "✗" : "✓";
 			const color = tc.status === "error" ? "error" : tc.status === "done" ? "success" : "accent";
 			const label = theme.fg(color, `${icon} `) + theme.fg("toolTitle", tc.toolName);
-			const argsText = tc.args ? theme.fg("dim", ` ${tc.args}`) : "";
+			const argsText = tc.args ? theme.fg("toolOutput", ` ${tc.args}`) : "";
 			lines.push(truncateToWidth(`  ${label}${argsText}`, width, ""));
 		}
 		return lines;
@@ -476,7 +476,7 @@ export default function (pi: ExtensionAPI) {
 
 	function getTranscriptLinesInner(width: number, theme: ExtensionContext["ui"]["theme"]): string[] {
 		if (thread.length === 0 && !pendingQuestion && !pendingAnswer && !pendingError) {
-			return [theme.fg("dim", "No BTW messages yet. Type a question below.")];
+			return [theme.fg("muted", "No BTW messages yet. Type a question below.")];
 		}
 
 		const lines: string[] = [];
@@ -484,7 +484,7 @@ export default function (pi: ExtensionAPI) {
 		for (const item of thread) {
 			// User message
 			const userText = item.question.trim().split("\n")[0];
-			lines.push(theme.fg("accent", theme.bold("You: ")) + truncateToWidth(userText, width - 5, "…"));
+			lines.push(theme.fg("mdHeading", theme.bold("You: ")) + truncateToWidth(userText, width - 5, "…"));
 			lines.push("");
 
 			// Assistant message rendered as markdown
@@ -495,7 +495,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (pendingQuestion) {
 			const userText = pendingQuestion.trim().split("\n")[0];
-			lines.push(theme.fg("accent", theme.bold("You: ")) + truncateToWidth(userText, width - 5, "…"));
+			lines.push(theme.fg("mdHeading", theme.bold("You: ")) + truncateToWidth(userText, width - 5, "…"));
 
 			// Show tool calls inline
 			if (pendingToolCalls.length > 0) {
@@ -503,7 +503,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (pendingError) {
-				lines.push(theme.fg("error", `❌ ${pendingError}`));
+				lines.push(theme.fg("error", `✗ ${pendingError}`));
 			} else if (pendingAnswer) {
 				lines.push("");
 				const mdLines = renderMarkdownLines(pendingAnswer, width);
@@ -519,9 +519,9 @@ export default function (pi: ExtensionAPI) {
 					.map((line) => line.trim())
 					.filter(Boolean)
 					.pop();
-				lines.push(theme.fg("accent", spinner()) + theme.fg("dim", reasoningTail ? " Thinking…" : " Waiting for model…"));
+				lines.push(theme.fg("accent", spinner()) + theme.fg("muted", reasoningTail ? " Thinking…" : " Waiting for model…"));
 				if (reasoningTail) {
-					lines.push(theme.fg("dim", truncateToWidth(reasoningTail, width, "…")));
+					lines.push(theme.fg("thinkingText", truncateToWidth(reasoningTail, width, "…")));
 				}
 			}
 		}
