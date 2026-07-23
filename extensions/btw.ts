@@ -34,6 +34,12 @@ const BTW_SYSTEM_PROMPT = [
 	"Be direct and practical.",
 ].join(" ");
 
+/** Terminal rows/cols left free around the overlay (all four sides). */
+const BTW_OVERLAY_MARGIN = 1;
+/** Overlay size as a fraction of the terminal. Kept in sync with the frame drawn in render(). */
+const BTW_OVERLAY_WIDTH_PCT = 62;
+const BTW_OVERLAY_HEIGHT_PCT = 85;
+
 const BTW_SUMMARY_PROMPT =
 	"Summarize this side conversation for handoff into the main conversation. Keep key decisions, findings, risks, and next actions. Output only the summary.";
 
@@ -261,29 +267,51 @@ class BtwOverlay extends Container implements Focusable {
 		return this.input.getValue();
 	}
 
-	private frameLine(content: string, innerWidth: number): string {
-		const truncated = truncateToWidth(content, innerWidth, "");
-		const padding = Math.max(0, innerWidth - visibleWidth(truncated));
-		return `${this.theme.fg("borderMuted", "│")}${truncated}${" ".repeat(padding)}${this.theme.fg("borderMuted", "│")}`;
+	/** One padded column inside each border, so text never touches the frame. */
+	private static readonly PAD = 1;
+
+	/** Wrap already-sized content in the border, padding it out to exactly contentWidth. */
+	private frameLine(content: string, contentWidth: number): string {
+		const truncated = truncateToWidth(content, contentWidth, "");
+		const padding = Math.max(0, contentWidth - visibleWidth(truncated));
+		const gutter = " ".repeat(BtwOverlay.PAD);
+		const border = this.theme.fg("borderMuted", "│");
+		return `${border}${gutter}${truncated}${" ".repeat(padding)}${gutter}${border}`;
 	}
 
-	private borderLine(innerWidth: number, edge: "top" | "bottom"): string {
-		const left = edge === "top" ? "┌" : "└";
-		const right = edge === "top" ? "┐" : "┘";
+	private borderLine(innerWidth: number, edge: "top" | "bottom" | "middle"): string {
+		const [left, right] = edge === "top" ? ["┌", "┐"] : edge === "bottom" ? ["└", "┘"] : ["├", "┤"];
 		return this.theme.fg("borderMuted", `${left}${"─".repeat(innerWidth)}${right}`);
 	}
 
 	override render(width: number): string[] {
-		const dialogWidth = Math.max(56, Math.min(width, Math.floor(width * 0.9)));
-		const innerWidth = Math.max(40, dialogWidth - 2);
+		// The overlay already sized us (width/minWidth in overlayOptions) and centers this
+		// component within that box, so fill the width we're handed rather than shrinking.
+		// The compositor centers with floor(): when the leftover columns are odd the right
+		// gap ends up one wider, so give up one column and shift the frame right by one to
+		// make both sides exactly equal.
+		const terminalCols = process.stdout.columns ?? width;
+		const leftover = Math.max(0, terminalCols - BTW_OVERLAY_MARGIN * 2 - width);
+		const shift = leftover % 2;
+		const indent = " ".repeat(shift);
+		const dialogWidth = Math.max(24, width - shift);
+		const innerWidth = dialogWidth - 2;
+		const contentWidth = Math.max(1, innerWidth - BtwOverlay.PAD * 2);
+
 		const terminalRows = process.stdout.rows ?? 30;
-		const dialogHeight = Math.max(16, Math.min(30, Math.floor(terminalRows * 0.75)));
+		// Mirror the overlay's resolved maxHeight exactly (percentage of the terminal,
+		// clamped by the vertical margins) so the frame fills its box and stays centered.
+		const availRows = terminalRows - BTW_OVERLAY_MARGIN * 2;
+		const wantedHeight = Math.max(8, Math.min(Math.floor((terminalRows * BTW_OVERLAY_HEIGHT_PCT) / 100), availRows));
+		// Same floor()-rounding story vertically: match the leftover rows' parity so the
+		// top and bottom gaps come out equal.
+		const dialogHeight = (availRows - wantedHeight) % 2 === 1 ? wantedHeight - 1 : wantedHeight;
 		// 4 header lines + separator + status + input + hint + bottom border
 		const chromeHeight = 9;
-		const transcriptHeight = Math.max(6, dialogHeight - chromeHeight);
+		const transcriptHeight = Math.max(3, dialogHeight - chromeHeight);
 
-		// Markdown renders to innerWidth already — no manual wrapping needed
-		const transcript = this.getTranscript(innerWidth, this.theme);
+		// Markdown renders to contentWidth already — no manual wrapping needed
+		const transcript = this.getTranscript(contentWidth, this.theme);
 		const visibleTranscript = transcript.slice(-transcriptHeight);
 		const transcriptPadding = Math.max(0, transcriptHeight - visibleTranscript.length);
 
@@ -291,32 +319,30 @@ class BtwOverlay extends Container implements Focusable {
 
 		const previousFocused = this.input.focused;
 		this.input.focused = false;
-		const inputLine = this.input.render(innerWidth)[0] ?? "";
+		const inputLine = this.input.render(contentWidth)[0] ?? "";
 		this.input.focused = previousFocused;
 
 		const lines = [
 			this.borderLine(innerWidth, "top"),
-			this.frameLine(this.theme.fg("accent", this.theme.bold(" BTW side chat ")), innerWidth),
-			this.frameLine(this.theme.fg("dim", "Separate side conversation. Esc closes."), innerWidth),
-			this.theme.fg("borderMuted", `├${"─".repeat(innerWidth)}┤`),
+			this.frameLine(this.theme.fg("accent", this.theme.bold("BTW side chat")), contentWidth),
+			this.frameLine(this.theme.fg("dim", "Separate side conversation. Esc closes."), contentWidth),
+			this.borderLine(innerWidth, "middle"),
 		];
 
 		for (const line of visibleTranscript) {
-			lines.push(this.frameLine(line, innerWidth));
+			lines.push(this.frameLine(line, contentWidth));
 		}
 		for (let i = 0; i < transcriptPadding; i++) {
-			lines.push(this.frameLine("", innerWidth));
+			lines.push(this.frameLine("", contentWidth));
 		}
 
-		lines.push(this.theme.fg("borderMuted", `├${"─".repeat(innerWidth)}┤`));
-		lines.push(this.frameLine(this.theme.fg("warning", status), innerWidth));
-		lines.push(
-			`${this.theme.fg("borderMuted", "│")}${inputLine}${this.theme.fg("borderMuted", "│")}`,
-		);
-		lines.push(this.frameLine(this.theme.fg("dim", "Enter submit · Esc close"), innerWidth));
+		lines.push(this.borderLine(innerWidth, "middle"));
+		lines.push(this.frameLine(this.theme.fg("warning", status), contentWidth));
+		lines.push(this.frameLine(inputLine, contentWidth));
+		lines.push(this.frameLine(this.theme.fg("dim", "Enter submit · Esc close"), contentWidth));
 		lines.push(this.borderLine(innerWidth, "bottom"));
 
-		return lines;
+		return shift ? lines.map((line) => indent + line) : lines;
 	}
 }
 
@@ -402,7 +428,8 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const lines: string[] = [];
-		for (const item of thread.slice(-6)) {
+		// No message cap — the overlay tail-slices to whatever fits its height.
+		for (const item of thread) {
 			// User message
 			const userText = item.question.trim().split("\n")[0];
 			lines.push(theme.fg("accent", theme.bold("You: ")) + truncateToWidth(userText, width - 5, "…"));
@@ -708,11 +735,11 @@ export default function (pi: ExtensionAPI) {
 				{
 					overlay: true,
 					overlayOptions: {
-						width: "80%",
-						minWidth: 72,
-						maxHeight: "78%",
-						anchor: "top-center",
-						margin: { top: 1, left: 2, right: 2 },
+						width: `${BTW_OVERLAY_WIDTH_PCT}%`,
+						minWidth: 56,
+						maxHeight: `${BTW_OVERLAY_HEIGHT_PCT}%`,
+						anchor: "center",
+						margin: BTW_OVERLAY_MARGIN,
 					},
 					onHandle: (handle) => {
 						runtime.handle = handle;
