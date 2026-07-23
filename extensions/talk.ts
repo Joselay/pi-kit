@@ -1,15 +1,15 @@
-// /voice - live voice conversation that drives this pi session, modeled on
+// /talk - live voice conversation that drives this pi session, modeled on
 // Codex's realtime voice architecture: a realtime speech model acts as the
 // conversational surface ("intermediary") and delegates actual work to the
 // coding agent ("backend") through a background_agent tool. Agent output is
-// mirrored back into the voice session as [BACKEND] messages and spoken as a
+// mirrored back into the talk session as [BACKEND] messages and spoken as a
 // summary when the agent finishes.
 //
 // Auth is the pi `openai-codex` OAuth subscription resolved through
-// ModelRuntime (same pattern as the web-search/imagegen/realtime-voice
-// skills); the GA realtime WebSocket accepts the ChatGPT bearer directly.
+// ModelRuntime (same pattern as the web-search/imagegen skills); the GA
+// realtime WebSocket accepts the ChatGPT bearer directly.
 //
-// Audio: prefers the AEC helper (~/.pi/agent/voice/voice-audio.swift,
+// Audio: prefers the AEC helper (~/.pi/agent/talk/talk-audio.swift,
 // compiled on demand) for full-duplex speaker use with echo cancellation and
 // barge-in; falls back to ffmpeg/ffplay in half-duplex (mic muted while the
 // assistant speaks) when the helper is unavailable.
@@ -48,14 +48,14 @@ const BACKEND_OUTPUT_TOKEN_BUDGET = 1000;
 const STARTUP_CONTEXT_TOKEN_BUDGET = 5300;
 const APPROX_CHARS_PER_TOKEN = 4;
 
-const VOICE_DIR = join(getAgentDir(), "voice");
-const AEC_SOURCE = join(VOICE_DIR, "voice-audio.swift");
-const AEC_BINARY = join(VOICE_DIR, "voice-audio");
+const TALK_DIR = join(getAgentDir(), "talk");
+const AEC_SOURCE = join(TALK_DIR, "talk-audio.swift");
+const AEC_BINARY = join(TALK_DIR, "talk-audio");
 
-const MODEL = process.env.PI_VOICE_MODEL?.trim() || DEFAULT_MODEL;
-const VOICE = process.env.PI_VOICE_VOICE?.trim() || DEFAULT_VOICE;
-const AUDIO_DEVICE = process.env.PI_VOICE_DEVICE?.trim() || "0";
-const DISABLE_AEC = process.env.PI_VOICE_NO_AEC === "1";
+const MODEL = process.env.PI_TALK_MODEL?.trim() || DEFAULT_MODEL;
+const VOICE = process.env.PI_TALK_VOICE?.trim() || DEFAULT_VOICE;
+const AUDIO_DEVICE = process.env.PI_TALK_DEVICE?.trim() || "0";
+const DISABLE_AEC = process.env.PI_TALK_NO_AEC === "1";
 
 // Upstream v2 tool definitions (methods_v2.rs), verbatim.
 const REALTIME_TOOLS = [
@@ -171,7 +171,7 @@ const REALTIME_END = `Realtime conversation ended.
 
 Subsequent user input will return to typed text rather than transcript-style text. Do not assume recognition errors or missing punctuation once realtime has ended. Resume normal chat behavior.
 
-Reason: the user ended the voice session.`;
+Reason: the user ended the talk session.`;
 
 function truncateToTokens(text: string, tokens: number): string {
 	const max = tokens * APPROX_CHARS_PER_TOKEN;
@@ -215,7 +215,7 @@ async function resolveOAuth(): Promise<{ token: string; accountId?: string }> {
 	const runtime = await ModelRuntime.create();
 	const check = await (runtime as any).checkAuth(PROVIDER_ID);
 	if (!(runtime as any).isUsingOAuth(PROVIDER_ID) || check?.type !== "oauth") {
-		throw new Error("voice needs the openai-codex OAuth subscription; run /login first");
+		throw new Error("talk needs the openai-codex OAuth subscription; run /login first");
 	}
 	const token = (await (runtime as any).getAuth(PROVIDER_ID))?.auth?.apiKey;
 	if (!token) throw new Error("could not resolve the OAuth token; run /login again");
@@ -301,7 +301,7 @@ function buildStartupContext(ctx: ExtensionContext): string {
 	const workspace = workspaceMap(ctx.cwd, 1600);
 	const sections = [
 		"<startup_context>",
-		"Snapshot captured when the voice session started. Use it to ground answers and delegations; the background agent always has the authoritative, current state.",
+		"Snapshot captured when the talk session started. Use it to ground answers and delegations; the background agent always has the authoritative, current state.",
 		"",
 		"## Current Thread",
 		thread,
@@ -483,11 +483,11 @@ async function ensureAecAudio(notify: (message: string) => void): Promise<AudioI
 	return new AecAudio();
 }
 
-// --- the voice session ---
+// --- the talk session ---
 
 type TranscriptWho = "you" | "asst" | "sys";
 
-class VoiceSession {
+class TalkSession {
 	private ws?: any;
 	private audio?: AudioIO;
 	private closing = false;
@@ -527,7 +527,7 @@ class VoiceSession {
 		const headers: Record<string, string> = {
 			Authorization: `Bearer ${token}`,
 			originator: "pi",
-			"user-agent": `pi-voice (${process.platform}; ${process.arch})`,
+			"user-agent": `pi-talk (${process.platform}; ${process.arch})`,
 		};
 		if (accountId) headers["chatgpt-account-id"] = accountId;
 
@@ -598,7 +598,7 @@ class VoiceSession {
 				this.send({ type: "input_audio_buffer.append", audio: frame.toString("base64") });
 			},
 			(message) => {
-				this.ctx.ui.notify(`voice audio failed: ${message}`, "error");
+				this.ctx.ui.notify(`talk audio failed: ${message}`, "error");
 				this.stop(false);
 			},
 		);
@@ -606,7 +606,7 @@ class VoiceSession {
 		// Tell the coding agent it is now the backend behind a voice intermediary
 		// (upstream injects realtime_start.md into the agent context).
 		this.pi.sendMessage(
-			{ customType: "voice-realtime", content: REALTIME_START, display: false },
+			{ customType: "talk-realtime", content: REALTIME_START, display: false },
 			{ triggerTurn: false },
 		);
 
@@ -626,7 +626,7 @@ class VoiceSession {
 		if (this.renderTimer) clearTimeout(this.renderTimer);
 		if (userInitiated) {
 			this.pi.sendMessage(
-				{ customType: "voice-realtime", content: REALTIME_END, display: false },
+				{ customType: "talk-realtime", content: REALTIME_END, display: false },
 				{ triggerTurn: false },
 			);
 		}
@@ -868,28 +868,28 @@ class VoiceSession {
 
 	private render(): void {
 		if (this.closing || !this.ctx.hasUI) return;
-		const label = (who: TranscriptWho) => (who === "you" ? "you " : who === "asst" ? "voice" : "  ·  ");
+		const label = (who: TranscriptWho) => (who === "you" ? "you " : who === "asst" ? "talk" : "  ·  ");
 		const lines = this.transcript.slice(-8).map((entry) => `${label(entry.who)}│ ${clip(entry.text, 110)}`);
 		if (this.openLine) {
 			const text = this.openLine.text;
 			const tail = text.length > 108 ? `…${text.slice(-107)}` : text;
 			lines.push(`${label(this.openLine.who)}│ ${tail}▌`);
 		}
-		this.ctx.ui.setWidget("voice", [`◉ ${this.statusText}`, ...lines], { placement: "belowEditor" });
+		this.ctx.ui.setWidget("talk", [`◉ ${this.statusText}`, ...lines], { placement: "belowEditor" });
 	}
 
 	clearWidget(): void {
 		if (this.ctx.hasUI) {
-			this.ctx.ui.setWidget("voice", undefined);
-			this.ctx.ui.setStatus("voice", undefined);
+			this.ctx.ui.setWidget("talk", undefined);
+			this.ctx.ui.setStatus("talk", undefined);
 		}
 	}
 }
 
 // --- extension wiring ---
 
-export default function voice(pi: ExtensionAPI) {
-	let active: VoiceSession | undefined;
+export default function talk(pi: ExtensionAPI) {
+	let active: TalkSession | undefined;
 
 	const stopSession = (userInitiated: boolean) => {
 		const session = active;
@@ -908,35 +908,35 @@ export default function voice(pi: ExtensionAPI) {
 	});
 	pi.on("session_shutdown", () => stopSession(false));
 
-	pi.registerCommand("voice", {
+	pi.registerCommand("talk", {
 		description: "Toggle live voice conversation (realtime speech driving this agent, Codex-style)",
 		handler: async (args, ctx) => {
 			if (process.platform !== "darwin") {
-				ctx.ui.notify("Voice requires macOS (AVFoundation audio)", "warning");
+				ctx.ui.notify("Talk requires macOS (AVFoundation audio)", "warning");
 				return;
 			}
 			const action = args.trim().toLowerCase();
 			if (action && action !== "on" && action !== "off") {
-				ctx.ui.notify("Use /voice, /voice on, or /voice off", "warning");
+				ctx.ui.notify("Use /talk, /talk on, or /talk off", "warning");
 				return;
 			}
 			const turnOn = action === "on" ? true : action === "off" ? false : !active;
 
 			if (!turnOn) {
 				if (!active) {
-					ctx.ui.notify("Voice is already off", "info");
+					ctx.ui.notify("Talk is already off", "info");
 					return;
 				}
 				stopSession(true);
-				ctx.ui.notify("Voice off", "info");
+				ctx.ui.notify("Talk off", "info");
 				return;
 			}
 			if (active) {
-				ctx.ui.notify("Voice is already on", "info");
+				ctx.ui.notify("Talk is already on", "info");
 				return;
 			}
 
-			const session = new VoiceSession(pi, ctx, () => {
+			const session = new TalkSession(pi, ctx, () => {
 				if (active === session) {
 					active = undefined;
 					session.clearWidget();
@@ -944,13 +944,13 @@ export default function voice(pi: ExtensionAPI) {
 			});
 			try {
 				active = session;
-				if (ctx.hasUI) ctx.ui.setStatus("voice", "◉ voice");
+				if (ctx.hasUI) ctx.ui.setStatus("talk", "◉ talk");
 				await session.start();
 			} catch (error) {
 				active = undefined;
 				session.stop(false);
 				session.clearWidget();
-				ctx.ui.notify(`Voice failed to start: ${clip(errorText(error), 140)}`, "error");
+				ctx.ui.notify(`Talk failed to start: ${clip(errorText(error), 140)}`, "error");
 			}
 		},
 	});

@@ -1,10 +1,10 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import {
 	CustomEditor,
 	getAgentDir,
+	ModelRuntime,
 	type ExtensionAPI,
 	type ExtensionContext,
 	type KeybindingsManager,
@@ -33,8 +33,8 @@ const STDERR_TAIL = 4000;
 
 // The realtime API only accepts 24 kHz PCM16.
 const SAMPLE_RATE = 24000;
-const AUTH_PATH = join(homedir(), ".codex", "auth.json");
-const AUTH_HINT = "run `codex login` if this persists";
+const PROVIDER_ID = "openai-codex";
+const AUTH_HINT = "run /login if this persists";
 const REALTIME_URL =
 	process.env.PI_DICTATE_ENDPOINT?.trim() || "wss://api.openai.com/v1/realtime?intent=transcription";
 // gpt-realtime-whisper emits transcript deltas as you speak; the gpt-4o-*-transcribe
@@ -58,8 +58,21 @@ type Recording = {
 	/** Audio captured before the hold was confirmed, replayed once the session opens. */
 	buffered: Buffer[];
 	session?: LiveSession;
+	/** Resolves once the (async) transcription session has been opened or has failed. */
+	sessionPending?: Promise<void>;
 	closed: Promise<void>;
 };
+
+/** Cancels the transcription session, waiting for an in-flight open first. */
+async function closeSession(item: Recording): Promise<void> {
+	if (item.sessionPending) {
+		try {
+			await item.sessionPending;
+		} catch {
+		}
+	}
+	item.session?.cancel();
+}
 class Timer {
 	private handle?: ReturnType<typeof setTimeout>;
 
@@ -117,39 +130,57 @@ function stopChild(child: ChildProcess | undefined, signal: NodeJS.Signals = "SI
 
 type Credentials = { token: string; accountId?: string };
 
+// ModelRuntime.create() reads pi's own credential store; cache it so a hold does
+// not pay the construction cost. getAuth() refreshes the token per call.
+let runtimePromise: Promise<any> | undefined;
+
+function modelRuntime(): Promise<any> {
+	runtimePromise ??= (ModelRuntime as any).create();
+	return runtimePromise!;
+}
+
 /**
- * Reuses the Codex login rather than a separate API key: the ChatGPT OAuth access
- * token in ~/.codex/auth.json carries `aud: https://api.openai.com/v1`, so the
- * transcriptions endpoint accepts it directly. Read per request, because Codex
- * refreshes the file in the background.
+ * Resolves the `openai-codex` OAuth subscription through pi's ModelRuntime (the
+ * same path as the web-search and imagegen skills), so the token comes from
+ * ~/.pi/agent/auth.json and is refreshed on our behalf. The ChatGPT access token
+ * carries `aud: https://api.openai.com/v1`, so the realtime endpoint accepts it.
  */
-function credentials(): Credentials {
-	let auth: { tokens?: { access_token?: string; account_id?: string }; OPENAI_API_KEY?: string | null };
+async function credentials(): Promise<Credentials> {
+	let runtime: any;
 	try {
-		auth = JSON.parse(readFileSync(AUTH_PATH, "utf8"));
-	} catch {
-		return requireEnvKey("no Codex credentials at ~/.codex/auth.json");
+		runtime = await modelRuntime();
+	} catch (error) {
+		// A failed create() must not poison every later attempt.
+		runtimePromise = undefined;
+		return requireEnvKey(`could not load pi's model runtime (${errorText(error)})`);
 	}
 
-	const token = auth.tokens?.access_token;
-	if (!token) return requireEnvKey("no OAuth token in ~/.codex/auth.json");
-	if (expired(token)) return requireEnvKey("Codex login expired");
-	return { token, accountId: auth.tokens?.account_id };
+	try {
+		const check = await runtime.checkAuth(PROVIDER_ID);
+		if (!runtime.isUsingOAuth(PROVIDER_ID) || check?.type !== "oauth") {
+			return requireEnvKey("pi is not signed in to the openai-codex subscription");
+		}
+		const token = (await runtime.getAuth(PROVIDER_ID))?.auth?.apiKey;
+		if (!token) return requireEnvKey("pi's openai-codex OAuth token could not be resolved");
+		return { token, accountId: accountIdFromToken(token) };
+	} catch (error) {
+		return requireEnvKey(`pi's openai-codex OAuth check failed (${errorText(error)})`);
+	}
 }
 
 function requireEnvKey(reason: string): Credentials {
 	const apiKey = process.env.OPENAI_API_KEY?.trim();
 	if (apiKey) return { token: apiKey };
-	throw new Error(`${reason}; run \`codex login\``);
+	throw new Error(`${reason}; run /login`);
 }
 
-function expired(token: string): boolean {
+function accountIdFromToken(token: string): string | undefined {
 	try {
-		const payload = token.split(".")[1] ?? "";
-		const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
-		return typeof claims.exp === "number" && claims.exp * 1000 <= Date.now();
+		const payload = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8"));
+		const accountId = payload?.["https://api.openai.com/auth"]?.chatgpt_account_id;
+		return typeof accountId === "string" && accountId ? accountId : undefined;
 	} catch {
-		return false;
+		return undefined;
 	}
 }
 
@@ -171,8 +202,8 @@ type LiveSession = {
  * `gpt-realtime-whisper` streams natively and does not support VAD, so end-of-turn is
  * driven by an explicit commit on key release.
  */
-function openLiveTranscription(onDelta: (delta: string) => void): LiveSession {
-	const { token, accountId } = credentials();
+async function openLiveTranscription(onDelta: (delta: string) => void): Promise<LiveSession> {
+	const { token, accountId } = await credentials();
 	const headers: Record<string, string> = {
 		Authorization: `Bearer ${token}`,
 		originator: "pi",
@@ -453,11 +484,9 @@ export default function dictate(pi: ExtensionAPI) {
 	};
 
 	function warmUp(): void {
-		// Surfaces a stale login before the user has spoken into a dead session.
-		try {
-			credentials();
-		} catch {
-		}
+		// Surfaces a stale login, and builds the ModelRuntime, before the user has
+		// spoken into a dead session.
+		void credentials().catch(() => {});
 		void modifierHeld();
 	}
 
@@ -526,7 +555,7 @@ export default function dictate(pi: ExtensionAPI) {
 					if (recording !== item) return;
 					recording = undefined;
 					maxTimer.clear();
-					item.session?.cancel();
+					void closeSession(item);
 					editor.setDictationState("idle");
 					notify(`Dictation recorder failed: ${error.message}`, "error");
 				});
@@ -561,16 +590,27 @@ export default function dictate(pi: ExtensionAPI) {
 
 		const token = generation;
 		let atStart = true;
-		try {
+		// Opening the session is async (OAuth resolve), so publish the in-flight
+		// promise: a quick release must wait for it rather than drop the utterance.
+		const pending = (async () => {
 			// No `recording` check here: transcription runs ~1.4s behind speech, so for a
 			// short hold every delta lands after release has already cleared `recording`.
-			item.session = openLiveTranscription((delta) => {
+			const session = await openLiveTranscription((delta) => {
 				if (token !== generation) return;
 				editor.insertTranscription(delta, atStart);
 				atStart = false;
 				item.transcribed = true;
 			});
-			for (const chunk of item.buffered.splice(0)) item.session.push(chunk);
+			if (token !== generation) {
+				session.cancel();
+				return;
+			}
+			item.session = session;
+			for (const chunk of item.buffered.splice(0)) session.push(chunk);
+		})();
+		item.sessionPending = pending;
+		try {
+			await pending;
 		} catch (error) {
 			notify(`Dictation failed: ${errorText(error)}`, "error");
 			void discard();
@@ -596,7 +636,7 @@ export default function dictate(pi: ExtensionAPI) {
 		const item = await take();
 		if (!item) return;
 		stopChild(item.child, "SIGKILL");
-		item.session?.cancel();
+		await closeSession(item);
 	}
 
 	async function stop(editor?: DictationEditor): Promise<void> {
@@ -618,6 +658,14 @@ export default function dictate(pi: ExtensionAPI) {
 			}),
 		]);
 		grace.clear();
+
+		// The session may still be opening if the hold was short.
+		if (item.sessionPending) {
+			try {
+				await item.sessionPending;
+			} catch {
+			}
+		}
 
 		const session = item.session;
 		if (!session || token !== generation || Date.now() - item.armedAt < MIN_RECORDING_MS) {
@@ -718,7 +766,7 @@ export default function dictate(pi: ExtensionAPI) {
 		maxTimer.clear();
 		const item = await take();
 		stopChild(item?.child, "SIGKILL");
-		item?.session?.cancel();
+		if (item) await closeSession(item);
 		transcribing = false;
 		currentEditor?.setDictationState("idle");
 	}

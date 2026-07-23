@@ -3,7 +3,7 @@ auth.json
 
 # Runtime and generated state
 sessions/
-voice/voice-audio
+talk/talk-audio
 models-store.json
 trust.json
 fast.json
