@@ -330,8 +330,8 @@ class BtwOverlay extends Container implements Focusable {
 		// Same floor()-rounding story vertically: match the leftover rows' parity so the
 		// top and bottom gaps come out equal.
 		const dialogHeight = (availRows - wantedHeight) % 2 === 1 ? wantedHeight - 1 : wantedHeight;
-		// 4 header lines + separator + input + hint + bottom border
-		const chromeHeight = 8;
+		// 4 header lines + separator + input + bottom border
+		const chromeHeight = 7;
 		const transcriptHeight = Math.max(3, dialogHeight - chromeHeight);
 
 		// Markdown renders to contentWidth already — no manual wrapping needed
@@ -341,13 +341,20 @@ class BtwOverlay extends Container implements Focusable {
 
 		const previousFocused = this.input.focused;
 		this.input.focused = false;
-		const inputLine = this.input.render(contentWidth)[0] ?? "";
+		// Input hardcodes a "> " prompt; swap it for a themed glyph of the same width.
+		const rendered = this.input.render(contentWidth)[0] ?? "";
+		const prompt = this.theme.fg("accent", "❯ ");
+		const body = rendered.startsWith("> ") ? rendered.slice(2) : rendered;
+		const placeholder = this.theme.fg("dim", "Ask on the side — stays out of the main chat");
+		const inputLine = this.input.getValue()
+			? prompt + body
+			: `${prompt}\x1b[7m \x1b[27m${placeholder}`;
 		this.input.focused = previousFocused;
 
 		const lines = [
 			this.borderLine(innerWidth, "top"),
 			this.frameLine(this.theme.fg("accent", this.theme.bold("BTW side chat")), contentWidth),
-			this.frameLine(this.theme.fg("dim", "Separate side conversation. Esc closes."), contentWidth),
+			this.frameLine(this.theme.fg("dim", "Separate side conversation · Enter submit · Esc close"), contentWidth),
 			this.borderLine(innerWidth, "middle"),
 		];
 
@@ -360,7 +367,6 @@ class BtwOverlay extends Container implements Focusable {
 
 		lines.push(this.borderLine(innerWidth, "middle"));
 		lines.push(this.frameLine(inputLine, contentWidth));
-		lines.push(this.frameLine(this.theme.fg("dim", "Enter submit · Esc close"), contentWidth));
 		lines.push(this.borderLine(innerWidth, "bottom"));
 
 		return shift ? lines.map((line) => indent + line) : lines;
