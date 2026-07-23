@@ -31,8 +31,12 @@ const REALTIME_URL = "wss://api.openai.com/v1/realtime";
 // Newest realtime model (July 2026); upstream Codex still pins gpt-realtime-1.5.
 // Verified to accept the ChatGPT OAuth bearer on the public GA endpoint.
 const DEFAULT_MODEL = "gpt-realtime-2.1";
+// Cheaper/faster variant, selectable with `/talk mini`.
+const DEFAULT_MINI_MODEL = "gpt-realtime-2.1-mini";
 const DEFAULT_VOICE = "marin";
-const TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe";
+// Newest streaming speech-to-text model; upstream Codex still pins
+// gpt-4o-mini-transcribe (methods_v2.rs REALTIME_V2_INPUT_TRANSCRIPTION_MODEL).
+const TRANSCRIBE_MODEL = process.env.PI_TALK_TRANSCRIBE_MODEL?.trim() || "gpt-realtime-whisper";
 const SAMPLE_RATE = 24000;
 // Upstream clients stream 960-sample (40 ms) mono PCM16 frames = 1920 bytes.
 const MIC_FRAME_BYTES = 960 * 2;
@@ -55,6 +59,7 @@ const AEC_SOURCE = join(TALK_DIR, "talk-audio.swift");
 const AEC_BINARY = join(TALK_DIR, "talk-audio");
 
 const MODEL = process.env.PI_TALK_MODEL?.trim() || DEFAULT_MODEL;
+const MINI_MODEL = process.env.PI_TALK_MINI_MODEL?.trim() || DEFAULT_MINI_MODEL;
 const VOICE = process.env.PI_TALK_VOICE?.trim() || DEFAULT_VOICE;
 const AUDIO_DEVICE = process.env.PI_TALK_DEVICE?.trim() || "0";
 const DISABLE_AEC = process.env.PI_TALK_NO_AEC === "1";
@@ -630,6 +635,7 @@ class TalkSession {
 	constructor(
 		private readonly pi: ExtensionAPI,
 		private readonly ctx: ExtensionCommandContext,
+		private readonly model: string,
 		private readonly onClosed: () => void,
 	) {}
 
@@ -652,7 +658,7 @@ class TalkSession {
 		const startupContext = buildStartupContext(this.ctx);
 		const instructions = startupContext ? `${prompt}\n\n${startupContext}` : prompt;
 
-		const url = `${REALTIME_URL}?model=${encodeURIComponent(MODEL)}`;
+		const url = `${REALTIME_URL}?model=${encodeURIComponent(this.model)}`;
 		const ws = new (globalThis as any).WebSocket(url, { headers });
 		this.ws = ws;
 
@@ -672,7 +678,7 @@ class TalkSession {
 			type: "session.update",
 			session: {
 				type: "realtime",
-				model: MODEL,
+				model: this.model,
 				output_modalities: ["audio"],
 				instructions,
 				tools: REALTIME_TOOLS,
@@ -726,7 +732,7 @@ class TalkSession {
 			{ triggerTurn: false },
 		);
 
-		this.statusText = `listening — ${MODEL} · ${VOICE} · ${this.audio.echoCancelled ? "echo-cancelled (speakers OK)" : "half-duplex (no AEC)"}`;
+		this.statusText = `listening — ${this.model} · ${VOICE} · ${this.audio.echoCancelled ? "echo-cancelled (speakers OK)" : "half-duplex (no AEC)"}`;
 		this.markDirty();
 	}
 
@@ -1040,11 +1046,12 @@ export default function talk(pi: ExtensionAPI) {
 				return;
 			}
 			const action = args.trim().toLowerCase();
-			if (action && action !== "on" && action !== "off") {
-				ctx.ui.notify("Use /talk, /talk on, or /talk off", "warning");
+			if (action && !["on", "off", "mini", "fast"].includes(action)) {
+				ctx.ui.notify("Use /talk, /talk on, /talk off, or /talk mini (cheaper/faster model)", "warning");
 				return;
 			}
-			const turnOn = action === "on" ? true : action === "off" ? false : !active;
+			const mini = action === "mini" || action === "fast";
+			const turnOn = action === "on" || mini ? true : action === "off" ? false : !active;
 
 			if (!turnOn) {
 				if (!active) {
@@ -1060,7 +1067,7 @@ export default function talk(pi: ExtensionAPI) {
 				return;
 			}
 
-			const session = new TalkSession(pi, ctx, () => {
+			const session = new TalkSession(pi, ctx, mini ? MINI_MODEL : MODEL, () => {
 				if (active === session) {
 					active = undefined;
 					session.clearWidget();
