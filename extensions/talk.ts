@@ -16,7 +16,7 @@
 
 import { spawn, execFile, execFileSync, type ChildProcess } from "node:child_process";
 import { existsSync, readdirSync, statSync } from "node:fs";
-import { userInfo } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 import {
 	getAgentDir,
@@ -45,8 +45,10 @@ const HANDOFF_COMPLETE_ACK = "Background agent finished. Use the preceding [BACK
 const STEER_ACK = "This was sent to steer the previous background agent task.";
 const ACTIVE_RESPONSE_ERROR_PREFIX = "Conversation already has an active response in progress:";
 const BACKEND_OUTPUT_TOKEN_BUDGET = 1000;
-const STARTUP_CONTEXT_TOKEN_BUDGET = 5300;
-const APPROX_CHARS_PER_TOKEN = 4;
+const APPROX_BYTES_PER_TOKEN = 4;
+// Upstream tries these argument keys in order when extracting the delegated
+// prompt from a background_agent call (protocol_v2.rs TOOL_ARGUMENT_KEYS).
+const TOOL_ARGUMENT_KEYS = ["input_transcript", "input", "text", "prompt", "query"] as const;
 
 const TALK_DIR = join(getAgentDir(), "talk");
 const AEC_SOURCE = join(TALK_DIR, "talk-audio.swift");
@@ -173,9 +175,47 @@ Subsequent user input will return to typed text rather than transcript-style tex
 
 Reason: the user ended the talk session.`;
 
-function truncateToTokens(text: string, tokens: number): string {
-	const max = tokens * APPROX_CHARS_PER_TOKEN;
-	return text.length <= max ? text : `${text.slice(0, max)}\n[...truncated]`;
+function approxTokenCount(text: string): number {
+	return Math.ceil(Buffer.byteLength(text, "utf8") / APPROX_BYTES_PER_TOKEN);
+}
+
+// Middle-out truncation ported from codex-rs utils/string/src/truncate.rs:
+// keep the head and tail, replace the middle with an approximate-token marker.
+function truncateMiddleToTokens(text: string, maxTokens: number): string {
+	if (!text) return "";
+	const maxBytes = maxTokens * APPROX_BYTES_PER_TOKEN;
+	const totalBytes = Buffer.byteLength(text, "utf8");
+	if (maxTokens > 0 && totalBytes <= maxBytes) return text;
+	const marker = (removedBytes: number) =>
+		`…${Math.ceil(removedBytes / APPROX_BYTES_PER_TOKEN)} tokens truncated…`;
+	if (maxBytes === 0) return marker(totalBytes);
+	const chars = Array.from(text);
+	const sizes = chars.map((ch) => Buffer.byteLength(ch, "utf8"));
+	const leftBudget = Math.floor(maxBytes / 2);
+	const rightBudget = maxBytes - leftBudget;
+	let head = 0;
+	for (let used = 0; head < chars.length && used + sizes[head]! <= leftBudget; head++) used += sizes[head]!;
+	let tail = chars.length;
+	for (let used = 0; tail > head && used + sizes[tail - 1]! <= rightBudget; tail--) used += sizes[tail - 1]!;
+	return chars.slice(0, head).join("") + marker(totalBytes - maxBytes) + chars.slice(tail).join("");
+}
+
+// Port of core/src/realtime_context.rs truncate_realtime_text_to_token_budget:
+// the marker is added after choosing preserved content, so tighten the content
+// budget until the rendered text itself fits the cap.
+function truncateToTokens(text: string, budgetTokens: number): string {
+	let truncationBudget = budgetTokens;
+	for (;;) {
+		const candidate = truncateMiddleToTokens(text, truncationBudget);
+		const candidateTokens = approxTokenCount(candidate);
+		if (candidateTokens <= budgetTokens) return candidate;
+		const next = truncationBudget - Math.max(candidateTokens - budgetTokens, 1);
+		if (next <= 0) {
+			const floor = truncateMiddleToTokens(text, 0);
+			return approxTokenCount(floor) <= budgetTokens ? floor : "";
+		}
+		truncationBudget = next;
+	}
 }
 
 function clip(text: string, max: number): string {
@@ -228,96 +268,173 @@ async function resolveOAuth(): Promise<{ token: string; accountId?: string }> {
 	return { token, accountId };
 }
 
-// --- startup context (mirrors Codex core/src/realtime_context.rs) ---
+// --- startup context (ported from Codex core/src/realtime_context.rs) ---
 
-const SKIP_DIRS = new Set([
-	".git", "node_modules", "target", "dist", "build", ".venv", "venv",
-	"__pycache__", ".next", ".cache", "Pods", "DerivedData", ".idea",
+const STARTUP_CONTEXT_HEADER =
+	"Startup context from Pi.\nThis is background context about recent work and machine/workspace layout. It may be incomplete or stale. Use it to inform responses, and do not repeat it back unless relevant.";
+const CURRENT_THREAD_SECTION_TOKEN_BUDGET = 1200;
+const WORKSPACE_SECTION_TOKEN_BUDGET = 1600;
+const NOTES_SECTION_TOKEN_BUDGET = 300;
+const REALTIME_TURN_TOKEN_BUDGET = 300;
+const TREE_MAX_DEPTH = 2;
+const DIR_ENTRY_LIMIT = 20;
+const NOISY_DIR_NAMES = new Set([
+	".git", ".next", ".pytest_cache", ".ruff_cache", "__pycache__",
+	"build", "dist", "node_modules", "out", "target",
 ]);
 
-function workspaceMap(cwd: string, budgetTokens: number): string {
-	const lines: string[] = [];
-	const walk = (dir: string, prefix: string, depth: number) => {
-		if (depth > 2 || lines.length > 120) return;
-		let entries: string[];
-		try {
-			entries = readdirSync(dir).filter((name) => !name.startsWith(".") && !SKIP_DIRS.has(name));
-		} catch {
-			return;
-		}
-		for (const name of entries.slice(0, 30)) {
-			const full = join(dir, name);
-			let isDir = false;
-			try {
-				isDir = statSync(full).isDirectory();
-			} catch {}
-			lines.push(`${prefix}${name}${isDir ? "/" : ""}`);
-			if (isDir) walk(full, `${prefix}  `, depth + 1);
-		}
-	};
-	walk(cwd, "", 1);
-	return truncateToTokens(lines.join("\n"), budgetTokens);
-}
-
-function gitSummary(cwd: string): string {
-	const git = (args: string[]) => {
-		try {
-			return execFileSync("git", args, { cwd, encoding: "utf8", timeout: 2000 }).trim();
-		} catch {
-			return "";
-		}
-	};
-	const branch = git(["rev-parse", "--abbrev-ref", "HEAD"]);
-	if (!branch) return "Not a git repository.";
-	const status = git(["status", "--porcelain"]).split("\n").filter(Boolean);
-	const shown = status.slice(0, 15).join("\n");
-	const more = status.length > 15 ? `\n(+${status.length - 15} more)` : "";
-	return `Git branch: ${branch}\n${status.length ? `Changed files:\n${shown}${more}` : "Working tree clean."}`;
-}
-
-function recentThread(ctx: ExtensionContext, budgetTokens: number): string {
-	const perTurnTokens = 300;
-	const turns: string[] = [];
-	let used = 0;
+function collectTreeLines(dir: string, depth: number, lines: string[]): void {
+	if (depth >= TREE_MAX_DEPTH) return;
+	let entries: { name: string; isDir: boolean }[];
 	try {
-		const entries = ctx.sessionManager.getBranch();
-		for (let index = entries.length - 1; index >= 0 && used < budgetTokens; index -= 1) {
-			const entry = entries[index] as any;
+		entries = readdirSync(dir)
+			.filter((name) => !name.startsWith(".") && !NOISY_DIR_NAMES.has(name))
+			.map((name) => {
+				let isDir = false;
+				try {
+					isDir = statSync(join(dir, name)).isDirectory();
+				} catch {}
+				return { name, isDir };
+			});
+	} catch {
+		return;
+	}
+	// Directories first, then lexicographic, as upstream read_sorted_entries does.
+	entries.sort((a, b) => Number(b.isDir) - Number(a.isDir) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+	const indent = "  ".repeat(depth);
+	for (const entry of entries.slice(0, DIR_ENTRY_LIMIT)) {
+		lines.push(`${indent}- ${entry.name}${entry.isDir ? "/" : ""}`);
+		if (entry.isDir) collectTreeLines(join(dir, entry.name), depth + 1, lines);
+	}
+	if (entries.length > DIR_ENTRY_LIMIT) {
+		lines.push(`${indent}- ... ${entries.length - DIR_ENTRY_LIMIT} more entries`);
+	}
+}
+
+function renderTree(root: string): string[] | undefined {
+	try {
+		if (!statSync(root).isDirectory()) return undefined;
+	} catch {
+		return undefined;
+	}
+	const lines: string[] = [];
+	collectTreeLines(root, 0, lines);
+	return lines.length ? lines : undefined;
+}
+
+function gitRoot(cwd: string): string | undefined {
+	try {
+		const root = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+			cwd,
+			encoding: "utf8",
+			timeout: 2000,
+		}).trim();
+		return root || undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function baseName(path: string): string {
+	return path.split("/").filter(Boolean).pop() ?? path;
+}
+
+function buildWorkspaceSection(cwd: string): string | undefined {
+	const root = gitRoot(cwd);
+	const userRoot = homedir();
+	const cwdTree = renderTree(cwd);
+	const gitRootTree = root && root !== cwd ? renderTree(root) : undefined;
+	const userRootTree = userRoot !== cwd && userRoot !== root ? renderTree(userRoot) : undefined;
+	if (!cwdTree && !root && !userRootTree) return undefined;
+
+	const lines = [`Current working directory: ${cwd}`, `Working directory name: ${baseName(cwd)}`];
+	if (root) {
+		lines.push(`Git root: ${root}`);
+		lines.push(`Git project: ${baseName(root)}`);
+	}
+	lines.push(`User root: ${userRoot}`);
+	if (cwdTree) lines.push("", "Working directory tree:", ...cwdTree);
+	if (gitRootTree) lines.push("", "Git root tree:", ...gitRootTree);
+	if (userRootTree) lines.push("", "User root tree:", ...userRootTree);
+	return lines.join("\n");
+}
+
+function buildCurrentThreadSection(ctx: ExtensionContext): string | undefined {
+	type Turn = { user: string[]; assistant: string[] };
+	const turns: Turn[] = [];
+	let current: Turn = { user: [], assistant: [] };
+	try {
+		for (const entry of ctx.sessionManager.getBranch() as any[]) {
 			if (entry?.type !== "message") continue;
 			const role = entry.message?.role;
-			if (role !== "user" && role !== "assistant") continue;
 			const text = messageText(entry.message).trim();
 			if (!text) continue;
-			const rendered = `${role}: ${truncateToTokens(text, perTurnTokens)}`;
-			turns.push(rendered);
-			used += Math.ceil(rendered.length / APPROX_CHARS_PER_TOKEN);
+			if (role === "user") {
+				if (current.user.length || current.assistant.length) {
+					turns.push(current);
+					current = { user: [], assistant: [] };
+				}
+				current.user.push(text);
+			} else if (role === "assistant") {
+				// Upstream drops assistant text that precedes any user message.
+				if (!current.user.length && !current.assistant.length) continue;
+				current.assistant.push(text);
+			}
 		}
-	} catch {}
-	return turns.length ? turns.reverse().join("\n\n") : "No prior conversation in this session.";
+	} catch {
+		return undefined;
+	}
+	if (current.user.length || current.assistant.length) turns.push(current);
+	if (!turns.length) return undefined;
+
+	const lines = [
+		"Most recent user/assistant turns from this exact thread. Use them for continuity when responding.",
+	];
+	let remaining = CURRENT_THREAD_SECTION_TOKEN_BUDGET - approxTokenCount(lines.join("\n"));
+	let retained = 0;
+	turns.reverse();
+	for (const [index, turn] of turns.entries()) {
+		if (remaining <= 0) break;
+		const turnLines = [index === 0 ? "### Latest turn" : `### Previous turn ${index}`];
+		if (turn.user.length) turnLines.push("User:", turn.user.join("\n\n"));
+		if (turn.assistant.length) turnLines.push("", "Assistant:", turn.assistant.join("\n\n"));
+		const text = truncateToTokens(turnLines.join("\n"), Math.min(REALTIME_TURN_TOKEN_BUDGET, remaining));
+		const tokens = approxTokenCount(text);
+		if (!tokens) continue;
+		lines.push("", text);
+		remaining -= tokens;
+		retained += 1;
+	}
+	return retained ? lines.join("\n") : undefined;
+}
+
+function formatSection(title: string, body: string | undefined, budgetTokens: number): string | undefined {
+	const trimmed = body?.trim();
+	if (!trimmed) return undefined;
+	const heading = `## ${title}\n`;
+	const bodyBudget = budgetTokens - approxTokenCount(heading);
+	if (bodyBudget <= 0) return undefined;
+	const rendered = truncateToTokens(trimmed, bodyBudget);
+	return rendered ? `${heading}${rendered}` : undefined;
 }
 
 function buildStartupContext(ctx: ExtensionContext): string {
-	const thread = recentThread(ctx, 1200);
-	const workspace = workspaceMap(ctx.cwd, 1600);
-	const sections = [
-		"<startup_context>",
-		"Snapshot captured when the talk session started. Use it to ground answers and delegations; the background agent always has the authoritative, current state.",
-		"",
-		"## Current Thread",
-		thread,
-		"",
-		"## Machine / Workspace Map",
-		`Working directory: ${ctx.cwd}`,
-		gitSummary(ctx.cwd),
-		workspace ? `Directory tree (depth 2):\n${workspace}` : "",
-		"",
-		"## Notes",
-		`Date: ${new Date().toString()}`,
-		`Platform: ${process.platform}`,
-		ctx.sessionManager.getSessionName?.() ? `Session: ${ctx.sessionManager.getSessionName()}` : "",
-		"</startup_context>",
-	].filter((section) => section !== "");
-	return truncateToTokens(sections.join("\n"), STARTUP_CONTEXT_TOKEN_BUDGET);
+	const thread = formatSection("Current Thread", buildCurrentThreadSection(ctx), CURRENT_THREAD_SECTION_TOKEN_BUDGET);
+	const workspace = formatSection(
+		"Machine / Workspace Map",
+		buildWorkspaceSection(ctx.cwd),
+		WORKSPACE_SECTION_TOKEN_BUDGET,
+	);
+	if (!thread && !workspace) return "";
+	const notes = formatSection(
+		"Notes",
+		"Built at realtime startup from the current thread history and a bounded local workspace scan. This excludes repo memory instructions, AGENTS files, project-doc prompt blends, and memory summaries.",
+		NOTES_SECTION_TOKEN_BUDGET,
+	);
+	const parts = [STARTUP_CONTEXT_HEADER, thread, workspace, notes].filter(
+		(part): part is string => part !== undefined,
+	);
+	return `<startup_context>\n${parts.join("\n\n")}\n</startup_context>`;
 }
 
 // --- audio backends ---
@@ -531,10 +648,9 @@ class TalkSession {
 		};
 		if (accountId) headers["chatgpt-account-id"] = accountId;
 
-		const instructions =
-			BACKEND_PROMPT.replaceAll("{{ user_first_name }}", userFirstName()) +
-			"\n\n" +
-			buildStartupContext(this.ctx);
+		const prompt = BACKEND_PROMPT.replaceAll("{{ user_first_name }}", userFirstName());
+		const startupContext = buildStartupContext(this.ctx);
+		const instructions = startupContext ? `${prompt}\n\n${startupContext}` : prompt;
 
 		const url = `${REALTIME_URL}?model=${encodeURIComponent(MODEL)}`;
 		const ws = new (globalThis as any).WebSocket(url, { headers });
@@ -678,20 +794,17 @@ class TalkSession {
 				this.firstChunkAt = 0;
 				break;
 			case "response.done":
-			case "response.cancelled": {
+			case "response.cancelled":
+				// Upstream clears the tracked output audio item and drains the
+				// deferred response.create queue here; function calls arrive
+				// through conversation.item.done, not the response payload.
+				this.currentItemId = undefined;
 				this.responseActive = false;
 				if (this.pendingResponseCreate) {
 					this.pendingResponseCreate = false;
 					this.send({ type: "response.create" });
 				}
-				const outputs = msg.response?.output;
-				if (Array.isArray(outputs)) {
-					for (const item of outputs) {
-						if (item?.type === "function_call") this.handleFunctionCall(item);
-					}
-				}
 				break;
-			}
 			case "response.output_audio.delta":
 			case "response.audio.delta": {
 				if (msg.item_id) this.currentItemId = msg.item_id;
@@ -747,15 +860,17 @@ class TalkSession {
 	}
 
 	private onBargeIn(speechItemId?: string): void {
-		// The user started talking mid-reply: stop local playback immediately and
-		// truncate the assistant item to what was actually heard (upstream sends
-		// conversation.item.truncate on speech_started, but only when the event's
-		// item_id is absent or matches the tracked output item).
-		if (!this.isPlaying() && !this.currentItemId) return;
-		if (this.currentItemId && (!speechItemId || speechItemId === this.currentItemId)) {
+		// The user started talking mid-reply: truncate the assistant item to what
+		// was actually heard (upstream takes the tracked output item and sends
+		// conversation.item.truncate, but only when the event's item_id is absent
+		// or matches it), then stop local playback immediately.
+		if (!this.currentItemId && !this.isPlaying()) return;
+		const itemId = this.currentItemId;
+		this.currentItemId = undefined;
+		if (itemId && (!speechItemId || speechItemId === itemId)) {
 			this.send({
 				type: "conversation.item.truncate",
-				item_id: this.currentItemId,
+				item_id: itemId,
 				content_index: 0,
 				audio_end_ms: Math.round((this.playedBytes / 2 / SAMPLE_RATE) * 1000),
 			});
@@ -763,29 +878,35 @@ class TalkSession {
 		this.playbackEndsAt = 0;
 		this.audio?.flush();
 		this.endLine("asst");
-		this.currentItemId = undefined;
 	}
 
 	// --- background_agent handoff (the Codex intermediary/backend loop) ---
 
 	private handleFunctionCall(item: any): void {
-		const callId = item?.call_id;
+		// Upstream falls back to the item id when call_id is missing, ignores
+		// function calls that match neither tool, and clears the tracked output
+		// audio item on both handoff and noop requests.
+		const callId = item?.call_id ?? item?.id;
 		if (!callId || this.processedCalls.has(callId)) return;
 		this.processedCalls.add(callId);
+		this.currentItemId = undefined;
 
 		if (item.name === "remain_silent") {
 			this.sendFunctionOutput(callId, "");
 			return;
 		}
-		if (item.name !== "background_agent") {
-			this.sendFunctionOutput(callId, `Unknown tool: ${item.name}`);
-			this.createResponse();
-			return;
-		}
+		if (item.name !== "background_agent") return;
 
 		let prompt = "";
 		try {
-			prompt = String(JSON.parse(item.arguments || "{}").prompt ?? "");
+			const args = JSON.parse(item.arguments || "{}");
+			for (const key of TOOL_ARGUMENT_KEYS) {
+				const value = args?.[key];
+				if (typeof value === "string") {
+					prompt = value;
+					break;
+				}
+			}
 		} catch {}
 		if (!prompt.trim()) {
 			this.sendFunctionOutput(callId, "No prompt provided.");
@@ -810,8 +931,10 @@ class TalkSession {
 		const text = messageText(message).trim();
 		if (!text) return;
 		// Upstream truncates each backend message independently to the budget
-		// (realtime_backend_output), prefixing before truncation.
-		this.sendItem("user", truncateToTokens(BACKEND_PREFIX + text, BACKEND_OUTPUT_TOKEN_BUDGET));
+		// (realtime_backend_output), prefixing before truncation and skipping
+		// the prefix when the text already carries it.
+		const prefixed = text.startsWith(BACKEND_PREFIX) ? text : BACKEND_PREFIX + text;
+		this.sendItem("user", truncateToTokens(prefixed, BACKEND_OUTPUT_TOKEN_BUDGET));
 	}
 
 	onAgentEnd(): void {
@@ -827,7 +950,8 @@ class TalkSession {
 		// Keep the voice model aware of what the user typed directly to the
 		// backend; context only, it should not speak up about it uninvited.
 		const trimmed = text.trim();
-		if (trimmed) this.sendItem("user", USER_PREFIX + trimmed);
+		if (!trimmed) return;
+		this.sendItem("user", trimmed.startsWith(USER_PREFIX) ? trimmed : USER_PREFIX + trimmed);
 	}
 
 	// --- transcript widget ---
