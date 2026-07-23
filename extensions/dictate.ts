@@ -1,7 +1,6 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { mkdtemp, rm, stat } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import {
 	CustomEditor,
@@ -21,19 +20,28 @@ import {
 	type TUI,
 } from "@earendil-works/pi-tui";
 
-const MODEL = process.env.PI_DICTATE_MODEL?.trim() || "mlx-community/whisper-large-v3-turbo";
 const STATE_PATH = join(getAgentDir(), "dictate.json");
 const MAX_RECORDING_MS = 5 * 60 * 1000;
 const HOLD_DELAY_MS = 500;
 const PRESPAWN_DELAY_MS = 120;
 const MIN_RECORDING_MS = 150;
 const CLOSE_GRACE_MS = 400;
-const TRANSCRIBE_TIMEOUT_MS = 60 * 1000;
+const CONNECT_TIMEOUT_MS = 10 * 1000;
+const FINALIZE_TIMEOUT_MS = 15 * 1000;
+const TAIL_SILENCE_MS = 600;
 const STDERR_TAIL = 4000;
-const IDLE_UNLOAD_MS = (() => {
-	const configured = Number.parseInt(process.env.PI_DICTATE_IDLE_MS ?? "", 10);
-	return Number.isFinite(configured) ? configured : 10 * 60 * 1000;
-})();
+
+// The realtime API only accepts 24 kHz PCM16.
+const SAMPLE_RATE = 24000;
+const AUTH_PATH = join(homedir(), ".codex", "auth.json");
+const AUTH_HINT = "run `codex login` if this persists";
+const REALTIME_URL =
+	process.env.PI_DICTATE_ENDPOINT?.trim() || "wss://api.openai.com/v1/realtime?intent=transcription";
+// gpt-realtime-whisper emits transcript deltas as you speak; the gpt-4o-*-transcribe
+// models only produce text once the turn is committed.
+const MODEL = process.env.PI_DICTATE_MODEL?.trim() || "gpt-realtime-whisper";
+const LANGUAGE = process.env.PI_DICTATE_LANGUAGE?.trim() || "en";
+const DELAY = process.env.PI_DICTATE_DELAY?.trim() || "low";
 
 const RECORDING_FRAMES = ["▁▁▂▃▂▁▁", "▁▂▃▅▃▂▁", "▂▃▅▇▅▃▂", "▃▅▇█▇▅▃", "▂▃▅▇▅▃▂", "▁▂▃▅▃▂▁"];
 const TRANSCRIBING_FRAMES = ["·  ", "·· ", "···"];
@@ -42,14 +50,16 @@ type DictationState = "idle" | "recording" | "transcribing";
 
 type Recording = {
 	child: ChildProcess;
-	dir: string;
-	wavPath: string;
 	armedAt: number;
 	armed: boolean;
 	stderr: string;
+	bytes: number;
+	transcribed: boolean;
+	/** Audio captured before the hold was confirmed, replayed once the session opens. */
+	buffered: Buffer[];
+	session?: LiveSession;
 	closed: Promise<void>;
 };
-
 class Timer {
 	private handle?: ReturnType<typeof setTimeout>;
 
@@ -75,77 +85,7 @@ function executable(envName: string, fallback: string, candidates: string[]): st
 }
 
 const FFMPEG = executable("PI_DICTATE_FFMPEG", "ffmpeg", ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]);
-const MLX_WHISPER = executable("PI_DICTATE_MLX_WHISPER", "mlx_whisper", [
-	join(homedir(), ".local/bin/mlx_whisper"),
-]);
 const AUDIO_DEVICE = process.env.PI_DICTATE_AUDIO_DEVICE?.trim() || "0";
-
-const PYTHON = (() => {
-	const configured = process.env.PI_DICTATE_PYTHON?.trim();
-	if (configured) return configured;
-	try {
-		const head = readFileSync(realpathSync(MLX_WHISPER), "utf8").slice(0, 256);
-		const interpreter = /^#!\s*(\S+)/.exec(head.split("\n")[0] ?? "")?.[1];
-		if (interpreter && existsSync(interpreter)) return interpreter;
-	} catch {
-	}
-	return "python3";
-})();
-
-const WORKER_SOURCE = String.raw`
-import json, os, sys
-
-out = os.fdopen(os.dup(1), "w")
-os.dup2(2, 1)
-
-def emit(payload):
-    out.write(json.dumps(payload) + "\n")
-    out.flush()
-
-def transcribe(audio):
-    return mlx_whisper.transcribe(
-        audio,
-        path_or_hf_repo=model,
-        language="en",
-        task="transcribe",
-        temperature=0.0,
-        condition_on_previous_text=False,
-        verbose=False,
-    )
-
-def is_silent(path):
-    with wave.open(path) as handle:
-        samples = np.frombuffer(handle.readframes(handle.getnframes()), dtype=np.int16)
-    return not samples.size or float(np.abs(samples).max()) / 32768.0 < silence_peak
-
-try:
-    import wave
-
-    import numpy as np
-    import mlx_whisper
-
-    model = os.environ["PI_DICTATE_MODEL"]
-    silence_peak = float(os.environ.get("PI_DICTATE_SILENCE_PEAK", "0.02"))
-    transcribe(np.zeros(16000, dtype=np.float32))
-except Exception as error:
-    emit({"fatal": str(error)})
-    sys.exit(1)
-
-emit({"ready": True})
-
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    request = json.loads(line)
-    request_id = request.get("id")
-    try:
-        path = request["path"]
-        text = "" if is_silent(path) else (transcribe(path).get("text") or "").strip()
-        emit({"id": request_id, "text": text})
-    except Exception as error:
-        emit({"id": request_id, "error": str(error)})
-`;
 
 function errorText(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
@@ -153,19 +93,6 @@ function errorText(error: unknown): string {
 
 function tail(existing: string, chunk: unknown): string {
 	return (existing + String(chunk)).slice(-STDERR_TAIL);
-}
-
-function onLines(stream: NodeJS.ReadableStream | null | undefined, handler: (line: string) => void): void {
-	let buffer = "";
-	stream?.on("data", (chunk) => {
-		buffer += String(chunk);
-		const parts = buffer.split("\n");
-		buffer = parts.pop() ?? "";
-		for (const part of parts) {
-			const line = part.trim();
-			if (line) handler(line);
-		}
-	});
 }
 
 const MODIFIER_MASK = 0x20000 | 0x40000 | 0x80000 | 0x100000;
@@ -182,6 +109,195 @@ function modifierHeld(): Promise<boolean> {
 			},
 		);
 	});
+}
+
+function stopChild(child: ChildProcess | undefined, signal: NodeJS.Signals = "SIGINT"): void {
+	if (child && child.exitCode === null && child.signalCode === null) child.kill(signal);
+}
+
+type Credentials = { token: string; accountId?: string };
+
+/**
+ * Reuses the Codex login rather than a separate API key: the ChatGPT OAuth access
+ * token in ~/.codex/auth.json carries `aud: https://api.openai.com/v1`, so the
+ * transcriptions endpoint accepts it directly. Read per request, because Codex
+ * refreshes the file in the background.
+ */
+function credentials(): Credentials {
+	let auth: { tokens?: { access_token?: string; account_id?: string }; OPENAI_API_KEY?: string | null };
+	try {
+		auth = JSON.parse(readFileSync(AUTH_PATH, "utf8"));
+	} catch {
+		return requireEnvKey("no Codex credentials at ~/.codex/auth.json");
+	}
+
+	const token = auth.tokens?.access_token;
+	if (!token) return requireEnvKey("no OAuth token in ~/.codex/auth.json");
+	if (expired(token)) return requireEnvKey("Codex login expired");
+	return { token, accountId: auth.tokens?.account_id };
+}
+
+function requireEnvKey(reason: string): Credentials {
+	const apiKey = process.env.OPENAI_API_KEY?.trim();
+	if (apiKey) return { token: apiKey };
+	throw new Error(`${reason}; run \`codex login\``);
+}
+
+function expired(token: string): boolean {
+	try {
+		const payload = token.split(".")[1] ?? "";
+		const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+		return typeof claims.exp === "number" && claims.exp * 1000 <= Date.now();
+	} catch {
+		return false;
+	}
+}
+
+const SILENCE_TAIL = Buffer.alloc(Math.floor((SAMPLE_RATE * 2 * TAIL_SILENCE_MS) / 1000)).toString("base64");
+
+type LiveSession = {
+	/** Raw s16le mono 24 kHz straight off the recorder. */
+	push(pcm: Buffer): void;
+	/** Flushes the tail, waits for the final transcript, returns text not already streamed. */
+	finish(): Promise<string>;
+	cancel(): void;
+};
+
+/**
+ * A transcription-only Realtime session over WebSocket. Deltas arrive while the user
+ * is still speaking, which is the whole point: the batch `/v1/audio/transcriptions`
+ * endpoint cannot start until the recording has finished uploading.
+ *
+ * `gpt-realtime-whisper` streams natively and does not support VAD, so end-of-turn is
+ * driven by an explicit commit on key release.
+ */
+function openLiveTranscription(onDelta: (delta: string) => void): LiveSession {
+	const { token, accountId } = credentials();
+	const headers: Record<string, string> = {
+		Authorization: `Bearer ${token}`,
+		originator: "pi",
+		"user-agent": `pi-dictate (${process.platform}; ${process.arch})`,
+	};
+	if (accountId) headers["chatgpt-account-id"] = accountId;
+
+	const ws = new (globalThis as any).WebSocket(REALTIME_URL, { headers });
+	const queue: string[] = [];
+	let ready = false;
+	let done = false;
+	let failure: Error | undefined;
+	let streamed = 0;
+	let finalText = "";
+	let settle: (() => void) | undefined;
+
+	const connectTimer = new Timer();
+	const finishTimer = new Timer();
+
+	const send = (message: unknown): void => {
+		const payload = JSON.stringify(message);
+		if (ready) ws.send(payload);
+		else queue.push(payload);
+	};
+
+	const fail = (error: Error): void => {
+		failure ??= error;
+		settle?.();
+	};
+
+	const close = (): void => {
+		connectTimer.clear();
+		finishTimer.clear();
+		try {
+			ws.close();
+		} catch {
+		}
+	};
+
+	connectTimer.set(CONNECT_TIMEOUT_MS, () => fail(new Error("realtime connection timed out")));
+
+	ws.addEventListener("open", () => {
+		connectTimer.clear();
+		ws.send(
+			JSON.stringify({
+				type: "session.update",
+				session: {
+					type: "transcription",
+					audio: {
+						input: {
+							format: { type: "audio/pcm", rate: SAMPLE_RATE },
+							transcription: { model: MODEL, language: LANGUAGE, delay: DELAY },
+							noise_reduction: { type: "near_field" },
+							turn_detection: null,
+						},
+					},
+				},
+			}),
+		);
+	});
+
+	ws.addEventListener("error", () => fail(new Error(`could not reach the realtime API (${AUTH_HINT})`)));
+
+	ws.addEventListener("close", () => {
+		done = true;
+		settle?.();
+	});
+
+	ws.addEventListener("message", (event: { data: string }) => {
+		let message: { type?: string; delta?: string; transcript?: string; error?: { message?: string } };
+		try {
+			message = JSON.parse(event.data);
+		} catch {
+			return;
+		}
+		switch (message.type) {
+			case "session.updated":
+				ready = true;
+				for (const payload of queue.splice(0)) ws.send(payload);
+				break;
+			case "conversation.item.input_audio_transcription.delta":
+				if (message.delta) {
+					streamed++;
+					onDelta(message.delta);
+				}
+				break;
+			case "conversation.item.input_audio_transcription.completed":
+				finalText = String(message.transcript ?? "");
+				settle?.();
+				break;
+			case "conversation.item.input_audio_transcription.failed":
+			case "error":
+				fail(new Error(message.error?.message ?? "realtime transcription failed"));
+				break;
+		}
+	});
+
+	return {
+		push(pcm: Buffer): void {
+			if (done || failure) return;
+			send({ type: "input_audio_buffer.append", audio: pcm.toString("base64") });
+		},
+
+		cancel(): void {
+			done = true;
+			close();
+		},
+
+		async finish(): Promise<string> {
+			if (!done && !failure) {
+				send({ type: "input_audio_buffer.append", audio: SILENCE_TAIL });
+				send({ type: "input_audio_buffer.commit" });
+				await new Promise<void>((resolve) => {
+					settle = resolve;
+					finishTimer.set(FINALIZE_TIMEOUT_MS, resolve);
+					if (failure || done) resolve();
+				});
+				settle = undefined;
+			}
+			close();
+			if (failure) throw failure;
+			// Deltas are already in the editor; only report text that never streamed.
+			return streamed > 0 ? "" : finalText.trim();
+		},
+	};
 }
 
 function readEnabled(): boolean {
@@ -211,11 +327,29 @@ class DictationEditor extends CustomEditor {
 		for (let index = 0; index < count; index++) super.handleInput("\x7f");
 	}
 
-	insertTranscription(text: string): void {
+	/**
+	 * Transcript fragments arrive one at a time and already carry their own spacing,
+	 * so only the first fragment of an utterance is spaced against existing text —
+	 * doing it per fragment splits words ("dict" + "ation" -> "dict ation").
+	 */
+	insertTranscription(text: string, atStart = true): void {
+		if (!text) return;
+		if (!atStart) {
+			this.insertTextAtCursor(text);
+			return;
+		}
+		const body = text.replace(/^\s+/, "");
+		if (!body) return;
 		const cursor = this.getCursor();
 		const line = this.getLines()[cursor.line] ?? "";
 		const needsLeadingSpace = cursor.col > 0 && !/\s/.test(line[cursor.col - 1] ?? "");
-		this.insertTextAtCursor(`${needsLeadingSpace ? " " : ""}${text} `);
+		this.insertTextAtCursor(`${needsLeadingSpace ? " " : ""}${body}`);
+	}
+
+	endTranscription(): void {
+		const cursor = this.getCursor();
+		const line = this.getLines()[cursor.line] ?? "";
+		if (cursor.col > 0 && !/\s/.test(line[cursor.col - 1] ?? "")) this.insertTextAtCursor(" ");
 	}
 
 	setDictationState(state: DictationState): void {
@@ -318,129 +452,14 @@ export default function dictate(pi: ExtensionAPI) {
 		if (ctx?.hasUI) ctx.ui.notify(message, level);
 	};
 
-	const stopChild = (child: ChildProcess | undefined, signal: NodeJS.Signals = "SIGINT") => {
-		if (child && child.exitCode === null && child.signalCode === null) child.kill(signal);
-	};
-
-
-	type Pending = { resolve: (text: string) => void; reject: (error: Error) => void };
-	type Worker = {
-		child: ChildProcess;
-		ready: Promise<void>;
-		pending: Map<number, Pending>;
-		stderr: string;
-	};
-
-	let worker: Worker | undefined;
-	let nextRequestId = 1;
-	const idleTimer = new Timer();
-
-	function disposeWorker(reason: string): void {
-		const current = worker;
-		worker = undefined;
-		idleTimer.clear();
-		if (!current) return;
-		for (const pending of current.pending.values()) pending.reject(new Error(reason));
-		current.pending.clear();
-		stopChild(current.child, "SIGKILL");
-	}
-
-	function scheduleIdleUnload(): void {
-		idleTimer.clear();
-		if (IDLE_UNLOAD_MS > 0) idleTimer.set(IDLE_UNLOAD_MS, () => disposeWorker("idle"), true);
-	}
-
-	function spawnWorker(): Worker {
-		const child = spawn(PYTHON, ["-u", "-c", WORKER_SOURCE], {
-			env: {
-				...process.env,
-				HF_HUB_OFFLINE: "1",
-				PI_DICTATE_MODEL: MODEL,
-			},
-			stdio: ["pipe", "pipe", "pipe"],
-		});
-		let resolveReady!: () => void;
-		let rejectReady!: (error: Error) => void;
-		const ready = new Promise<void>((resolve, reject) => {
-			resolveReady = resolve;
-			rejectReady = reject;
-		});
-		ready.catch(() => {});
-
-		const item: Worker = { child, ready, pending: new Map(), stderr: "" };
-
-		const fail = (reason: string) => {
-			rejectReady(new Error(reason));
-			for (const pending of item.pending.values()) pending.reject(new Error(reason));
-			item.pending.clear();
-			if (worker === item) worker = undefined;
-		};
-
-		onLines(child.stdout, (line) => {
-			let message: { ready?: boolean; fatal?: string; id?: number; text?: string; error?: string };
-			try {
-				message = JSON.parse(line);
-			} catch {
-				return;
-			}
-			if (message.ready) return resolveReady();
-			if (message.fatal) return rejectReady(new Error(message.fatal));
-			if (typeof message.id !== "number") return;
-			const pending = item.pending.get(message.id);
-			if (!pending) return;
-			item.pending.delete(message.id);
-			if (message.error) pending.reject(new Error(message.error));
-			else pending.resolve(message.text ?? "");
-		});
-		child.stderr?.on("data", (chunk) => (item.stderr = tail(item.stderr, chunk)));
-		child.stdin?.on("error", () => {});
-		child.once("error", (error) => fail(error.message));
-		child.once("close", (code, signal) => {
-			fail(item.stderr.trim().split("\n").pop() || `transcriber exited ${code ?? signal}`);
-		});
-		return item;
-	}
-
-	function ensureWorker(): Worker {
-		if (!worker) worker = spawnWorker();
-		scheduleIdleUnload();
-		return worker;
-	}
-
 	function warmUp(): void {
-		ensureWorker().ready.catch(() => {});
+		// Surfaces a stale login before the user has spoken into a dead session.
+		try {
+			credentials();
+		} catch {
+		}
 		void modifierHeld();
 	}
-
-	async function transcribe(wavPath: string): Promise<string> {
-		const item = ensureWorker();
-		await item.ready;
-		return new Promise<string>((resolve, reject) => {
-			if (item.child.exitCode !== null || item.child.signalCode !== null) {
-				reject(new Error("transcriber is not running"));
-				return;
-			}
-			const id = nextRequestId++;
-			const timer = setTimeout(() => {
-				item.pending.delete(id);
-				if (worker === item) disposeWorker("timeout");
-				reject(new Error("transcription timed out"));
-			}, TRANSCRIBE_TIMEOUT_MS);
-			item.pending.set(id, {
-				resolve: (text) => {
-					clearTimeout(timer);
-					scheduleIdleUnload();
-					resolve(text);
-				},
-				reject: (error) => {
-					clearTimeout(timer);
-					reject(error);
-				},
-			});
-			item.child.stdin?.write(`${JSON.stringify({ id, path: wavPath })}\n`);
-		});
-	}
-
 
 	let recording: Recording | undefined;
 	let starting: Promise<void> | undefined;
@@ -448,7 +467,12 @@ export default function dictate(pi: ExtensionAPI) {
 	const maxTimer = new Timer();
 
 	async function settled(): Promise<void> {
-		while (starting) await starting;
+		while (starting) {
+			const pending = starting;
+			await pending;
+			// Never wait on the same settled promise twice; that would spin forever.
+			if (starting === pending) starting = undefined;
+		}
 	}
 
 	function start(editor: DictationEditor): Promise<void> {
@@ -456,12 +480,8 @@ export default function dictate(pi: ExtensionAPI) {
 		if (recording || transcribing) return Promise.resolve();
 		const token = generation;
 
-		starting = (async () => {
-			let dir: string | undefined;
+		const pending = (async () => {
 			try {
-				dir = await mkdtemp(join(tmpdir(), "pi-dictate-"));
-				if (token !== generation) return;
-				const wavPath = join(dir, "speech.wav");
 				const child = spawn(
 					FFMPEG,
 					[
@@ -475,30 +495,40 @@ export default function dictate(pi: ExtensionAPI) {
 						"-ac",
 						"1",
 						"-ar",
-						"16000",
-						"-y",
-						wavPath,
+						String(SAMPLE_RATE),
+						"-f",
+						"s16le",
+						"-",
 					],
 					{ stdio: ["ignore", "pipe", "pipe"] },
 				);
 
 				const item: Recording = {
 					child,
-					dir,
-					wavPath,
 					armedAt: Date.now(),
 					armed: false,
 					stderr: "",
+					bytes: 0,
+					transcribed: false,
+					buffered: [],
 					closed: new Promise((resolve) => child.once("close", () => resolve())),
 				};
+
+				child.stdout?.on("data", (chunk: Buffer) => {
+					item.bytes += chunk.length;
+					// Before the hold is confirmed there is no session yet, so hold the
+					// audio back rather than losing the first words.
+					if (item.session) item.session.push(chunk);
+					else item.buffered.push(chunk);
+				});
 				child.stderr?.on("data", (chunk) => (item.stderr = tail(item.stderr, chunk)));
 				child.once("error", (error) => {
 					if (recording !== item) return;
 					recording = undefined;
 					maxTimer.clear();
+					item.session?.cancel();
 					editor.setDictationState("idle");
 					notify(`Dictation recorder failed: ${error.message}`, "error");
-					void rm(item.dir, { recursive: true, force: true });
 				});
 
 				if (token !== generation) {
@@ -506,16 +536,18 @@ export default function dictate(pi: ExtensionAPI) {
 					return;
 				}
 				recording = item;
-				dir = undefined;
 			} catch (error) {
 				editor.setDictationState("idle");
 				if (token === generation) notify(`Could not start dictation: ${errorText(error)}`, "error");
-			} finally {
-				starting = undefined;
-				if (dir) await rm(dir, { recursive: true, force: true });
 			}
 		})();
-		return starting;
+		// Cleared from out here: the body can finish synchronously, and clearing it
+		// inside would run before this assignment and leave `starting` set forever.
+		starting = pending;
+		void pending.finally(() => {
+			if (starting === pending) starting = undefined;
+		});
+		return pending;
 	}
 
 	async function arm(editor: DictationEditor): Promise<void> {
@@ -526,11 +558,29 @@ export default function dictate(pi: ExtensionAPI) {
 		item.armed = true;
 		item.armedAt = Date.now();
 		editor.setDictationState("recording");
+
+		const token = generation;
+		let atStart = true;
+		try {
+			// No `recording` check here: transcription runs ~1.4s behind speech, so for a
+			// short hold every delta lands after release has already cleared `recording`.
+			item.session = openLiveTranscription((delta) => {
+				if (token !== generation) return;
+				editor.insertTranscription(delta, atStart);
+				atStart = false;
+				item.transcribed = true;
+			});
+			for (const chunk of item.buffered.splice(0)) item.session.push(chunk);
+		} catch (error) {
+			notify(`Dictation failed: ${errorText(error)}`, "error");
+			void discard();
+			return;
+		}
+
 		maxTimer.set(MAX_RECORDING_MS, () => {
 			notify("Dictation stopped at 5-minute limit", "warning");
 			void stop(editor);
 		});
-		warmUp();
 	}
 
 	async function take(): Promise<Recording | undefined> {
@@ -546,7 +596,7 @@ export default function dictate(pi: ExtensionAPI) {
 		const item = await take();
 		if (!item) return;
 		stopChild(item.child, "SIGKILL");
-		await rm(item.dir, { recursive: true, force: true });
+		item.session?.cancel();
 	}
 
 	async function stop(editor?: DictationEditor): Promise<void> {
@@ -569,34 +619,33 @@ export default function dictate(pi: ExtensionAPI) {
 		]);
 		grace.clear();
 
-		if (token !== generation || Date.now() - item.armedAt < MIN_RECORDING_MS) {
+		const session = item.session;
+		if (!session || token !== generation || Date.now() - item.armedAt < MIN_RECORDING_MS) {
+			session?.cancel();
 			if (token === generation) editor?.setDictationState("idle");
-			await rm(item.dir, { recursive: true, force: true });
 			return;
 		}
 
 		transcribing = true;
 		try {
-			const info = await stat(item.wavPath);
-			if (info.size < 1000) throw new Error(item.stderr.trim() || "microphone produced no audio");
+			if (item.bytes < 1000) throw new Error(item.stderr.trim() || "microphone produced no audio");
 			editor?.setDictationState("transcribing");
 
-			const text = await transcribe(item.wavPath);
+			const trailing = await session.finish();
 			if (token !== generation) return;
-			if (!text) {
+			editor?.insertTranscription(trailing, !item.transcribed);
+			if (!item.transcribed && !trailing) {
 				notify("No speech detected", "warning");
 				return;
 			}
-			editor?.insertTranscription(text);
+			editor?.endTranscription();
 		} catch (error) {
 			if (token === generation) notify(`Dictation failed: ${errorText(error)}`, "error");
 		} finally {
 			transcribing = false;
 			if (token === generation) editor?.setDictationState("idle");
-			await rm(item.dir, { recursive: true, force: true });
 		}
 	}
-
 
 	type Hold = {
 		phase: "pending" | "checking" | "passthrough" | "dictating";
@@ -669,10 +718,9 @@ export default function dictate(pi: ExtensionAPI) {
 		maxTimer.clear();
 		const item = await take();
 		stopChild(item?.child, "SIGKILL");
-		if (transcribing) disposeWorker("cancelled");
+		item?.session?.cancel();
 		transcribing = false;
 		currentEditor?.setDictationState("idle");
-		if (item) await rm(item.dir, { recursive: true, force: true });
 	}
 
 	pi.on("session_start", (_event, context) => {
@@ -700,7 +748,6 @@ export default function dictate(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		await teardown();
-		disposeWorker("shutdown");
 		currentEditor?.dispose();
 		currentEditor = undefined;
 		ctx = undefined;
@@ -739,7 +786,6 @@ export default function dictate(pi: ExtensionAPI) {
 			}
 
 			await teardown();
-			disposeWorker("disabled");
 			context.ui.notify("Dictation off", "info");
 		},
 	});
