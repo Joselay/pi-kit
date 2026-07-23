@@ -28,6 +28,7 @@ Pi extensions live in [`extensions`](extensions):
 - [`fast.ts`](extensions/fast.ts) - `/fast` for Codex priority mode.
 - [`files.ts`](extensions/files.ts) - `/files` browser for Git and session-referenced files.
 - [`dupe.ts`](extensions/dupe.ts) - Duplicate the current session into a new Ghostty split.
+- [`emoji.ts`](extensions/emoji.ts) - `:shortcode:` autocomplete and `/emoji` picker.
 - [`goal.ts`](extensions/goal.ts) - Long-running goals with budgets and progress tracking.
 - [`header.ts`](extensions/header.ts) - Displays a random image header.
 - [`notify.ts`](extensions/notify.ts) - Plays a sound when the agent finishes.
@@ -49,6 +50,7 @@ Pi extensions live in [`extensions`](extensions):
 ## Support Files
 
 - [`analyze-edits.py`](analyze-edits.py) - `uv run analyze-edits.py` for edit-tool usage and failure stats from session logs.
+- [`emoji`](emoji) - Emoji dataset for the emoji extension; regenerate with `uv run emoji/build.py`.
 - [`shims`](shims) - Python command shims used by the uv extension.
 - [`voice`](voice) - Swift echo-cancellation audio helper for the voice extension (compiled on demand).
 - [`images`](images) - Header artwork.
