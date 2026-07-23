@@ -152,26 +152,22 @@ async function credentials(): Promise<Credentials> {
 	} catch (error) {
 		// A failed create() must not poison every later attempt.
 		runtimePromise = undefined;
-		return requireEnvKey(`could not load pi's model runtime (${errorText(error)})`);
+		throw new Error(`could not load pi's model runtime (${errorText(error)}); run /login`);
 	}
 
+	let check: any;
+	let token: string | undefined;
 	try {
-		const check = await runtime.checkAuth(PROVIDER_ID);
-		if (!runtime.isUsingOAuth(PROVIDER_ID) || check?.type !== "oauth") {
-			return requireEnvKey("pi is not signed in to the openai-codex subscription");
-		}
-		const token = (await runtime.getAuth(PROVIDER_ID))?.auth?.apiKey;
-		if (!token) return requireEnvKey("pi's openai-codex OAuth token could not be resolved");
-		return { token, accountId: accountIdFromToken(token) };
+		check = await runtime.checkAuth(PROVIDER_ID);
+		token = (await runtime.getAuth(PROVIDER_ID))?.auth?.apiKey;
 	} catch (error) {
-		return requireEnvKey(`pi's openai-codex OAuth check failed (${errorText(error)})`);
+		throw new Error(`pi's openai-codex OAuth check failed (${errorText(error)}); run /login`);
 	}
-}
-
-function requireEnvKey(reason: string): Credentials {
-	const apiKey = process.env.OPENAI_API_KEY?.trim();
-	if (apiKey) return { token: apiKey };
-	throw new Error(`${reason}; run /login`);
+	if (!runtime.isUsingOAuth(PROVIDER_ID) || check?.type !== "oauth") {
+		throw new Error("pi is not signed in to the openai-codex subscription; run /login");
+	}
+	if (!token) throw new Error("pi's openai-codex OAuth token could not be resolved; run /login");
+	return { token, accountId: accountIdFromToken(token) };
 }
 
 function accountIdFromToken(token: string): string | undefined {

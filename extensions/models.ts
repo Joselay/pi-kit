@@ -26,7 +26,7 @@ const CHATGPT_BASE_URL = process.env.PI_CODEX_CHATGPT_BASE_URL?.trim() || "https
  * The backend gates entries on `minimal_client_version`, so a stale value hides
  * new models. Bump (or set PI_CODEX_CLIENT_VERSION) when Codex CLI moves on.
  */
-const CLIENT_VERSION = process.env.PI_CODEX_CLIENT_VERSION?.trim() || "0.144.0";
+const CLIENT_VERSION = process.env.PI_CODEX_CLIENT_VERSION?.trim() || "0.145.0";
 const REQUEST_TIMEOUT_MS = 15_000;
 const USER_AGENT = "pi-models/0.1.0";
 const PROVIDER_ID = "openai-codex";
