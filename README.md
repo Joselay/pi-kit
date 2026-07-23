@@ -21,10 +21,11 @@ Skills live in [`skills`](skills):
 Pi extensions live in [`extensions`](extensions):
 
 - [`answer.ts`](extensions/answer.ts) - `/answer` interactive Q&A from the last assistant message.
+- [`autoreview.ts`](extensions/autoreview.ts) - `/autoreview` one-shot diff review by the `codex-auto-review` model (no agent turn).
 - [`btw.ts`](extensions/btw.ts) - Side-chat popover for tangential questions.
 - [`continue.ts`](extensions/continue.ts) - Shortcut to send `continue` when the agent stops.
 - [`cosmetic.ts`](extensions/cosmetic.ts) - All UI chrome: random image header, custom footer (model, context, Codex usage), whimsical working messages, and the completion sound.
-- [`dictate.ts`](extensions/dictate.ts) - `/dictate` push-to-talk voice input via local MLX Whisper.
+- [`dictate.ts`](extensions/dictate.ts) - `/dictate` push-to-talk voice input via `gpt-realtime-whisper`.
 - [`fast.ts`](extensions/fast.ts) - `/fast` for Codex priority mode.
 - [`files.ts`](extensions/files.ts) - `/files` browser for Git and session-referenced files.
 - [`dupe.ts`](extensions/dupe.ts) - Duplicate the current session into a new Ghostty split.
@@ -33,11 +34,29 @@ Pi extensions live in [`extensions`](extensions):
 - [`recall.ts`](extensions/recall.ts) - Project-scoped prompt history.
 - [`reset.ts`](extensions/reset.ts) - `/reset` for Codex usage-limit resets.
 - [`review.ts`](extensions/review.ts) - `/review` workflow for code changes and folders.
+- [`say.ts`](extensions/say.ts) - `/say` speak text or the last reply aloud (`gpt-realtime-2.1-mini` as TTS over OAuth).
+- [`semantic-recall.ts`](extensions/semantic-recall.ts) - `/recall` semantic search over past sessions (`text-embedding-3-large`).
 - [`todos.ts`](extensions/todos.ts) - File-based todo management and task refinement.
 - [`unified-edit.ts`](extensions/unified-edit.ts) - Replaces `edit` with row edit scripts and Codex-style patches.
 - [`usage.ts`](extensions/usage.ts) - Session usage and cost breakdown.
 - [`talk.ts`](extensions/talk.ts) - `/talk` live voice conversation driving the agent (Codex-style realtime intermediary over OAuth).
+- [`translate.ts`](extensions/translate.ts) - `/translate` live speech-to-speech translation via `gpt-realtime-translate`.
 - [`uv.ts`](extensions/uv.ts) - Replaces bash with a `uv`-aware version.
+
+## Local Models (gpt-oss)
+
+Pi supports OpenAI's open-weight `gpt-oss` models through the llama.cpp router
+(`brew install llama.cpp`). Start the router, then download/load and select the
+model from inside pi:
+
+```bash
+llama-server --models-dir ~/models --no-models-autoload --jinja \
+  --host 127.0.0.1 --port 8080 -ngl 999 -c 32768
+```
+
+In pi: `/login llama.cpp` (default URL `http://127.0.0.1:8080`), then `/llama`
+→ *Download model…* → search `gpt-oss-20b` (GGUF), load it, and pick it with
+`/model`. `gpt-oss-120b` works the same on machines with enough memory.
 
 ## Theme
 

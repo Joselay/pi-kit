@@ -25,6 +25,10 @@ function usage() {
   search.mjs --query-file <file> [options]
 
 Options:
+  --raw                              Single-shot search via the standalone
+                                     alpha/search endpoint (no answering model
+                                     pass: raw search output + result links)
+  --recency <days>                   With --raw: only results from the last N days
   --mode <cached|indexed|live>       Web access mode (default: cached, like upstream)
   --allowed-domains <a,b,...>        Restrict search results to these domains
   --search-context-size <low|medium|high>
@@ -58,6 +62,8 @@ function parseArgs(argv) {
     city: undefined,
     timezone: undefined,
     json: false,
+    raw: false,
+    recency: undefined,
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -68,6 +74,10 @@ function parseArgs(argv) {
     }
     if (arg === "--json") {
       args.json = true;
+      continue;
+    }
+    if (arg === "--raw") {
+      args.raw = true;
       continue;
     }
     const value = argv[++i];
@@ -104,6 +114,12 @@ function parseArgs(argv) {
       case "--timezone":
         args.timezone = value;
         break;
+      case "--recency": {
+        const days = Number.parseInt(value, 10);
+        if (!Number.isInteger(days) || days <= 0) fail("--recency must be a positive number of days");
+        args.recency = days;
+        break;
+      }
       default:
         fail(`unknown argument: ${arg}`);
     }
@@ -167,6 +183,65 @@ function endpointFor(baseUrl) {
   const normalized = baseUrl.replace(/\/+$/, "");
   const codexBase = normalized.endsWith("/codex") ? normalized : `${normalized}/codex`;
   return `${codexBase}/responses`;
+}
+
+// The standalone search endpoint upstream codex's `web.run` tool posts to
+// (codex-api/src/endpoint/search.rs): one shot, no answering model pass.
+function alphaSearchEndpoint(baseUrl) {
+  const normalized = baseUrl.replace(/\/+$/, "");
+  const codexBase = normalized.endsWith("/codex") ? normalized : `${normalized}/codex`;
+  return `${codexBase}/alpha/search`;
+}
+
+async function runRawSearch({ query, token, baseUrl, args }) {
+  const searchQuery = { q: query };
+  if (args.recency) searchQuery.recency = args.recency;
+  if (args.allowedDomains?.length) searchQuery.domains = args.allowedDomains;
+
+  const settings = { external_web_access: args.mode !== "cached" };
+  if (args.searchContextSize) settings.search_context_size = args.searchContextSize;
+  if (args.allowedDomains?.length) settings.filters = { allowed_domains: args.allowedDomains };
+  if (args.country || args.region || args.city || args.timezone) {
+    settings.user_location = {
+      type: "approximate",
+      ...(args.country && { country: args.country }),
+      ...(args.region && { region: args.region }),
+      ...(args.city && { city: args.city }),
+      ...(args.timezone && { timezone: args.timezone }),
+    };
+  }
+
+  const response = await fetchWithRetries(alphaSearchEndpoint(baseUrl), {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "chatgpt-account-id": accountIdFromToken(token),
+      originator: "pi",
+      "session-id": randomUUID(),
+      accept: "application/json",
+      "content-type": "application/json",
+      "user-agent": `pi-web-search-skill (${process.platform}; ${process.arch})`,
+    },
+    body: JSON.stringify({
+      id: randomUUID(),
+      model: SEARCH_MODEL,
+      commands: { search_query: [searchQuery] },
+      settings,
+      max_output_tokens: 2500,
+    }),
+  });
+
+  if (!response.ok) fail(await responseError(response));
+  const payload = await response.json();
+  const output = cleanText(payload.output ?? "");
+  const sources = [];
+  const seenUrls = new Set();
+  for (const result of payload.results ?? []) {
+    if (!result || typeof result !== "object" || !result.url || seenUrls.has(result.url)) continue;
+    seenUrls.add(result.url);
+    sources.push({ title: result.title ?? "", url: result.url });
+  }
+  return { searches: [query], answer: output, sources };
 }
 
 // Mirrors upstream create_web_search_tool: cached -> no external access,
@@ -328,6 +403,24 @@ try {
   if (!query) fail("query must not be empty");
 
   const { token, baseUrl } = await resolveOAuth();
+
+  if (args.raw) {
+    const result = await runRawSearch({ query, token, baseUrl, args });
+    if (!result.answer && result.sources.length === 0) fail("the search endpoint returned no output");
+    if (args.json) {
+      console.log(JSON.stringify(result, null, 2));
+    } else {
+      if (result.answer) console.log(result.answer);
+      if (result.sources.length) {
+        console.log("\nSources:");
+        result.sources.forEach((source, index) => {
+          console.log(`  [${index + 1}] ${source.title ? `${source.title} — ` : ""}${source.url}`);
+        });
+      }
+    }
+    process.exit(0);
+  }
+
   const requestBody = {
     model: SEARCH_MODEL,
     instructions:

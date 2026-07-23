@@ -23,6 +23,7 @@ node <skill-directory>/search.mjs --query "<focused question>"
 Give each call at least a 120-second timeout. The helper prints the searches performed, the cited answer, and a numbered source list.
 
 - `--query <text>` / `--query-file <path>` — exactly one is required; use `--query-file` for long queries.
+- `--raw` — single-shot search via the standalone `alpha/search` endpoint (the one upstream codex's `web.run` tool posts to): no answering-model pass, just the raw search output and result links. Faster and cheaper; use it for "find me the link/source" lookups where no synthesis is needed. `--recency <days>` restricts raw results to the last N days.
 - `--mode <cached|indexed|live>` — default `cached` (the upstream default) answers from the search index only; `indexed` allows live fetches of indexed URLs; `live` allows unrestricted live fetches. Escalate to `live` when freshness matters (breaking news, just-published releases, live status pages) or when `cached` results look stale.
 - `--allowed-domains <a.com,b.org>` — restrict results to specific domains (for example, pin documentation lookups to the official docs site).
 - `--search-context-size <low|medium|high>` — how much search context the hosted tool retrieves; leave unset for the server default, like upstream.
