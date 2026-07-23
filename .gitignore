@@ -9,6 +9,7 @@ trust.json
 fast.json
 dictate.json
 recall.json*
+recall-index.json
 pi-debug.log
 __pycache__/
 
