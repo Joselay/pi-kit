@@ -204,6 +204,8 @@ async function openLiveTranscription(mode: DictateMode, onDelta: (delta: string)
 						input: {
 							format: { type: "audio/pcm", rate: SAMPLE_RATE },
 							transcription,
+							// Codex's transcription-mode session omits noise_reduction;
+							// near_field is kept on purpose for close-mic laptop use.
 							noise_reduction: { type: "near_field" },
 							turn_detection: null,
 						},
@@ -257,9 +259,15 @@ async function openLiveTranscription(mode: DictateMode, onDelta: (delta: string)
 				break;
 			case "conversation.item.input_audio_transcription.failed":
 			case "error":
-				// Same fallback chain as codex's parse_error_event: error.message, then
-				// the top-level message field.
-				fail(new Error(message.error?.message ?? message.message ?? "realtime transcription failed"));
+				// Same fallback chain as codex's parse_error_event: the top-level
+				// message field, then error.message, then the stringified error.
+				fail(
+					new Error(
+						message.message ??
+							message.error?.message ??
+							(message.error ? JSON.stringify(message.error) : "realtime transcription failed"),
+					),
+				);
 				break;
 		}
 	});

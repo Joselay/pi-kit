@@ -15,10 +15,11 @@
 // assistant speaks) when the helper is unavailable.
 
 import { execFileSync } from "node:child_process";
-import { readdirSync, statSync } from "node:fs";
+import { closeSync, openSync, readdirSync, readSync, statSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 import {
+	getAgentDir,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
@@ -236,9 +237,17 @@ function userFirstName(): string {
 const STARTUP_CONTEXT_HEADER =
 	"Startup context from Pi.\nThis is background context about recent work and machine/workspace layout. It may be incomplete or stale. Use it to inform responses, and do not repeat it back unless relevant.";
 const CURRENT_THREAD_SECTION_TOKEN_BUDGET = 1200;
+const RECENT_WORK_SECTION_TOKEN_BUDGET = 2200;
 const WORKSPACE_SECTION_TOKEN_BUDGET = 1600;
 const NOTES_SECTION_TOKEN_BUDGET = 300;
 const REALTIME_TURN_TOKEN_BUDGET = 300;
+const MAX_RECENT_THREADS = 40;
+const MAX_RECENT_WORK_GROUPS = 8;
+const MAX_CURRENT_CWD_ASKS = 8;
+const MAX_OTHER_CWD_ASKS = 5;
+const MAX_ASK_CHARS = 240;
+// The session header and first user ask sit at the top of a session file.
+const SESSION_HEAD_BYTES = 64 * 1024;
 const TREE_MAX_DEPTH = 2;
 const DIR_ENTRY_LIMIT = 20;
 const NOISY_DIR_NAMES = new Set([
@@ -291,6 +300,7 @@ function gitRoot(cwd: string): string | undefined {
 			cwd,
 			encoding: "utf8",
 			timeout: 2000,
+			stdio: ["ignore", "pipe", "ignore"],
 		}).trim();
 		return root || undefined;
 	} catch {
@@ -320,6 +330,133 @@ function buildWorkspaceSection(cwd: string): string | undefined {
 	if (gitRootTree) lines.push("", "Git root tree:", ...gitRootTree);
 	if (userRootTree) lines.push("", "User root tree:", ...userRootTree);
 	return lines.join("\n");
+}
+
+// --- Recent Work (ported from Codex realtime_context.rs build_recent_work_section;
+// pi's on-disk session store stands in for codex's thread-store metadata) ---
+
+type SessionSummary = { cwd: string; mtimeMs: number; ask?: string };
+
+/** Session cwd and first user ask, read from the head of a session jsonl. */
+function readSessionSummary(path: string, mtimeMs: number): SessionSummary | undefined {
+	let head = "";
+	try {
+		const fd = openSync(path, "r");
+		try {
+			const buffer = Buffer.alloc(SESSION_HEAD_BYTES);
+			head = buffer.toString("utf8", 0, readSync(fd, buffer, 0, SESSION_HEAD_BYTES, 0));
+		} finally {
+			closeSync(fd);
+		}
+	} catch {
+		return undefined;
+	}
+	let cwd: string | undefined;
+	let ask: string | undefined;
+	for (const line of head.split("\n")) {
+		let entry: any;
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			continue; // the final line is usually cut mid-record by the head read
+		}
+		if (!cwd && entry?.type === "session" && typeof entry.cwd === "string") cwd = entry.cwd;
+		if (entry?.type === "message" && entry.message?.role === "user") {
+			// Upstream collapses the first user message to single-spaced words.
+			ask = messageText(entry.message).split(/\s+/).filter(Boolean).join(" ");
+			break;
+		}
+	}
+	if (!cwd) return undefined;
+	return { cwd, mtimeMs, ask: ask || undefined };
+}
+
+function clipAsk(ask: string): string {
+	const chars = Array.from(ask);
+	return chars.length > MAX_ASK_CHARS ? `${chars.slice(0, MAX_ASK_CHARS - 3).join("")}...` : ask;
+}
+
+function buildRecentWorkSection(cwd: string): string | undefined {
+	const files: { path: string; mtimeMs: number }[] = [];
+	try {
+		const sessionsDir = join(getAgentDir(), "sessions");
+		for (const dir of readdirSync(sessionsDir)) {
+			let names: string[];
+			try {
+				names = readdirSync(join(sessionsDir, dir));
+			} catch {
+				continue;
+			}
+			for (const name of names) {
+				if (!name.endsWith(".jsonl")) continue;
+				const path = join(sessionsDir, dir, name);
+				try {
+					files.push({ path, mtimeMs: statSync(path).mtimeMs });
+				} catch {}
+			}
+		}
+	} catch {
+		return undefined;
+	}
+	files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+	// Group by git project root, falling back to the session cwd (upstream's
+	// resolve_root_git_project_for_trust grouping).
+	type Group = { root: string; isGit: boolean; entries: SessionSummary[] };
+	const groups = new Map<string, Group>();
+	const rootCache = new Map<string, { root: string; isGit: boolean }>();
+	for (const file of files.slice(0, MAX_RECENT_THREADS)) {
+		const summary = readSessionSummary(file.path, file.mtimeMs);
+		if (!summary) continue;
+		let resolved = rootCache.get(summary.cwd);
+		if (!resolved) {
+			const root = gitRoot(summary.cwd);
+			resolved = root ? { root, isGit: true } : { root: summary.cwd, isGit: false };
+			rootCache.set(summary.cwd, resolved);
+		}
+		let group = groups.get(resolved.root);
+		if (!group) {
+			group = { root: resolved.root, isGit: resolved.isGit, entries: [] };
+			groups.set(resolved.root, group);
+		}
+		// Files arrive mtime-descending, so entries[0] stays the latest.
+		group.entries.push(summary);
+	}
+	if (!groups.size) return undefined;
+
+	const currentRoot = gitRoot(cwd) ?? cwd;
+	// Current project first, then latest activity, then path (upstream order).
+	const ordered = [...groups.values()].sort(
+		(a, b) =>
+			Number(b.root === currentRoot) - Number(a.root === currentRoot) ||
+			b.entries[0]!.mtimeMs - a.entries[0]!.mtimeMs ||
+			(a.root < b.root ? -1 : a.root > b.root ? 1 : 0),
+	);
+
+	const sections: string[] = [];
+	for (const group of ordered.slice(0, MAX_RECENT_WORK_GROUPS)) {
+		const latest = group.entries[0]!;
+		const lines = [
+			`### ${group.isGit ? "Git repo" : "Directory"}: ${group.root}`,
+			`Recent sessions: ${group.entries.length}`,
+			`Latest activity: ${new Date(latest.mtimeMs).toISOString()}`,
+			"",
+			"User asks:",
+		];
+		const seen = new Set<string>();
+		const maxAsks = group.root === currentRoot ? MAX_CURRENT_CWD_ASKS : MAX_OTHER_CWD_ASKS;
+		for (const entry of group.entries) {
+			if (!entry.ask) continue;
+			const key = `${entry.cwd}:${entry.ask}`;
+			if (seen.has(key)) continue;
+			seen.add(key);
+			lines.push(`- ${entry.cwd}: ${clipAsk(entry.ask)}`);
+			if (seen.size === maxAsks) break;
+		}
+		// Upstream keeps a group only when it contributed at least one ask.
+		if (seen.size) sections.push(lines.join("\n"));
+	}
+	return sections.length ? sections.join("\n\n") : undefined;
 }
 
 function buildCurrentThreadSection(ctx: ExtensionContext): string | undefined {
@@ -383,18 +520,19 @@ function formatSection(title: string, body: string | undefined, budgetTokens: nu
 
 function buildStartupContext(ctx: ExtensionContext): string {
 	const thread = formatSection("Current Thread", buildCurrentThreadSection(ctx), CURRENT_THREAD_SECTION_TOKEN_BUDGET);
+	const recentWork = formatSection("Recent Work", buildRecentWorkSection(ctx.cwd), RECENT_WORK_SECTION_TOKEN_BUDGET);
 	const workspace = formatSection(
 		"Machine / Workspace Map",
 		buildWorkspaceSection(ctx.cwd),
 		WORKSPACE_SECTION_TOKEN_BUDGET,
 	);
-	if (!thread && !workspace) return "";
+	if (!thread && !recentWork && !workspace) return "";
 	const notes = formatSection(
 		"Notes",
-		"Built at realtime startup from the current thread history and a bounded local workspace scan. This excludes repo memory instructions, AGENTS files, project-doc prompt blends, and memory summaries.",
+		"Built at realtime startup from the current thread history, local thread metadata, and a bounded local workspace scan. This excludes repo memory instructions, AGENTS files, project-doc prompt blends, and memory summaries.",
 		NOTES_SECTION_TOKEN_BUDGET,
 	);
-	const parts = [STARTUP_CONTEXT_HEADER, thread, workspace, notes].filter(
+	const parts = [STARTUP_CONTEXT_HEADER, thread, recentWork, workspace, notes].filter(
 		(part): part is string => part !== undefined,
 	);
 	return `<startup_context>\n${parts.join("\n\n")}\n</startup_context>`;
@@ -578,6 +716,7 @@ class TalkSession {
 				// deferred response.create queue here; function calls arrive
 				// through conversation.item.done, not the response payload.
 				this.currentItemId = undefined;
+				this.playedBytes = 0;
 				this.responseActive = false;
 				if (this.pendingResponseCreate) {
 					this.pendingResponseCreate = false;
@@ -586,7 +725,13 @@ class TalkSession {
 				break;
 			case "response.output_audio.delta":
 			case "response.audio.delta": {
-				if (msg.item_id) this.currentItemId = msg.item_id;
+				// Per-item accounting (upstream update_output_audio_state): the
+				// same item accumulates, a new item id replaces the state, so a
+				// barge-in truncates at the played offset within that item only.
+				if (msg.item_id && msg.item_id !== this.currentItemId) {
+					this.currentItemId = msg.item_id;
+					this.playedBytes = 0;
+				}
 				if (msg.delta) this.playChunk(Buffer.from(msg.delta, "base64"));
 				break;
 			}
@@ -613,7 +758,8 @@ class TalkSession {
 				if (msg.item?.type === "function_call") this.handleFunctionCall(msg.item);
 				break;
 			case "error": {
-				const message = msg.error?.message ?? JSON.stringify(msg);
+				// parse_error_event order: top-level message, then error.message.
+				const message = msg.message ?? msg.error?.message ?? JSON.stringify(msg.error ?? msg);
 				if (message.startsWith(ACTIVE_RESPONSE_ERROR_PREFIX)) {
 					// response.create raced an active response; defer and retry
 					// once the active response finishes (upstream queue behavior).
@@ -653,6 +799,7 @@ class TalkSession {
 				audio_end_ms: Math.round((this.playedBytes / 2 / SAMPLE_RATE) * 1000),
 			});
 		}
+		this.playedBytes = 0;
 		this.playbackEndsAt = 0;
 		this.audio?.flush();
 		this.endLine("asst");
@@ -668,6 +815,7 @@ class TalkSession {
 		if (!callId || this.processedCalls.has(callId)) return;
 		this.processedCalls.add(callId);
 		this.currentItemId = undefined;
+		this.playedBytes = 0;
 
 		if (item.name === "remain_silent") {
 			this.sendFunctionOutput(callId, "");
@@ -675,18 +823,21 @@ class TalkSession {
 		}
 		if (item.name !== "background_agent") return;
 
+		// Upstream extract_input_transcript: first non-empty string under the
+		// known keys, otherwise the raw arguments string.
 		let prompt = "";
 		try {
 			const args = JSON.parse(item.arguments || "{}");
 			for (const key of TOOL_ARGUMENT_KEYS) {
 				const value = args?.[key];
-				if (typeof value === "string") {
-					prompt = value;
+				if (typeof value === "string" && value.trim()) {
+					prompt = value.trim();
 					break;
 				}
 			}
 		} catch {}
-		if (!prompt.trim()) {
+		if (!prompt.trim() && typeof item.arguments === "string") prompt = item.arguments;
+		if (!prompt.trim() || prompt.trim() === "{}") {
 			this.sendFunctionOutput(callId, "No prompt provided.");
 			this.createResponse();
 			return;
