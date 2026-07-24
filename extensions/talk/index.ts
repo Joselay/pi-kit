@@ -658,7 +658,8 @@ class TalkVisual {
 	// character cell) with 2x2 supersampling per pixel. Each sample is
 	// projected onto a sphere and shaded with Lambert diffuse from a drifting
 	// light, a specular hot spot, a cool rim light, and an anti-aliased limb,
-	// over swirling two-tone plasma bands. Interior cells split their four
+	// over swirling two-tone plasma bands crossed by a scrolling meridian/
+	// parallel graticule that makes the rotation read. Interior cells split their four
 	// pixels into bright/dark groups (fg/bg) so real detail survives the
 	// two-colors-per-cell limit; edge cells keep a transparent background.
 	// Audio spins it faster, swells it, and lights it from within.
@@ -710,7 +711,13 @@ class TalkVisual {
 			const band = 0.5 + 0.5 * Math.sin(lon * 2.6 + Math.sin(lat * 2.2 + spin * 0.6) * churn);
 			const detail = 0.9 + 0.1 * Math.sin(lon * 6 + Math.sin(lat * 4 + spin * 1.3) * 2);
 			const glow = audio ? this.level * 0.45 * (1 - radius / edge) : 0;
-			const light = (0.1 + 0.9 * diffuse) * detail + glow;
+			// Meridian/parallel graticule scrolling with the spin so the
+			// rotation reads as a turning globe: thin, front-facing, fading
+			// into the shadowed hemisphere and compressing toward the limb.
+			const meridian = Math.abs(Math.cos(lon * 6)) ** 18;
+			const parallel = Math.abs(Math.cos(lat * 6)) ** 18;
+			const grid = Math.max(meridian, parallel) * sz * (0.3 + 0.7 * diffuse);
+			const light = (0.1 + 0.9 * diffuse) * detail + glow + grid * 0.32;
 			const aa = Math.min(1, (edge - radius) * 10);
 			const out: [number, number, number] = [0, 0, 0];
 			for (let i = 0; i < 3; i++) {
@@ -753,19 +760,25 @@ class TalkVisual {
 			}
 		}
 
-		// Sparks orbit the globe while the agent works.
+		// Sparks orbit the globe while the agent works, each trailing a short
+		// comet tail that fades behind it. Tail segments are drawn first so the
+		// bright head wins any pixels they share.
 		if (state === "working") {
+			const TRAIL = 5;
 			for (let k = 0; k < 3; k++) {
-				const a = spin * 0.6 + (k * Math.PI * 2) / 3;
-				const sxp = Math.round((W - 1) / 2 + Math.cos(a) * W * 0.46);
-				const syp = Math.round((H - 1) / 2 + Math.sin(a) * H * 0.42);
-				for (const xx of [sxp, sxp + 1]) {
-					if (xx < 0 || xx >= W || syp < 0 || syp >= H) continue;
-					const o = (syp * W + xx) * 4;
-					px[o] = SPARK_COLOR[0] / 255;
-					px[o + 1] = SPARK_COLOR[1] / 255;
-					px[o + 2] = SPARK_COLOR[2] / 255;
-					px[o + 3] = 1;
+				for (let tr = TRAIL - 1; tr >= 0; tr--) {
+					const fade = 1 - tr / TRAIL;
+					const a = spin * 0.6 - tr * 0.13 + (k * Math.PI * 2) / 3;
+					const sxp = Math.round((W - 1) / 2 + Math.cos(a) * W * 0.46);
+					const syp = Math.round((H - 1) / 2 + Math.sin(a) * H * 0.42);
+					for (const xx of [sxp, sxp + 1]) {
+						if (xx < 0 || xx >= W || syp < 0 || syp >= H) continue;
+						const o = (syp * W + xx) * 4;
+						px[o] = (SPARK_COLOR[0] / 255) * fade;
+						px[o + 1] = (SPARK_COLOR[1] / 255) * fade;
+						px[o + 2] = (SPARK_COLOR[2] / 255) * fade;
+						px[o + 3] = 1;
+					}
 				}
 			}
 		}
