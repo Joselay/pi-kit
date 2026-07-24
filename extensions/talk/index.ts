@@ -65,6 +65,16 @@ const VOICE_MODEL = process.env.PI_TALK_VOICE_MODEL?.trim() || DEFAULT_VOICE_MOD
 const VOICE = process.env.PI_TALK_VOICE?.trim() || DEFAULT_VOICE;
 const AUDIO_DEVICE = process.env.PI_TALK_DEVICE?.trim() || "0";
 const DISABLE_AEC = process.env.PI_TALK_NO_AEC === "1";
+// Optional ISO-639-1 hint for the transcriber. Left unset it auto-detects,
+// which on a breath or a bit of speaker echo can come back as a stray word in
+// some other language; pinning it keeps those in the language you speak.
+const LANGUAGE = process.env.PI_TALK_LANGUAGE?.trim();
+// How loud speech has to be before the server opens a turn. Above the API's
+// 0.5 default: at 0.5 room noise and residual echo open turns of their own,
+// which the transcriber then has to write down as something. Upstream Codex
+// sends no threshold at all, which `PI_TALK_VAD_THRESHOLD=off` restores.
+const VAD_THRESHOLD_ENV = process.env.PI_TALK_VAD_THRESHOLD?.trim();
+const VAD_THRESHOLD = VAD_THRESHOLD_ENV === "off" ? undefined : Number(VAD_THRESHOLD_ENV) || 0.6;
 
 const MAX_TRANSCRIPT_ENTRIES = 40;
 const MAX_OUT_LEVELS = 600;
@@ -122,6 +132,11 @@ class TalkSession {
 
 	private activeHandoff?: { callId: string };
 	private processedCalls = new Set<string>();
+	// Items whose transcript is already in the transcript list. A `.done` event
+	// carries the whole transcript, so anything that settles a line early — a
+	// barge-in, or a server emitting both the GA and the legacy event name —
+	// would otherwise have that line re-added in full underneath it.
+	private settledItems = new Set<string>();
 
 	private transcript: TranscriptEntry[] = [];
 	private openLine?: { who: "you" | "asst"; text: string };
@@ -200,12 +215,13 @@ class TalkSession {
 					input: {
 						format: { type: "audio/pcm", rate: SAMPLE_RATE },
 						noise_reduction: { type: "near_field" },
-						transcription: { model: TRANSCRIBE_MODEL },
+						transcription: { model: TRANSCRIBE_MODEL, ...(LANGUAGE ? { language: LANGUAGE } : {}) },
 						turn_detection: {
 							type: "server_vad",
 							interrupt_response: true,
 							create_response: true,
 							silence_duration_ms: 500,
+							...(VAD_THRESHOLD === undefined ? {} : { threshold: VAD_THRESHOLD }),
 						},
 					},
 					output: {
@@ -349,15 +365,26 @@ class TalkSession {
 				this.streamDelta("you", msg.delta ?? "");
 				break;
 			case "conversation.item.input_audio_transcription.completed":
+				if (this.alreadySettled(msg.item_id)) break;
 				if (!this.openLine && msg.transcript) this.streamDelta("you", msg.transcript.trim());
 				this.endLine("you");
 				break;
+			// Upstream v2 (protocol_v2.rs) reads the text and audio-transcript
+			// names for the same line; the un-prefixed pair is v1-era, kept
+			// because a server emitting both no longer doubles anything.
 			case "response.output_audio_transcript.delta":
+			case "response.output_text.delta":
 			case "response.audio_transcript.delta":
 				this.streamDelta("asst", msg.delta ?? "");
 				break;
+			case "response.output_text.done":
+				if (this.alreadySettled(msg.item_id)) break;
+				if (!this.openLine && msg.text) this.streamDelta("asst", msg.text.trim());
+				this.endLine("asst");
+				break;
 			case "response.output_audio_transcript.done":
 			case "response.audio_transcript.done":
+				if (this.alreadySettled(msg.item_id)) break;
 				if (!this.openLine && msg.transcript) this.streamDelta("asst", msg.transcript.trim());
 				this.endLine("asst");
 				break;
@@ -416,7 +443,10 @@ class TalkSession {
 		this.playbackEndsAt = 0;
 		this.outLevels.length = 0;
 		this.audio?.flush();
-		this.endLine("asst");
+		// What was actually spoken before the interruption is the honest record of
+		// this item, so keep it and ignore the full transcript the server sends
+		// afterwards — that arrives late and would read as the reply twice.
+		if (this.endLine("asst") && itemId) this.settledItems.add(itemId);
 	}
 
 	// --- background_agent handoff (the Codex intermediary/backend loop) ---
@@ -497,6 +527,14 @@ class TalkSession {
 		this.push({ who: "sys", text });
 	}
 
+	/** True when this item's transcript is already settled; records it if not. */
+	private alreadySettled(itemId: unknown): boolean {
+		if (typeof itemId !== "string" || !itemId) return false;
+		if (this.settledItems.has(itemId)) return true;
+		this.settledItems.add(itemId);
+		return false;
+	}
+
 	private streamDelta(who: "you" | "asst", delta: string): void {
 		if (!delta) return;
 		if (this.openLine && this.openLine.who !== who) this.endLine(this.openLine.who);
@@ -505,12 +543,17 @@ class TalkSession {
 		this.markDirty();
 	}
 
-	private endLine(who: "you" | "asst"): void {
-		if (this.openLine?.who !== who) return;
+	/** Settles the open line; true when it carried text worth keeping. */
+	private endLine(who: "you" | "asst"): boolean {
+		if (this.openLine?.who !== who) return false;
 		const text = this.openLine.text.trim();
 		this.openLine = undefined;
-		if (text) this.push({ who, text });
-		else this.markDirty();
+		if (!text) {
+			this.markDirty();
+			return false;
+		}
+		this.push({ who, text });
+		return true;
 	}
 
 	/** Append an utterance, keeping the transcript bounded, and redraw. */
