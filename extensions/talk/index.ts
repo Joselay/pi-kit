@@ -1248,7 +1248,10 @@ class TalkPanel {
 	private transcript(width: number): string[] {
 		const { entries, open } = this.getView();
 		const all = open ? [...entries, open] : entries;
-		const bodyWidth = Math.max(4, width - LABEL_W - 1);
+		// Label, its trailing space, and a reserved column for the cursor block the
+		// open line ends with — without that column the line still being spoken
+		// renders one wider than the panel it was measured for.
+		const bodyWidth = Math.max(4, width - LABEL_W - 2);
 		const rows: string[] = [];
 		for (const [index, entry] of all.entries()) {
 			const wrapped = wrapText(entry.text, bodyWidth);
