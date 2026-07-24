@@ -4,7 +4,7 @@
 // demand) for full-duplex speaker use, or an ffmpeg/ffplay half-duplex
 // fallback.
 
-import { spawn, execFile, type ChildProcess } from "node:child_process";
+import { spawn, execFile, execFileSync, type ChildProcess } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -14,6 +14,10 @@ import { clip, errorText } from "./util.ts";
 export const SAMPLE_RATE = 24000;
 /** Upstream clients stream 960-sample (40 ms) mono PCM16 frames = 1920 bytes. */
 export const MIC_FRAME_BYTES = 960 * 2;
+// Longest gap in the mic stream treated as normal. Capture is continuous — even
+// silence arrives as frames — so this only has to clear the ~300 ms the helper
+// takes to rebuild its engine when the audio route changes.
+const MIC_STALL_MS = 4000;
 
 const TALK_DIR = join(getAgentDir(), "assets", "talk");
 const AEC_SOURCE = join(TALK_DIR, "talk-audio.swift");
@@ -21,6 +25,40 @@ const AEC_BINARY = join(TALK_DIR, "talk-audio");
 
 export function findBinary(name: string): string {
 	return [`/opt/homebrew/bin/${name}`, `/usr/local/bin/${name}`].find(existsSync) ?? name;
+}
+
+/**
+ * avfoundation addresses capture devices by enumeration index, which is not the
+ * system default input and shifts as devices come and go — a Continuity iPhone,
+ * a USB interface or a virtual device can take index 0, and capturing the wrong
+ * microphone succeeds silently. Accept a name (or part of one) as well and look
+ * its index up, so a device can be named rather than guessed at.
+ */
+export function resolveAudioDevice(device: string): string {
+	if (/^\d+$/.test(device)) return device;
+	const wanted = device.toLowerCase();
+	// ffmpeg prints the listing to stderr and exits non-zero by design.
+	let listing = "";
+	try {
+		const args = ["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""];
+		listing = execFileSync(findBinary("ffmpeg"), args, {
+			encoding: "utf8",
+			timeout: 5000,
+			stdio: ["ignore", "ignore", "pipe"],
+		});
+	} catch (error) {
+		listing = String((error as { stderr?: unknown })?.stderr ?? "");
+	}
+	let inAudio = false;
+	for (const line of listing.split("\n")) {
+		if (/AVFoundation (audio|video) devices:/.test(line)) {
+			inAudio = line.includes("audio");
+			continue;
+		}
+		const match = inAudio ? /\[(\d+)\]\s+(.+?)\s*$/.exec(line) : undefined;
+		if (match && match[2]!.toLowerCase().includes(wanted)) return match[1]!;
+	}
+	return device;
 }
 
 /** Playback duration of a PCM16 mono chunk at SAMPLE_RATE, in milliseconds. */
@@ -94,6 +132,9 @@ export class FfplayPipe {
 	private spawnPlayer(): void {
 		this.child = spawn(findBinary("ffplay"), FFPLAY_ARGS, { stdio: ["pipe", "ignore", "ignore"] });
 		this.child.stdin?.on("error", () => {});
+		// findBinary falls back to a bare name, so a machine without ffplay emits
+		// ENOENT here; unhandled, that takes the whole agent down.
+		this.child.on("error", () => {});
 		this.child.on("close", () => {
 			if (this.stopped) return;
 			this.child = undefined;
@@ -103,7 +144,11 @@ export class FfplayPipe {
 }
 
 export interface AudioIO {
-	/** True when the mic stream is echo-cancelled and can stay open during playback. */
+	/**
+	 * True when the mic stream is echo-cancelled and can stay open during
+	 * playback. Only known once start() has resolved: the AEC helper reports
+	 * whether the voice-processing unit actually came up.
+	 */
 	readonly echoCancelled: boolean;
 	start(onFrame: MicFrameHandler, onFatal: (message: string) => void): Promise<void>;
 	play(buf: Buffer): void;
@@ -114,34 +159,83 @@ export interface AudioIO {
 
 /** Full-duplex capture+playback through the Swift AEC helper. */
 export class AecAudio implements AudioIO {
-	readonly echoCancelled = true;
+	/** Not known until the helper's ready line says whether VP came up. */
+	echoCancelled = false;
 	private child?: ChildProcess;
 	private stopped = false;
+	private lastFrameAt = 0;
+	private watchdog?: ReturnType<typeof setInterval>;
 
 	async start(onFrame: MicFrameHandler, onFatal: (message: string) => void): Promise<void> {
 		const child = spawn(AEC_BINARY, [], { stdio: ["pipe", "pipe", "pipe"] });
 		this.child = child;
 		child.stdin?.on("error", () => {});
-		child.stdout?.on("data", reframeMic(onFrame));
+		const reframe = reframeMic(onFrame);
+		child.stdout?.on("data", (chunk: Buffer) => {
+			this.lastFrameAt = Date.now();
+			reframe(chunk);
+		});
+		// Keep only the tail: this accumulates for the life of the session, and
+		// all anyone reads off it is the last line.
 		let stderr = "";
-		const ready = new Promise<void>((resolve, reject) => {
-			const timer = setTimeout(() => reject(new Error("audio helper did not become ready")), 5000);
+		const note = (chunk: unknown) => {
+			stderr = (stderr + String(chunk)).slice(-4096);
+		};
+		const lastLine = (code: number | null) =>
+			stderr.trim().split("\n").pop() || `audio helper exited (${code})`;
+		// Whichever of ready / failure lands first settles start(); afterwards
+		// only onFatal is left, so a startup failure is reported exactly once.
+		let settled = false;
+		await new Promise<void>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				if (settled) return;
+				settled = true;
+				reject(new Error("audio helper did not become ready"));
+			}, 5000);
 			child.stderr?.on("data", (chunk) => {
-				stderr += String(chunk);
-				if (/\bready\b/.test(stderr)) {
-					clearTimeout(timer);
-					resolve();
-				}
-			});
-			child.once("close", (code) => {
+				note(chunk);
+				// Match only a complete line: a chunk boundary between "ready"
+				// and its " aec=0" would otherwise read as cancellation working.
+				const ready = /\bready(?: aec=([01]))? *\n/.exec(stderr);
+				if (!ready || settled) return;
+				settled = true;
+				// aec=0 means voice processing failed to initialise: the mic is
+				// live but not cancelled, so the caller has to gate it while the
+				// assistant speaks or the speakers feed straight back in.
+				this.echoCancelled = ready[1] !== "0";
+				this.lastFrameAt = Date.now();
 				clearTimeout(timer);
-				reject(new Error(stderr.trim().split("\n").pop() || `audio helper exited (${code})`));
+				resolve();
+			});
+			// spawn itself can fail (helper deleted between build and run).
+			child.on("error", (error) => {
+				note(error.message);
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				reject(new Error(`audio helper failed to start: ${error.message}`));
+			});
+			child.on("close", (code) => {
+				clearTimeout(timer);
+				if (!settled) {
+					settled = true;
+					reject(new Error(lastLine(code)));
+					return;
+				}
+				if (!this.stopped) onFatal(lastLine(code));
 			});
 		});
-		child.on("close", (code) => {
-			if (!this.stopped) onFatal(stderr.trim().split("\n").pop() || `audio helper exited (${code})`);
-		});
-		await ready;
+
+		// The helper can also stay alive and go deaf — a wedged voice-processing
+		// unit, or a device swap it failed to recover from. Silence is still
+		// frames, so a gap in the stream at all means capture has stopped.
+		this.watchdog = setInterval(() => {
+			if (this.stopped || !this.lastFrameAt) return;
+			if (Date.now() - this.lastFrameAt < MIC_STALL_MS) return;
+			this.lastFrameAt = 0;
+			onFatal("microphone stopped delivering audio");
+		}, 1000);
+		this.watchdog.unref?.();
 	}
 
 	play(buf: Buffer): void {
@@ -154,6 +248,7 @@ export class AecAudio implements AudioIO {
 
 	stop(): void {
 		this.stopped = true;
+		if (this.watchdog) clearInterval(this.watchdog);
 		try {
 			this.child?.stdin?.end();
 		} catch {}
@@ -175,13 +270,18 @@ export class FfmpegAudio implements AudioIO {
 			findBinary("ffmpeg"),
 			[
 				"-hide_banner", "-loglevel", "error",
-				"-f", "avfoundation", "-i", `:${this.device}`,
+				"-f", "avfoundation", "-i", `:${resolveAudioDevice(this.device)}`,
 				"-ac", "1", "-ar", String(SAMPLE_RATE),
 				"-f", "s16le", "pipe:1",
 			],
 			{ stdio: ["ignore", "pipe", "pipe"] },
 		);
 		this.capture.stdout?.on("data", reframeMic(onFrame));
+		// Without ffmpeg on PATH this is an unhandled ENOENT, which is fatal to
+		// the agent rather than to the audio session.
+		this.capture.on("error", (error) => {
+			if (!this.stopped) onFatal(`microphone capture failed: ${error.message}`);
+		});
 		this.capture.on("close", (code) => {
 			if (!this.stopped) onFatal(`microphone capture ended unexpectedly (code ${code})`);
 		});
