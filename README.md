@@ -37,7 +37,6 @@ Pi extensions live in [`extensions`](extensions):
 - [`reset.ts`](extensions/reset.ts) - `/reset` for Codex usage-limit resets.
 - [`review.ts`](extensions/review.ts) - `/review` workflow for code changes and folders.
 - [`say.ts`](extensions/say.ts) - `/say` speak text or the last reply aloud (`gpt-realtime-2.1-mini` as TTS over OAuth).
-- [`semantic-recall.ts`](extensions/semantic-recall.ts) - `/recall` semantic search over past sessions; `/recall large|small` switches embedding tier (`text-embedding-3-large` / `text-embedding-3-small`, persisted).
 - [`talk.ts`](extensions/talk.ts) - `/talk` live voice conversation driving the agent (Codex-style realtime intermediary over OAuth); `/talk mini|voice` picks the cheaper or best-audio model tier.
 - [`todos.ts`](extensions/todos.ts) - File-based todo management and task refinement.
 - [`translate.ts`](extensions/translate.ts) - `/translate` live speech-to-speech translation via `gpt-realtime-translate`.
