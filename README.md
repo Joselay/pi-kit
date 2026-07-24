@@ -2,8 +2,6 @@
 
 Personal [Pi Coding Agent](https://pi.dev/) setup: reusable skills, extensions, a theme, and supporting assets used across projects.
 
-My day-to-day workflow runs mostly on Codex. Much of this kit is inspired by and adapted from [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff), built on top of and reshaped to fit my own workflow.
-
 ## Skills
 
 Skills live in [`skills`](skills):
