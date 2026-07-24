@@ -5,7 +5,7 @@
  */
 
 import { getAgentDir, type ExtensionAPI, type ExtensionContext, type ThemeColor } from "@earendil-works/pi-coding-agent";
-import { Image, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Image, truncateToWidth } from "@earendil-works/pi-tui";
 import { spawn, type ChildProcess } from "node:child_process";
 import type { EventEmitter } from "node:events";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
@@ -99,7 +99,6 @@ const footerColors = {
 	project: "#89B4FA", // Catppuccin blue
 	branch: "#F9E2AF", // Catppuccin yellow
 	sessionName: "#F5C2E7", // Catppuccin pink
-	provider: "#BAC2DE", // Catppuccin subtext1
 	model: "#FAB387", // Catppuccin peach
 	fast: "#74C7EC", // Catppuccin sapphire
 	thinking: "#CBA6F7", // Catppuccin mauve
@@ -530,24 +529,21 @@ export default function (pi: ExtensionAPI) {
 			const dim = (text: string) => theme.fg("dim", text);
 			const separator = () => dim(" • ");
 
-			function projectSegment(): { plain: string; styled: string } {
+			function projectSegment(): string {
 				const projectName = lastPathSegment(ctx.cwd);
-				let plain = projectName;
 				let styled = fg(footerColors.project, projectName);
 				const branch = footerData.getGitBranch();
 				if (branch) {
-					plain += ` • ${branch}`;
 					styled += separator() + fg(footerColors.branch, branch);
 				}
 				const sessionName = pi.getSessionName();
 				if (sessionName) {
-					plain += ` • ${sessionName}`;
 					styled += separator() + fg(footerColors.sessionName, sessionName);
 				}
-				return { plain, styled };
+				return styled;
 			}
 
-			function modelSegment(model: Model | undefined, fastText: string | undefined, projectPlain: string, width: number): string {
+			function modelSegment(model: Model | undefined, fastText: string | undefined): string {
 				const segments: { text: string; color: string }[] = [{ text: model?.id || "no-model", color: footerColors.model }];
 				if (fastText) segments.push({ text: fastText, color: footerColors.fast });
 				if (model?.reasoning) {
@@ -558,16 +554,7 @@ export default function (pi: ExtensionAPI) {
 					});
 				}
 
-				const plain = segments.map((segment) => segment.text).join(" • ");
-				const styled = segments.map((segment) => fg(segment.color, segment.text)).join(separator());
-
-				if (footerData.getAvailableProviderCount() > 1 && model) {
-					const providerPrefix = `(${model.provider}) `;
-					if (visibleWidth(projectPlain) + 3 + visibleWidth(providerPrefix + plain) <= width) {
-						return fg(footerColors.provider, providerPrefix) + styled;
-					}
-				}
-				return styled;
+				return segments.map((segment) => fg(segment.color, segment.text)).join(separator());
 			}
 
 			function contextSegment(model: Model | undefined): string {
@@ -620,9 +607,9 @@ export default function (pi: ExtensionAPI) {
 					const fastText = fastStatus === "fast:on" && modelSupportsCodexFastMode(model) ? "fast" : undefined;
 
 					const headerLine = truncateToWidth(
-						project.styled +
+						project +
 							separator() +
-							modelSegment(model, fastText, project.plain, width) +
+							modelSegment(model, fastText) +
 							separator() +
 							contextSegment(model) +
 							codexSegment(model),
