@@ -147,7 +147,7 @@ type RowGroup = {
 type PatchOperation =
 	| { kind: "add"; path: string; contents: string }
 	| { kind: "delete"; path: string }
-	| { kind: "update"; path: string; chunks: UpdateChunk[] };
+	| { kind: "update"; path: string; moveTo?: string; chunks: UpdateChunk[] };
 
 type UpdateChunk = {
 	changeContext?: string;
@@ -973,7 +973,7 @@ function parseUpdateChunk(lines: string[], startIndex: number, lastContentLine: 
 		changeContext = first.slice(3);
 		i++;
 	} else if (!allowMissingContext) {
-		throw new Error(`Expected update hunk to start with @@ context marker, got: '${lines[i]}'`);
+		throw new Error(`Expected update hunk to start with a @@ context marker, got: '${lines[i]}'`);
 	}
 
 	const oldLines: string[] = [];
@@ -1006,7 +1006,10 @@ function parseUpdateChunk(lines: string[], startIndex: number, lastContentLine: 
 			newLines.push(body);
 		} else if (marker === "-") oldLines.push(body);
 		else if (marker === "+") newLines.push(body);
-		else if (parsed === 0) throw new Error(`Unexpected line found in update hunk: '${raw}'. Every line should start with ' ', '+', or '-'.`);
+		else if (parsed === 0)
+			throw new Error(
+				`Unexpected line found in update hunk: '${raw}'. Every line should start with ' ' (context line), '+' (added line), or '-' (removed line)`,
+			);
 		else break;
 		parsed++;
 		i++;
@@ -1025,19 +1028,30 @@ function parsePatch(patchText: string): PatchOperation[] {
 	const operations: PatchOperation[] = [];
 	let i = 1;
 	const lastContentLine = lines.length - 2;
+	// Optional preamble, only valid immediately after Begin Patch. The id is
+	// validated like upstream but otherwise unused here.
+	if (i <= lastContentLine && lines[i].trimEnd().startsWith("*** Environment ID:")) {
+		if (!lines[i].trimEnd().slice("*** Environment ID:".length).trim())
+			throw new Error("apply_patch environment_id cannot be empty");
+		i++;
+		if (i <= lastContentLine && lines[i].trimEnd().startsWith("*** Environment ID:"))
+			throw new Error("apply_patch environment_id cannot be specified more than once");
+	}
 	while (i <= lastContentLine) {
 		if (lines[i].trim() === "") {
 			i++;
 			continue;
 		}
-		const line = lines[i].trim();
+		// Right-trim only, as upstream does: an indented "*** " or "@@" line is
+		// hunk content, never a directive.
+		const line = lines[i].trimEnd();
 		if (line.startsWith("*** Add File: ")) {
 			const path = normalizePath(line.slice("*** Add File: ".length));
 			i++;
 			const contentLines: string[] = [];
 			while (i <= lastContentLine) {
 				const next = lines[i];
-				if (next.trim().startsWith("*** ")) break;
+				if (next.trimEnd().startsWith("*** ")) break;
 				if (!next.startsWith("+")) throw new Error(`Invalid add-file line '${next}'. Add file lines must start with '+'`);
 				contentLines.push(next.slice(1));
 				i++;
@@ -1053,23 +1067,29 @@ function parsePatch(patchText: string): PatchOperation[] {
 		if (line.startsWith("*** Update File: ")) {
 			const path = normalizePath(line.slice("*** Update File: ".length));
 			i++;
-			if (i <= lastContentLine && lines[i].trim().startsWith("*** Move to: ")) throw new Error("Patch move operations (*** Move to:) are not supported.");
+			let moveTo: string | undefined;
+			if (i <= lastContentLine && lines[i].trimEnd().startsWith("*** Move to: ")) {
+				moveTo = normalizePath(lines[i].trimEnd().slice("*** Move to: ".length));
+				i++;
+			}
 			const chunks: UpdateChunk[] = [];
 			while (i <= lastContentLine) {
 				if (lines[i].trim() === "") {
 					i++;
 					continue;
 				}
-				if (lines[i].trim().startsWith("*** ")) break;
+				if (lines[i].trimEnd().startsWith("*** ")) break;
 				const parsed = parseUpdateChunk(lines, i, lastContentLine, chunks.length === 0);
 				chunks.push(parsed.chunk);
 				i = parsed.nextIndex;
 			}
 			if (chunks.length === 0) throw new Error(`Update file hunk for path '${path}' is empty`);
-			operations.push({ kind: "update", path, chunks });
+			operations.push({ kind: "update", path, moveTo, chunks });
 			continue;
 		}
-		throw new Error(`'${line}' is not a valid hunk header. Valid headers: '*** Add File:', '*** Delete File:', '*** Update File:'`);
+		throw new Error(
+			`'${line}' is not a valid hunk header. Valid hunk headers: '*** Add File: {path}', '*** Delete File: {path}', '*** Update File: {path}'`,
+		);
 	}
 	return operations;
 }
@@ -1154,7 +1174,16 @@ async function buildPatchPlan(text: string, cwd: string): Promise<ParsedPlan> {
 			continue;
 		}
 		if (snapshot.current === null) throw new Error(`Failed to update ${op.path}: file does not exist.`);
-		snapshot.current = deriveUpdatedContent(op.path, snapshot.current, op.chunks);
+		const updated = deriveUpdatedContent(op.path, snapshot.current, op.chunks);
+		if (op.moveTo && op.moveTo !== op.path) {
+			// Rename: the updated content lands at the destination, the source
+			// goes away (rendered as an add + delete pair).
+			const target = await store.get(op.moveTo);
+			target.current = updated;
+			snapshot.current = null;
+		} else {
+			snapshot.current = updated;
+		}
 	}
 
 	return { mode: "patch", changes: store.collectChanges("The patch produced no changes.") };

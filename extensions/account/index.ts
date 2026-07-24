@@ -38,8 +38,10 @@ type RateLimitDetails = {
 type UsagePayload = {
 	plan_type?: string;
 	rate_limit?: RateLimitDetails | null;
-	/** Separate bucket for cloud code review; same shape, often null. */
+	/** Separate bucket for cloud code review; same shape, often null. The
+	 * server's rate-limit SSE event uses the plural name, so accept both. */
 	code_review_rate_limit?: RateLimitDetails | null;
+	code_review_rate_limits?: RateLimitDetails | null;
 	credits?: {
 		has_credits?: boolean;
 		unlimited?: boolean;
@@ -149,20 +151,21 @@ type AccountSnapshot = {
 /** Every endpoint is best-effort: one 404 shouldn't blank the whole report. */
 async function loadSnapshot(auth: CodexAuth): Promise<AccountSnapshot> {
 	const snapshot: AccountSnapshot = { errors: {} };
-	const requests: Array<[keyof AccountSnapshot, string]> = [
+	const requests: Array<[keyof AccountSnapshot, string, Record<string, string>?]> = [
 		["usage", "/usage"],
 		["accounts", "/accounts/check"],
 		["profile", "/profiles/me"],
-		["settings", "/settings/user"],
-		["workspaceMessages", "/workspace-messages"],
+		// Codex opts these two out of caches so the report is never stale.
+		["settings", "/settings/user", { "cache-control": "no-cache, no-store" }],
+		["workspaceMessages", "/workspace-messages", { "cache-control": "no-store" }],
 		["configBundle", "/config/bundle"],
 	];
 
 	await Promise.all(
-		requests.map(async ([key, path]) => {
+		requests.map(async ([key, path, headers]) => {
 			try {
 				// 404s are "no data": not every endpoint exists for every plan.
-				const payload = await whamRequest(auth, path, { userAgent: USER_AGENT, allow404: true });
+				const payload = await whamRequest(auth, path, { userAgent: USER_AGENT, allow404: true, headers });
 				if (payload !== undefined) (snapshot as Record<string, unknown>)[key] = payload;
 			} catch (error) {
 				snapshot.errors[path] = errorText(error);
@@ -264,11 +267,19 @@ function renderReport(snapshot: AccountSnapshot): string {
 	// Which workspace this token is scoped to, and whether it's personal.
 	const accounts = snapshot.accounts;
 	if (accounts) {
-		const records: AccountRecord[] = Array.isArray(accounts.accounts)
-			? accounts.accounts
-			: Object.values(accounts.accounts ?? {})
-					.map((entry) => entry?.account)
-					.filter((record): record is AccountRecord => Boolean(record));
+		let records: AccountRecord[];
+		if (Array.isArray(accounts.accounts)) {
+			records = accounts.accounts;
+		} else {
+			// Codex orders the map by account_ordering; unlisted ids keep their
+			// insertion order after the listed ones.
+			const byId = accounts.accounts ?? {};
+			const ordering = (accounts.account_ordering ?? []).filter((id) => id in byId);
+			const keys = [...ordering, ...Object.keys(byId).filter((id) => !ordering.includes(id))];
+			records = keys
+				.map((id) => byId[id]?.account)
+				.filter((record): record is AccountRecord => Boolean(record));
+		}
 		const defaultId = accounts.default_account_id ?? undefined;
 		const active = records.find((record) => (record.account_id ?? record.id) === defaultId) ?? records[0];
 		if (active) {
@@ -309,7 +320,7 @@ function renderReport(snapshot: AccountSnapshot): string {
 		lines.push("", "### Rate limits", ...limitLines);
 	}
 
-	const codeReviewLines = formatLimitBlock(usage?.code_review_rate_limit);
+	const codeReviewLines = formatLimitBlock(usage?.code_review_rate_limit ?? usage?.code_review_rate_limits);
 	if (codeReviewLines.length > 0) {
 		lines.push("", "### Code review limits", ...codeReviewLines);
 	}

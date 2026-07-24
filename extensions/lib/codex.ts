@@ -100,13 +100,21 @@ export async function resolveRealtimeOAuth(feature: string): Promise<OAuthCreden
 export async function whamRequest(
 	auth: CodexAuth,
 	path: string,
-	options: { userAgent: string; body?: unknown; signal?: AbortSignal; allow404?: boolean },
+	options: {
+		userAgent: string;
+		body?: unknown;
+		signal?: AbortSignal;
+		allow404?: boolean;
+		/** Extra request headers (e.g. the cache-control opt-outs codex sends). */
+		headers?: Record<string, string>;
+	},
 ): Promise<unknown> {
 	const method = options.body === undefined ? "GET" : "POST";
 	const headers: Record<string, string> = {
 		authorization: `Bearer ${auth.access}`,
 		"chatgpt-account-id": auth.accountId,
 		"user-agent": options.userAgent,
+		...options.headers,
 	};
 	if (options.body !== undefined) headers["content-type"] = "application/json";
 
