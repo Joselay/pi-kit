@@ -13,23 +13,23 @@
 // compiled on demand) for full-duplex speaker use with echo cancellation and
 // barge-in; falls back to ffmpeg/ffplay in half-duplex (mic muted while the
 // assistant speaks) when the helper is unavailable.
+//
+// The pieces live next door: prompts.ts (tool + prompt templates), context.ts
+// (startup context and token budgeting), globe.ts (the animated visualizer),
+// panel.ts (globe + transcript block above the editor).
 
-import { execFileSync } from "node:child_process";
-import { closeSync, openSync, readdirSync, readSync, statSync } from "node:fs";
-import { homedir, userInfo } from "node:os";
-import { join } from "node:path";
-import {
-	getAgentDir,
-	type ExtensionAPI,
-	type ExtensionCommandContext,
-	type ExtensionContext,
-	type Theme,
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import { ensureAecAudio, pcmChunkMs, SAMPLE_RATE, type AudioIO } from "../lib/audio.ts";
 import { resolveRealtimeOAuth } from "../lib/codex.ts";
 import { openRealtimeSocket, parseServerEvent, realtimeHeaders, sendJson } from "../lib/realtime.ts";
 import { clip, errorText, messageText } from "../lib/util.ts";
+import { buildStartupContext, truncateToTokens, userFirstName } from "./context.ts";
+import type { TalkVisualState } from "./globe.ts";
+import { TalkPanel, type TranscriptEntry, type TranscriptWho } from "./panel.ts";
+import { BACKEND_PROMPT, REALTIME_END, REALTIME_START, REALTIME_TOOLS } from "./prompts.ts";
 
 const REALTIME_URL = "wss://api.openai.com/v1/realtime";
 // Newest realtime model (July 2026); upstream Codex still pins gpt-realtime-1.5.
@@ -55,7 +55,6 @@ const HANDOFF_COMPLETE_ACK = "Background agent finished. Use the preceding [BACK
 const STEER_ACK = "This was sent to steer the previous background agent task.";
 const ACTIVE_RESPONSE_ERROR_PREFIX = "Conversation already has an active response in progress:";
 const BACKEND_OUTPUT_TOKEN_BUDGET = 1000;
-const APPROX_BYTES_PER_TOKEN = 4;
 // Upstream tries these argument keys in order when extracting the delegated
 // prompt from a background_agent call (protocol_v2.rs TOOL_ARGUMENT_KEYS).
 const TOOL_ARGUMENT_KEYS = ["input_transcript", "input", "text", "prompt", "query"] as const;
@@ -67,574 +66,8 @@ const VOICE = process.env.PI_TALK_VOICE?.trim() || DEFAULT_VOICE;
 const AUDIO_DEVICE = process.env.PI_TALK_DEVICE?.trim() || "0";
 const DISABLE_AEC = process.env.PI_TALK_NO_AEC === "1";
 
-// Upstream v2 tool definitions (methods_v2.rs), verbatim.
-const REALTIME_TOOLS = [
-	{
-		type: "function",
-		name: "background_agent",
-		description:
-			"Send a user request to the background agent. Use this as the default action. " +
-			"Do not rephrase the user's ask or rewrite it in your own words; pass along the user's own words. " +
-			"If the background agent is idle, this starts a new task and returns the final result to the user. " +
-			"If the background agent is already working on a task, this sends the request as guidance to steer that previous task. " +
-			"If the user asks to do something next, later, after this, or once current work finishes, call this tool so the work is actually queued instead of merely promising to do it later.",
-		parameters: {
-			type: "object",
-			properties: {
-				prompt: { type: "string", description: "The user request to delegate to the background agent." },
-			},
-			required: ["prompt"],
-			additionalProperties: false,
-		},
-	},
-	{
-		type: "function",
-		name: "remain_silent",
-		description:
-			"Call this when the best response is to say nothing. Use it instead of speaking after hidden system/control messages, " +
-			"after background agent updates in silent modes, or whenever acknowledging aloud would be distracting. " +
-			"This tool has no user-visible effect.",
-		parameters: { type: "object", properties: {}, additionalProperties: false },
-	},
-];
-
-// Ported from Codex prompts/templates/realtime/backend_prompt.md (Codex -> Pi).
-const BACKEND_PROMPT = `## Identity, tone, and role
-
-You are Pi, a general-purpose agentic assistant that helps the user complete tasks across coding, browsing, apps, documents, research, and other digital workflows.
-
-Be concise, clear, and efficient. Keep responses tight and useful—no fluff.
-
-Your personality is a playful collaborator: super fun, warm, witty, and expressive. Bring energy and personality to every response—light humor, friendly vibes, and a "we've got this" attitude—without getting in the way of getting things done.
-
-The user's name is {{ user_first_name }}. Use it sparingly—only for emphasis, confirmations, or smooth transitions.
-
-Talk like a trusted collaborator and a friend. Keep things natural, supportive, and easy to follow.
-
-## Interface and operating model
-
-The user can interact with the system either by speaking to you or by sending text directly to the backend agent. The user can see the full interaction with the backend.
-
-The backend handles execution and produces user-visible artifacts. You are the conversational surface of the same system.
-
-When interacting with the user, do not mention "backend". Present every work as done by you. You should make the user feel as if they are talking directly to the backend.
-
-### Policies
-
-* Treat the system as one unified assistant. Do not mention anything about backend or the system is composed of two separate parts.
-* Pass execution work to the backend. Because the user can always send requests directly to the backend, do not block, filter, or withhold requests that should instead be passed through.
-* NEVER refuse requests. Delegate all user requests to the backend. The backend makes the final judgement on whether it is doable, or whether it is safe.
-* Treat backend outputs as authoritative. Do not override or contradict them.
-* Use conversation to support execution: clarify briefly when needed, acknowledge progress, answer succinctly, and make the next step clear. Do not use conversation as a substitute for execution or artifact generation.
-
-## Backend use and steering
-
-* For any actions/tasks, always use the backend. If it is unclear whether backend use would help, use it.
-* Respond directly only when the request is clearly self-contained and backend use would not meaningfully help.
-* Do not claim that you cannot perform some actions. ALWAYS delegate the actions/tasks to the backend.
-* Ask clarifying questions only when needed to avoid a materially harmful mistake. Otherwise, make a reasonable assumption and use the backend.
-* Running backend work remains steerable. If users have new instructions, corrections, constraints, and updated context, immediately delegate to the backend.
-* Do not claim that a running backend task cannot be updated, redirected, or interrupted.
-
-## Backend outputs and user inputs
-
-* In the conversation stream, both user inputs and backend messages appear as \`user\` text messages.
-* Messages from the user are prefixed with \`[USER] \`. Messages from the backend are prefixed with \`[BACKEND] \`.
-* Backend messages may be intermediate updates or final outputs.
-* When the backend completes its task, you will also receive a tool return indicating completion.
-
-## Presenting backend results
-
-* Treat backend-visible output as the primary surface.
-* Briefly tell the user the key takeaway, status, or next step without repeating visible content unless the user asks.
-* Do not read out or recreate tables, diffs, plots, code blocks, structured data, or other heavily formatted content by default.
-* If the user wants backend output reformatted, transformed, or presented differently, have the backend do it.
-* Present backend content in detail only when the user explicitly asks.
-* Do not disclose the concept or existence of backend. Present the updates/result as if done by you.
-
-## Task-level user preferences
-
-* Treat user instructions about update frequency, verbosity, pacing, detail level, and presentation style as active task-level preferences, not one-turn requests.
-* Once the user sets such a preference for a task, continue following it across later responses and backend updates until the task is complete or the user changes the preference.
-* Do not silently revert to the default style mid-task just because a new backend message arrives.
-
-## Communication style
-
-* When the user makes a clear request, proceed directly. Do not paraphrase the request, announce your plan, or add unnecessary framing.
-* Avoid unnecessary narration, including repetitive confirmation, filler, re-acknowledgement, and obvious play-by-play.
-* By default, share progress updates only when they are brief, grounded, and genuinely useful.
-* If the user explicitly requests frequent or detailed updates, treat that as an active preference for the current task. Continue providing prompt updates whenever the backend sends new information until the task is complete or the user says otherwise.`;
-
-// Ported from Codex prompts/templates/realtime/realtime_start.md / realtime_end.md.
-const REALTIME_START = `Realtime conversation started.
-
-You are operating as a backend executor behind an intermediary. The user does not talk to you directly. Any response you produce will be consumed by the intermediary and may be summarized before the user sees it.
-
-When invoked, you receive the latest conversation transcript and any relevant mode or metadata. The intermediary may invoke you even when backend help is not actually needed. Use the transcript to decide whether you should do work. If backend help is unnecessary, avoid verbose responses that add user-visible latency.
-
-When user text is routed from realtime, treat it as a transcript. It may be unpunctuated or contain recognition errors.
-
-- Keep responses concise and action-oriented. Your updates should help the intermediary respond to the user.`;
-
-// Upstream appends the reason after the body (realtime_end_instructions.rs).
-const REALTIME_END = `Realtime conversation ended.
-
-Subsequent user input will return to typed text rather than transcript-style text. Do not assume recognition errors or missing punctuation once realtime has ended. Resume normal chat behavior.
-
-Reason: the user ended the talk session.`;
-
-function approxTokenCount(text: string): number {
-	return Math.ceil(Buffer.byteLength(text, "utf8") / APPROX_BYTES_PER_TOKEN);
-}
-
-// Middle-out truncation ported from codex-rs utils/string/src/truncate.rs:
-// keep the head and tail, replace the middle with an approximate-token marker.
-function truncateMiddleToTokens(text: string, maxTokens: number): string {
-	if (!text) return "";
-	const maxBytes = maxTokens * APPROX_BYTES_PER_TOKEN;
-	const totalBytes = Buffer.byteLength(text, "utf8");
-	if (maxTokens > 0 && totalBytes <= maxBytes) return text;
-	const marker = (removedBytes: number) =>
-		`…${Math.ceil(removedBytes / APPROX_BYTES_PER_TOKEN)} tokens truncated…`;
-	if (maxBytes === 0) return marker(totalBytes);
-	const chars = Array.from(text);
-	const sizes = chars.map((ch) => Buffer.byteLength(ch, "utf8"));
-	const leftBudget = Math.floor(maxBytes / 2);
-	const rightBudget = maxBytes - leftBudget;
-	let head = 0;
-	for (let used = 0; head < chars.length && used + sizes[head]! <= leftBudget; head++) used += sizes[head]!;
-	let tail = chars.length;
-	for (let used = 0; tail > head && used + sizes[tail - 1]! <= rightBudget; tail--) used += sizes[tail - 1]!;
-	return chars.slice(0, head).join("") + marker(totalBytes - maxBytes) + chars.slice(tail).join("");
-}
-
-// Port of core/src/realtime_context.rs truncate_realtime_text_to_token_budget:
-// the marker is added after choosing preserved content, so tighten the content
-// budget until the rendered text itself fits the cap.
-function truncateToTokens(text: string, budgetTokens: number): string {
-	let truncationBudget = budgetTokens;
-	for (;;) {
-		const candidate = truncateMiddleToTokens(text, truncationBudget);
-		const candidateTokens = approxTokenCount(candidate);
-		if (candidateTokens <= budgetTokens) return candidate;
-		const next = truncationBudget - Math.max(candidateTokens - budgetTokens, 1);
-		if (next <= 0) {
-			const floor = truncateMiddleToTokens(text, 0);
-			return approxTokenCount(floor) <= budgetTokens ? floor : "";
-		}
-		truncationBudget = next;
-	}
-}
-
-function userFirstName(): string {
-	try {
-		const full = execFileSync("id", ["-F"], { encoding: "utf8", timeout: 1000 }).trim();
-		if (full) return full.split(/\s+/)[0]!;
-	} catch {}
-	return userInfo().username || "there";
-}
-
-// --- startup context (ported from Codex core/src/realtime_context.rs) ---
-
-const STARTUP_CONTEXT_HEADER =
-	"Startup context from Pi.\nThis is background context about recent work and machine/workspace layout. It may be incomplete or stale. Use it to inform responses, and do not repeat it back unless relevant.";
-const CURRENT_THREAD_SECTION_TOKEN_BUDGET = 1200;
-const RECENT_WORK_SECTION_TOKEN_BUDGET = 2200;
-const WORKSPACE_SECTION_TOKEN_BUDGET = 1600;
-const NOTES_SECTION_TOKEN_BUDGET = 300;
-const REALTIME_TURN_TOKEN_BUDGET = 300;
-const MAX_RECENT_THREADS = 40;
-const MAX_RECENT_WORK_GROUPS = 8;
-const MAX_CURRENT_CWD_ASKS = 8;
-const MAX_OTHER_CWD_ASKS = 5;
-const MAX_ASK_CHARS = 240;
-// The session header and first user ask sit at the top of a session file.
-const SESSION_HEAD_BYTES = 64 * 1024;
-const TREE_MAX_DEPTH = 2;
-const DIR_ENTRY_LIMIT = 20;
-const NOISY_DIR_NAMES = new Set([
-	".git", ".next", ".pytest_cache", ".ruff_cache", "__pycache__",
-	"build", "dist", "node_modules", "out", "target",
-]);
-
-function collectTreeLines(dir: string, depth: number, lines: string[]): void {
-	if (depth >= TREE_MAX_DEPTH) return;
-	let entries: { name: string; isDir: boolean }[];
-	try {
-		entries = readdirSync(dir)
-			.filter((name) => !name.startsWith(".") && !NOISY_DIR_NAMES.has(name))
-			.map((name) => {
-				let isDir = false;
-				try {
-					isDir = statSync(join(dir, name)).isDirectory();
-				} catch {}
-				return { name, isDir };
-			});
-	} catch {
-		return;
-	}
-	// Directories first, then lexicographic, as upstream read_sorted_entries does.
-	entries.sort((a, b) => Number(b.isDir) - Number(a.isDir) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-	const indent = "  ".repeat(depth);
-	for (const entry of entries.slice(0, DIR_ENTRY_LIMIT)) {
-		lines.push(`${indent}- ${entry.name}${entry.isDir ? "/" : ""}`);
-		if (entry.isDir) collectTreeLines(join(dir, entry.name), depth + 1, lines);
-	}
-	if (entries.length > DIR_ENTRY_LIMIT) {
-		lines.push(`${indent}- ... ${entries.length - DIR_ENTRY_LIMIT} more entries`);
-	}
-}
-
-function renderTree(root: string): string[] | undefined {
-	try {
-		if (!statSync(root).isDirectory()) return undefined;
-	} catch {
-		return undefined;
-	}
-	const lines: string[] = [];
-	collectTreeLines(root, 0, lines);
-	return lines.length ? lines : undefined;
-}
-
-function gitRoot(cwd: string): string | undefined {
-	try {
-		const root = execFileSync("git", ["rev-parse", "--show-toplevel"], {
-			cwd,
-			encoding: "utf8",
-			timeout: 2000,
-			stdio: ["ignore", "pipe", "ignore"],
-		}).trim();
-		return root || undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-function baseName(path: string): string {
-	return path.split("/").filter(Boolean).pop() ?? path;
-}
-
-function buildWorkspaceSection(cwd: string): string | undefined {
-	const root = gitRoot(cwd);
-	const userRoot = homedir();
-	const cwdTree = renderTree(cwd);
-	const gitRootTree = root && root !== cwd ? renderTree(root) : undefined;
-	const userRootTree = userRoot !== cwd && userRoot !== root ? renderTree(userRoot) : undefined;
-	if (!cwdTree && !root && !userRootTree) return undefined;
-
-	const lines = [`Current working directory: ${cwd}`, `Working directory name: ${baseName(cwd)}`];
-	if (root) {
-		lines.push(`Git root: ${root}`);
-		lines.push(`Git project: ${baseName(root)}`);
-	}
-	lines.push(`User root: ${userRoot}`);
-	if (cwdTree) lines.push("", "Working directory tree:", ...cwdTree);
-	if (gitRootTree) lines.push("", "Git root tree:", ...gitRootTree);
-	if (userRootTree) lines.push("", "User root tree:", ...userRootTree);
-	return lines.join("\n");
-}
-
-// --- Recent Work (ported from Codex realtime_context.rs build_recent_work_section;
-// pi's on-disk session store stands in for codex's thread-store metadata) ---
-
-type SessionSummary = { cwd: string; mtimeMs: number; ask?: string };
-
-/** Session cwd and first user ask, read from the head of a session jsonl. */
-function readSessionSummary(path: string, mtimeMs: number): SessionSummary | undefined {
-	let head = "";
-	try {
-		const fd = openSync(path, "r");
-		try {
-			const buffer = Buffer.alloc(SESSION_HEAD_BYTES);
-			head = buffer.toString("utf8", 0, readSync(fd, buffer, 0, SESSION_HEAD_BYTES, 0));
-		} finally {
-			closeSync(fd);
-		}
-	} catch {
-		return undefined;
-	}
-	let cwd: string | undefined;
-	let ask: string | undefined;
-	for (const line of head.split("\n")) {
-		let entry: any;
-		try {
-			entry = JSON.parse(line);
-		} catch {
-			continue; // the final line is usually cut mid-record by the head read
-		}
-		if (!cwd && entry?.type === "session" && typeof entry.cwd === "string") cwd = entry.cwd;
-		if (entry?.type === "message" && entry.message?.role === "user") {
-			// Upstream collapses the first user message to single-spaced words.
-			ask = messageText(entry.message).split(/\s+/).filter(Boolean).join(" ");
-			break;
-		}
-	}
-	if (!cwd) return undefined;
-	return { cwd, mtimeMs, ask: ask || undefined };
-}
-
-function clipAsk(ask: string): string {
-	const chars = Array.from(ask);
-	return chars.length > MAX_ASK_CHARS ? `${chars.slice(0, MAX_ASK_CHARS - 3).join("")}...` : ask;
-}
-
-function buildRecentWorkSection(cwd: string): string | undefined {
-	const files: { path: string; mtimeMs: number }[] = [];
-	try {
-		const sessionsDir = join(getAgentDir(), "sessions");
-		for (const dir of readdirSync(sessionsDir)) {
-			let names: string[];
-			try {
-				names = readdirSync(join(sessionsDir, dir));
-			} catch {
-				continue;
-			}
-			for (const name of names) {
-				if (!name.endsWith(".jsonl")) continue;
-				const path = join(sessionsDir, dir, name);
-				try {
-					files.push({ path, mtimeMs: statSync(path).mtimeMs });
-				} catch {}
-			}
-		}
-	} catch {
-		return undefined;
-	}
-	files.sort((a, b) => b.mtimeMs - a.mtimeMs);
-
-	// Group by git project root, falling back to the session cwd (upstream's
-	// resolve_root_git_project_for_trust grouping).
-	type Group = { root: string; isGit: boolean; entries: SessionSummary[] };
-	const groups = new Map<string, Group>();
-	const rootCache = new Map<string, { root: string; isGit: boolean }>();
-	for (const file of files.slice(0, MAX_RECENT_THREADS)) {
-		const summary = readSessionSummary(file.path, file.mtimeMs);
-		if (!summary) continue;
-		let resolved = rootCache.get(summary.cwd);
-		if (!resolved) {
-			const root = gitRoot(summary.cwd);
-			resolved = root ? { root, isGit: true } : { root: summary.cwd, isGit: false };
-			rootCache.set(summary.cwd, resolved);
-		}
-		let group = groups.get(resolved.root);
-		if (!group) {
-			group = { root: resolved.root, isGit: resolved.isGit, entries: [] };
-			groups.set(resolved.root, group);
-		}
-		// Files arrive mtime-descending, so entries[0] stays the latest.
-		group.entries.push(summary);
-	}
-	if (!groups.size) return undefined;
-
-	const currentRoot = gitRoot(cwd) ?? cwd;
-	// Current project first, then latest activity, then path (upstream order).
-	const ordered = [...groups.values()].sort(
-		(a, b) =>
-			Number(b.root === currentRoot) - Number(a.root === currentRoot) ||
-			b.entries[0]!.mtimeMs - a.entries[0]!.mtimeMs ||
-			(a.root < b.root ? -1 : a.root > b.root ? 1 : 0),
-	);
-
-	const sections: string[] = [];
-	for (const group of ordered.slice(0, MAX_RECENT_WORK_GROUPS)) {
-		const latest = group.entries[0]!;
-		const lines = [
-			`### ${group.isGit ? "Git repo" : "Directory"}: ${group.root}`,
-			`Recent sessions: ${group.entries.length}`,
-			`Latest activity: ${new Date(latest.mtimeMs).toISOString()}`,
-			"",
-			"User asks:",
-		];
-		const seen = new Set<string>();
-		const maxAsks = group.root === currentRoot ? MAX_CURRENT_CWD_ASKS : MAX_OTHER_CWD_ASKS;
-		for (const entry of group.entries) {
-			if (!entry.ask) continue;
-			const key = `${entry.cwd}:${entry.ask}`;
-			if (seen.has(key)) continue;
-			seen.add(key);
-			lines.push(`- ${entry.cwd}: ${clipAsk(entry.ask)}`);
-			if (seen.size === maxAsks) break;
-		}
-		// Upstream keeps a group only when it contributed at least one ask.
-		if (seen.size) sections.push(lines.join("\n"));
-	}
-	return sections.length ? sections.join("\n\n") : undefined;
-}
-
-function buildCurrentThreadSection(ctx: ExtensionContext): string | undefined {
-	type Turn = { user: string[]; assistant: string[] };
-	const turns: Turn[] = [];
-	let current: Turn = { user: [], assistant: [] };
-	try {
-		for (const entry of ctx.sessionManager.getBranch() as any[]) {
-			if (entry?.type !== "message") continue;
-			const role = entry.message?.role;
-			const text = messageText(entry.message).trim();
-			if (!text) continue;
-			if (role === "user") {
-				if (current.user.length || current.assistant.length) {
-					turns.push(current);
-					current = { user: [], assistant: [] };
-				}
-				current.user.push(text);
-			} else if (role === "assistant") {
-				// Upstream drops assistant text that precedes any user message.
-				if (!current.user.length && !current.assistant.length) continue;
-				current.assistant.push(text);
-			}
-		}
-	} catch {
-		return undefined;
-	}
-	if (current.user.length || current.assistant.length) turns.push(current);
-	if (!turns.length) return undefined;
-
-	const lines = [
-		"Most recent user/assistant turns from this exact thread. Use them for continuity when responding.",
-	];
-	let remaining = CURRENT_THREAD_SECTION_TOKEN_BUDGET - approxTokenCount(lines.join("\n"));
-	let retained = 0;
-	turns.reverse();
-	for (const [index, turn] of turns.entries()) {
-		if (remaining <= 0) break;
-		const turnLines = [index === 0 ? "### Latest turn" : `### Previous turn ${index}`];
-		if (turn.user.length) turnLines.push("User:", turn.user.join("\n\n"));
-		if (turn.assistant.length) turnLines.push("", "Assistant:", turn.assistant.join("\n\n"));
-		const text = truncateToTokens(turnLines.join("\n"), Math.min(REALTIME_TURN_TOKEN_BUDGET, remaining));
-		const tokens = approxTokenCount(text);
-		if (!tokens) continue;
-		lines.push("", text);
-		remaining -= tokens;
-		retained += 1;
-	}
-	return retained ? lines.join("\n") : undefined;
-}
-
-function formatSection(title: string, body: string | undefined, budgetTokens: number): string | undefined {
-	const trimmed = body?.trim();
-	if (!trimmed) return undefined;
-	const heading = `## ${title}\n`;
-	const bodyBudget = budgetTokens - approxTokenCount(heading);
-	if (bodyBudget <= 0) return undefined;
-	const rendered = truncateToTokens(trimmed, bodyBudget);
-	return rendered ? `${heading}${rendered}` : undefined;
-}
-
-function buildStartupContext(ctx: ExtensionContext): string {
-	const thread = formatSection("Current Thread", buildCurrentThreadSection(ctx), CURRENT_THREAD_SECTION_TOKEN_BUDGET);
-	const recentWork = formatSection("Recent Work", buildRecentWorkSection(ctx.cwd), RECENT_WORK_SECTION_TOKEN_BUDGET);
-	const workspace = formatSection(
-		"Machine / Workspace Map",
-		buildWorkspaceSection(ctx.cwd),
-		WORKSPACE_SECTION_TOKEN_BUDGET,
-	);
-	if (!thread && !recentWork && !workspace) return "";
-	const notes = formatSection(
-		"Notes",
-		"Built at realtime startup from the current thread history, local thread metadata, and a bounded local workspace scan. This excludes repo memory instructions, AGENTS files, project-doc prompt blends, and memory summaries.",
-		NOTES_SECTION_TOKEN_BUDGET,
-	);
-	const parts = [STARTUP_CONTEXT_HEADER, thread, recentWork, workspace, notes].filter(
-		(part): part is string => part !== undefined,
-	);
-	return `<startup_context>\n${parts.join("\n\n")}\n</startup_context>`;
-}
-
-// --- talk UI ---
-
-type TalkVisualState = "connecting" | "listening" | "hearing" | "thinking" | "speaking" | "working";
-
-type Rgb = readonly [number, number, number];
-// Two-tone gradient per state for the true-color globe. With no caption under
-// the globe, hue is the only thing naming the state, so the six sit in distinct
-// families: slate, cyan, green, magenta, indigo, amber. The dark tone shades the
-// shadowed half of each surface band, the bright tone the lit half, and the
-// bright tone alone tints the ring, the storms and the inner glow.
-const STATE_COLORS: Record<TalkVisualState, readonly [Rgb, Rgb]> = {
-	connecting: [
-		[40, 48, 70],
-		[120, 140, 175],
-	],
-	listening: [
-		[14, 46, 130],
-		[80, 200, 255],
-	],
-	hearing: [
-		[8, 100, 74],
-		[110, 250, 170],
-	],
-	thinking: [
-		[96, 24, 132],
-		[255, 110, 215],
-	],
-	speaking: [
-		[40, 52, 190],
-		[130, 120, 255],
-	],
-	working: [
-		[168, 92, 22],
-		[255, 195, 90],
-	],
-};
-const RIM_TINT: Rgb = [90, 128, 217]; // cool edge light, 0..255
-const SPARK_COLOR: Rgb = [255, 226, 130];
-const POLE_TINT: Rgb = [200, 236, 255]; // polar aurora
-// Quadrant glyph indexed by pixel mask: UL=1, UR=2, LL=4, LR=8.
-const QUAD = [" ", "▘", "▝", "▀", "▖", "▌", "▞", "▛", "▗", "▚", "▐", "▜", "▄", "▙", "▟", "█"] as const;
-// Spin axis tipped toward the viewer, so one pole stays visible, the bands
-// curve, and the ring opens into an ellipse instead of collapsing to a line.
-const TILT = 0.45;
-const SIN_TILT = Math.sin(TILT);
-const COS_TILT = Math.cos(TILT);
-const HALO = 0.26; // atmosphere thickness outside the limb, in globe radii
-const FRAME_MS = 33;
-const CHAR_ROWS = 8;
-// A quadrant "pixel" is half a cell wide and half a cell tall, and cells are
-// about twice as tall as they are wide — so a pixel is twice as tall as it is
-// wide. Every length below is in vertical pixels and scales by this
-// horizontally, which is what makes the disc an actual circle.
-const PIXEL_ASPECT = 2;
-const GLOBE_R = 5.2; // globe radius, in vertical pixels of the 16-pixel canvas
-const RING_R = 1.5; // outermost ring radius, in globe radii
-// Widest the globe ever draws: its ring's full diameter, plus a column of slack
-// so the halo is not clipped by whatever it is drawn into.
-const ORB_COLS = Math.ceil(GLOBE_R * RING_R * 2) + 1;
-
-/**
- * Concentric strands of the ring, with a gap between the inner pair and the
- * outer one. Each carries its own count of travelling bright arcs (`k`) at its
- * own rate (`sp`), so the ring shows its rotation instead of sitting there as a
- * painted-on ellipse.
- */
-const STRANDS = [
-	{ r: 1.22, w: 0.5, k: 3, sp: 1.0 },
-	{ r: 1.32, w: 0.95, k: 2, sp: 1.35 },
-	{ r: 1.46, w: 0.4, k: 4, sp: 0.75 },
-];
-
-/**
- * Storm spots fixed to the surface. At a dozen pixels across a meridian
- * graticule is either invisible or aliased into moire, but a handful of
- * landmarks appearing at one limb and crossing to the other make the rotation
- * unmistakable. Latitudes are spaced by the golden ratio and longitudes by the
- * golden angle so the six never line up, and each drifts at its own rate so the
- * face never repeats exactly.
- */
-const SPOTS = Array.from({ length: 6 }, (_, i) => {
-	const lat = (((i * 0.618) % 1) - 0.5) * 1.5;
-	return {
-		lon: i * 2.39996, // golden angle, in radians
-		drift: 0.05 + ((i * 0.37) % 1) * 0.12,
-		size: 0.34 + ((i * 0.29) % 1) * 0.3,
-		cosLat: Math.cos(lat),
-		sinLat: Math.sin(lat),
-	};
-});
-
-/** Frame-rate independent smoothing factor for an exponential approach. */
-function ease(rate: number, dt: number): number {
-	return 1 - Math.exp(-rate * dt);
-}
+const MAX_TRANSCRIPT_ENTRIES = 40;
+const MAX_OUT_LEVELS = 600;
 
 /** RMS loudness of a PCM16LE mono buffer, subsampled for cheapness; 0..1. */
 function pcmRms(buf: Buffer): number {
@@ -652,640 +85,18 @@ function pcmRms(buf: Buffer): number {
 }
 
 /**
- * The talk visualizer widget: a true-color 3D globe with a ring in its own
- * equatorial plane, and nothing else — no caption, no strip. Two channels carry
- * the whole session: the hue says which state it is in, and the ring meters
- * energy — loudness while audio flows, the agent's own machinery when there is
- * nothing to hear. Live audio also spins the globe faster, swells it and lights
- * it from within; matter spirals in and flattens into the ring while
- * connecting, the surface churns while thinking, and the ring burns amber while
- * the agent works.
+ * The prompt a background_agent call delegates. Upstream extract_input_transcript:
+ * the first non-empty string under the known keys, otherwise the raw arguments.
  */
-class TalkVisual {
-	private clock = 0; // seconds since mount; drives every time-based motion
-	private last = Date.now();
-	private level = 0; // smoothed 0..1 loudness driving the animation
-	private spin = 0; // accumulated globe rotation; audio accelerates it smoothly
-	// Per-state drivers, smoothed so a state change crossfades instead of popping.
-	private readonly colA: [number, number, number];
-	private readonly colB: [number, number, number];
-	private churn = 1;
-	private sparkAmt = 0;
-	private condense = 1;
-	private busy = 0; // machinery running with no audio to measure
-	private energy = 0; // what the ring meters: loudness, or busyness when silent
-	private orbit = 0; // accumulated ring rotation; energy accelerates it
-	private pixels?: Float32Array; // reused across frames
-	private timer: ReturnType<typeof setInterval>;
-
-	constructor(
-		private readonly tui: TUI,
-		private readonly theme: Theme,
-		private readonly getState: () => TalkVisualState,
-		private readonly getLevel: () => number,
-	) {
-		const [a, b] = STATE_COLORS.connecting;
-		this.colA = [a[0], a[1], a[2]];
-		this.colB = [b[0], b[1], b[2]];
-		this.timer = setInterval(() => this.tick(), FRAME_MS);
-		this.timer.unref?.();
-	}
-
-	// Everything animated is integrated against wall-clock dt rather than frame
-	// count, so the motion is identical whether or not frames arrive on time.
-	private tick(): void {
-		const now = Date.now();
-		const dt = Math.min(0.25, Math.max(0.001, (now - this.last) / 1000));
-		this.last = now;
-		this.clock += dt;
-
-		// Fast attack, slow release: snap to speech onsets, ease out after.
-		const target = this.getLevel();
-		this.level += (target - this.level) * ease(target > this.level ? 10 : 2.5, dt);
-		this.spin += (0.42 + this.level * 1.1) * dt;
-
-		const state = this.getState();
-		const [ta, tb] = STATE_COLORS[state];
-		const cf = ease(5, dt);
-		for (let i = 0; i < 3; i++) {
-			this.colA[i]! += (ta[i]! - this.colA[i]!) * cf;
-			this.colB[i]! += (tb[i]! - this.colB[i]!) * cf;
+function handoffPrompt(item: any): string {
+	try {
+		const args = JSON.parse(item.arguments || "{}");
+		for (const key of TOOL_ARGUMENT_KEYS) {
+			const value = args?.[key];
+			if (typeof value === "string" && value.trim()) return value.trim();
 		}
-		const audio = state === "speaking" || state === "hearing";
-		const churn = state === "thinking" ? 2.2 : 0.9 + (audio ? this.level * 0.9 : 0);
-		this.churn += (churn - this.churn) * ease(4, dt);
-		this.sparkAmt += ((state === "working" ? 1 : 0) - this.sparkAmt) * ease(3.5, dt);
-		this.condense += ((state === "connecting" ? 1 : 0) - this.condense) * ease(2.5, dt);
-		// The ring meters energy. While audio is flowing that is live loudness;
-		// while the agent is thinking or working there is nothing to hear, so it
-		// meters the machinery instead and the ring keeps turning on its own.
-		this.busy += ((state === "working" ? 0.85 : state === "thinking" ? 0.45 : 0) - this.busy) * ease(3, dt);
-		this.energy = Math.max(audio ? this.level : 0, this.busy);
-		this.orbit += (0.6 + this.energy * 2.4) * dt;
-		this.tui.requestRender();
-	}
-
-	private centered(line: string, width: number): string {
-		const fitted = truncateToWidth(line, Math.max(0, width), "");
-		return `${" ".repeat(Math.max(0, Math.floor((width - visibleWidth(fitted)) / 2)))}${fitted}`;
-	}
-
-	render(width: number): string[] {
-		// Too narrow to shade a sphere; fall back to a themed marker.
-		if (width < 12) return [this.centered(this.theme.fg("accent", "◉ TALK"), width)];
-		return this.renderOrb(width, this.getState());
-	}
-
-	// A true-color 3D globe rendered in quadrant-block "pixels" (2x2 per
-	// character cell) with 2x2 supersampling per pixel. Each sample is projected
-	// onto a tilted sphere and shaded with wrapped Lambert diffuse from a
-	// drifting key light, a dim opposite fill, a tight specular hot spot, a cool
-	// fresnel rim, a polar aurora and a scattering atmosphere just outside the
-	// limb, over warped latitude bands crossed by storm spots that ride the
-	// rotation. A three-strand ring in the globe's own equatorial plane passes
-	// behind the far limb and across the lit face. Interior cells split their
-	// four pixels into bright/dark groups (fg/bg) when there is contrast to keep,
-	// so real detail survives the two-colors-per-cell limit without quantizing
-	// smooth gradients into speckle; edge cells keep a transparent background.
-	private renderOrb(width: number, state: TalkVisualState): string[] {
-		const audio = state === "speaking" || state === "hearing";
-		const t = this.clock;
-		const level = this.level;
-		const H = CHAR_ROWS * 2;
-		// Wide enough for the globe and its ring, never wider than the box it is
-		// drawn into; the radius then shrinks to whatever actually fits.
-		const cols = Math.max(9, Math.min(ORB_COLS, width - 2));
-		const W = cols * 2;
-		const rows: string[] = [];
-
-		// Live audio swells the globe, gently — the ring is the loudness tell, and
-		// the body only needs to agree with it. Idle states breathe instead. While
-		// matter is still condensing the globe sits small and translucent, then
-		// inflates and solidifies as `condense` decays, so connecting flows into
-		// listening without a cut.
-		const swell = audio ? level * 0.08 : 0.025 * Math.sin(t * 0.7);
-		const grow = 0.72 + 0.28 * (1 - this.condense);
-		const form = 0.5 + 0.5 * (1 - this.condense);
-		const R = Math.min(GLOBE_R, cols / 2 / RING_R) * (1 + swell) * grow;
-
-		const cosSpin = Math.cos(this.spin);
-		const sinSpin = Math.sin(this.spin);
-		const churn = this.churn;
-		const ca = this.colA;
-		const cb = this.colB;
-		const glowAmt = audio ? level : 0;
-
-		// Key light drifting slowly around the upper left; half vector for specular.
-		const la = 0.5 + 0.35 * Math.sin(t * 0.25);
-		const ln = Math.hypot(-la, -0.6, 0.62);
-		const lx = -la / ln;
-		const ly = -0.6 / ln;
-		const lz = 0.62 / ln;
-		// Dim fill from the opposite side. Without it the unlit limb falls all the
-		// way to background black and the silhouette stops reading as a circle.
-		const fn = Math.hypot(la, 0.5, 0.5);
-		const fx = la / fn;
-		const fy = 0.5 / fn;
-		const fz = 0.5 / fn;
-		const hn = Math.hypot(lx, ly, lz + 1);
-		const hx = lx / hn;
-		const hy = ly / hn;
-		const hz = (lz + 1) / hn;
-
-		// Storm centres as unit vectors in the globe's own frame, so comparing them
-		// against a sample is one dot product and no trigonometry per pixel.
-		const spots = SPOTS.map((s) => {
-			const lon = s.lon + s.drift * t;
-			return {
-				x: s.cosLat * Math.sin(lon),
-				y: s.sinLat,
-				z: s.cosLat * Math.cos(lon),
-				inner: 1 - s.size,
-				inv: 1 / s.size,
-			};
-		});
-
-		// Shade one sample point into `smp` as pre-gamma rgb (0..1) premultiplied
-		// by coverage, plus that coverage; false when the sample misses both the
-		// globe and its atmosphere. A shared scratch buffer keeps this allocation
-		// free — it runs a few thousand times per frame.
-		const OUT = (1 + HALO) * (1 + HALO);
-		const smp = new Float32Array(4);
-		const shade = (nx: number, ny: number): boolean => {
-			const d2 = nx * nx + ny * ny;
-			if (d2 > OUT) return false;
-			const r = Math.sqrt(d2);
-			let cr = 0;
-			let cg = 0;
-			let cbl = 0;
-			let alpha = 0;
-
-			// Analytic limb coverage — one pixel of feather right at the edge — so
-			// the silhouette is a clean anti-aliased circle at any radius, without
-			// the supersampler having to resolve it.
-			const cov = Math.min(1, (1 - r) * R + 0.5);
-			if (cov > 0) {
-				const sz = Math.sqrt(Math.max(0, 1 - d2));
-				const ndl = nx * lx + ny * ly + sz * lz;
-				// Wrapped diffuse: softens the terminator so the shadowed side still
-				// carries some shape instead of going flat black.
-				const diffuse = Math.max(0, (ndl + 0.22) / 1.22);
-				const fill = Math.max(0, nx * fx + ny * fy + sz * fz) * 0.2;
-				let s = nx * hx + ny * hy + sz * hz;
-				s = s > 0 ? s : 0;
-				// ^32 by repeated squaring rather than Math.pow, which is several
-				// times the cost of the whole rest of this function per sample.
-				const s2 = s * s;
-				const s4 = s2 * s2;
-				const s8 = s4 * s4;
-				const s16 = s8 * s8;
-				const spec = s16 * s16; // a tight highlight rather than a wash
-				const fres = 1 - sz;
-				const rim = fres * fres * fres * 0.55;
-
-				// Globe frame: untilt onto the spin axis, then unspin, so everything
-				// below is fixed to the surface and rides the rotation.
-				const ty = ny * COS_TILT - sz * SIN_TILT;
-				const tz = ny * SIN_TILT + sz * COS_TILT;
-				const gx = nx * cosSpin + tz * sinSpin;
-				const gz = -nx * sinSpin + tz * cosSpin;
-
-				// Latitude bands warped by a slow swirl, the way a gas giant reads.
-				// Being latitude-aligned they never alias into moire the way
-				// meridians do at this resolution. Compressed rather than full
-				// swing: at full contrast the dark half of a band reads as a dent in
-				// the sphere rather than as a marking on it.
-				const raw = 0.5 + 0.5 * Math.sin(ty * 7.2 + 0.5 * churn * Math.sin(gx * 2.4 + gz * 1.3 + t * 0.8));
-				const band = 0.24 + 0.62 * raw * raw * (3 - 2 * raw);
-
-				let spot = 0;
-				for (const p of spots) {
-					const dot = gx * p.x + ty * p.y + gz * p.z;
-					if (dot <= p.inner) continue;
-					const m = Math.min(1, (dot - p.inner) * p.inv);
-					spot += m * m * (3 - 2 * m);
-				}
-				if (spot > 1) spot = 1;
-
-				// Polar aurora: cold light capping the axis, brightest where the
-				// surface turns away from the light, so the night side is not dead.
-				const polar = Math.max(0, Math.abs(ty) - 0.7) / 0.3;
-				const cap = polar * polar * (0.2 + 0.5 * (1 - diffuse));
-				// Live audio lights the globe from within.
-				const emis = glowAmt * 0.22 * (1 - d2);
-				const light = 0.07 + 0.93 * diffuse + fill;
-				const a = cov * form;
-				for (let i = 0; i < 3; i++) {
-					const base = (ca[i]! + (cb[i]! - ca[i]!) * band) / 255;
-					const hot = cb[i]! / 255;
-					const v =
-						base * light +
-						spot * 0.55 * hot * (0.3 + 0.7 * diffuse) +
-						spot * spot * 0.16 +
-						emis * hot +
-						spec * 0.26 +
-						(rim * RIM_TINT[i]! + cap * POLE_TINT[i]!) / 255;
-					const c = (v > 1 ? 1 : v) * a;
-					if (i === 0) cr = c;
-					else if (i === 1) cg = c;
-					else cbl = c;
-				}
-				alpha = a;
-			}
-
-			// Atmosphere: scattered light hugging the limb, strongest on the lit
-			// side and fading outward, which gives the globe depth against the
-			// background instead of a hard cutout edge.
-			const fall = 1 - Math.max(0, r - 0.94) / HALO;
-			if (fall > 0 && r > 0.6) {
-				const facing = 0.45 + 0.55 * Math.max(0, (nx * lx + ny * ly) / (r || 1));
-				const a = fall * fall * facing * (0.5 + 0.5 * glowAmt) * 0.85 * form * (1 - cov * 0.55);
-				if (a > 0) {
-					cr += ((RIM_TINT[0] * 0.5 + cb[0]! * 0.5) / 255) * a;
-					cg += ((RIM_TINT[1] * 0.5 + cb[1]! * 0.5) / 255) * a;
-					cbl += ((RIM_TINT[2] * 0.5 + cb[2]! * 0.5) / 255) * a;
-					alpha += a;
-				}
-			}
-			if (alpha <= 0) return false;
-			smp[0] = cr;
-			smp[1] = cg;
-			smp[2] = cbl;
-			smp[3] = alpha > 1 ? 1 : alpha;
-			return true;
-		};
-
-		// Supersampled pixel grid: rgb + coverage per pixel, in a buffer reused
-		// across frames.
-		const size = W * H * 4;
-		if (!this.pixels || this.pixels.length !== size) this.pixels = new Float32Array(size);
-		const px = this.pixels;
-		px.fill(0);
-		const midX = (W - 1) / 2;
-		const midY = (H - 1) / 2;
-		const scaleX = 1 / (R * PIXEL_ASPECT);
-		const scaleY = 1 / R;
-		for (let py = 0; py < H; py++) {
-			for (let x = 0; x < W; x++) {
-				let r = 0;
-				let g = 0;
-				let b = 0;
-				let cov = 0;
-				for (let s = 0; s < 4; s++) {
-					const dx = s & 1 ? 0.25 : -0.25;
-					const dy = s & 2 ? 0.25 : -0.25;
-					if (!shade((x + dx - midX) * scaleX, (py + dy - midY) * scaleY)) continue;
-					r += smp[0]!;
-					g += smp[1]!;
-					b += smp[2]!;
-					cov += smp[3]!;
-				}
-				if (!cov) continue;
-				const o = (py * W + x) * 4;
-				px[o] = r / 4;
-				px[o + 1] = g / 4;
-				px[o + 2] = b / 4;
-				px[o + 3] = cov / 4;
-			}
-		}
-
-		// Plot one point at a globe-space position (in radii). The same axial tilt
-		// as the surface takes it to view space, anything on the far side is
-		// occluded by the globe rather than drawn over it, and the blend is
-		// additive so a point crossing the lit face reads as a highlight instead
-		// of a hole punched in the surface.
-		const plot = (gx: number, gy: number, gz: number, tint: Rgb, weight: number, rad: number): void => {
-			const vy = gy * COS_TILT + gz * SIN_TILT;
-			const vz = -gy * SIN_TILT + gz * COS_TILT;
-			let w = weight;
-			if (vz < 0) {
-				// Going behind: fade across the limb instead of clipping, so a point
-				// sinks under the globe and comes back out rather than blinking.
-				const occ = (Math.hypot(gx, vy) - 1) / 0.14;
-				if (occ <= 0) return;
-				if (occ < 1) w *= occ;
-			}
-			w *= 0.45 + 0.55 * ((vz / (Math.hypot(gx, gy, gz) || 1) + 1) / 2);
-			if (w <= 0.015) return;
-			// Sub-pixel splat: a round, anti-aliased falloff, stretched
-			// horizontally because pixels are half as wide as they are tall, so it
-			// stays circular on screen and glides between pixels instead of
-			// snapping from one to the next.
-			const cx = midX + gx * R * PIXEL_ASPECT;
-			const cy = midY + vy * R;
-			const radX = rad * PIXEL_ASPECT;
-			const y1 = Math.floor(cy + rad);
-			const x1 = Math.floor(cx + radX);
-			for (let yy = Math.ceil(cy - rad); yy <= y1; yy++) {
-				if (yy < 0 || yy >= H) continue;
-				const dy = (yy - cy) / rad;
-				const dy2 = dy * dy;
-				for (let xx = Math.ceil(cx - radX); xx <= x1; xx++) {
-					if (xx < 0 || xx >= W) continue;
-					const dx = (xx - cx) / radX;
-					const d2 = dx * dx + dy2;
-					if (d2 >= 1) continue;
-					const f = 1 - d2;
-					const ww = w * f * f;
-					const o = (yy * W + xx) * 4;
-					for (let i = 0; i < 3; i++) px[o + i] = Math.min(1, px[o + i]! + (tint[i]! / 255) * ww);
-					px[o + 3] = Math.min(1, px[o + 3]! + ww);
-				}
-			}
-		};
-
-		// The ring is the meter the level strip used to be, and it lies in the
-		// globe's own equatorial plane so the two read as one object: the far half
-		// slips behind the limb, the near half crosses the lit face. Loose motes
-		// never resolve at this size — a continuous curve does, and it brightens,
-		// gains beads and runs faster as energy rises. The tint tracks the live
-		// palette, warming to amber sparks while the agent works.
-		const energy = this.energy;
-		const ringTint: [number, number, number] = [0, 0, 0];
-		for (let i = 0; i < 3; i++) {
-			const idle = POLE_TINT[i]! * 0.4 + cb[i]! * 0.6;
-			ringTint[i] = idle + (SPARK_COLOR[i]! - idle) * this.sparkAmt;
-		}
-		const ringAmt = (0.55 + 0.45 * energy) * form;
-		for (const st of STRANDS) {
-			// One sample per ~0.75px of arc, so a strand is a continuous line
-			// rather than a dotted one, whatever radius it ended up drawn at.
-			const circ = Math.PI * st.r * R * (PIXEL_ASPECT + SIN_TILT);
-			const segs = Math.max(24, Math.ceil(circ / 0.75));
-			for (let i = 0; i < segs; i++) {
-				const a = (i / segs) * Math.PI * 2;
-				// Brightness travelling around the strand: a uniform ring would
-				// hide its own rotation, arcs sweeping along it do not.
-				const dens = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(a * st.k - this.orbit * st.sp * 2));
-				plot(Math.cos(a) * st.r, 0, Math.sin(a) * st.r, ringTint, st.w * dens * ringAmt * 0.6, 0.8);
-			}
-		}
-		// Beads riding the ring: the fast, legible end of the meter, drawn
-		// tail-first so each bright head wins the pixels it shares with its trail.
-		const beads = 2 + Math.round(energy * 3);
-		for (let b = 0; b < beads; b++) {
-			const head = this.orbit * (1.1 + b * 0.13) + b * 2.4;
-			for (let tr = 5; tr >= 0; tr--) {
-				const a = head - tr * 0.09;
-				plot(Math.cos(a) * 1.33, 0, Math.sin(a) * 1.33, ringTint, (1 - tr / 6) ** 1.5 * ringAmt * 1.5, 0.95);
-			}
-		}
-
-		// Connecting: matter spirals inward and flattens into the ring plane as it
-		// arrives, so the session assembles itself out of the geometry it is about
-		// to settle into rather than out of unrelated confetti.
-		if (this.condense > 0.02) {
-			for (let k = 0; k < 7; k++) {
-				const elev0 = (((k * 0.618) % 1) - 0.5) * 1.5;
-				const phase = (this.clock * 0.6 + k * 0.143) % 1;
-				for (let tr = 5; tr >= 0; tr--) {
-					const p = phase - tr * 0.045;
-					if (p <= 0) continue;
-					// Stays within the frame: 1.75 radii is just inside the canvas.
-					const rr = 1.75 - 0.42 * p;
-					const elev = elev0 * (1 - p) * (1 - p);
-					const a = k * 2.39996 + this.orbit * 0.9 + p * 3.4;
-					const ce = Math.cos(elev);
-					const weight = this.condense * Math.sin(p * Math.PI) * (1 - tr / 6) * 1.1;
-					plot(Math.cos(a) * ce * rr, Math.sin(elev) * rr, Math.sin(a) * ce * rr, POLE_TINT, weight, 0.9);
-				}
-			}
-		}
-
-		const GAMMA = 0.85;
-		const offs = new Int32Array(4);
-		const lums = new Float64Array(4);
-		const q = (v: number) => Math.round(255 * (v > 1 ? 1 : v) ** GAMMA);
-		const seq = (sel: number, bg: boolean): string => {
-			let r = 0;
-			let g = 0;
-			let b = 0;
-			let n = 0;
-			for (let i = 0; i < 4; i++) {
-				if (!(sel & (1 << i))) continue;
-				const o = offs[i]!;
-				r += px[o]!;
-				g += px[o + 1]!;
-				b += px[o + 2]!;
-				n += 1;
-			}
-			return `\x1b[${bg ? 48 : 38};2;${q(r / n)};${q(g / n)};${q(b / n)}m`;
-		};
-		let curFg = "";
-		let curBg = "";
-		// Emit an SGR change only where a cell actually needs one: a run of empty
-		// background costs one reset instead of one escape pair per cell, which
-		// roughly halves the bytes pushed to the terminal each frame.
-		const style = (fg: string, bg: string): string => {
-			let out = "";
-			if (curBg && bg !== curBg) {
-				out += "\x1b[0m";
-				curFg = "";
-				curBg = "";
-			}
-			if (bg && bg !== curBg) {
-				out += bg;
-				curBg = bg;
-			}
-			if (fg && fg !== curFg) {
-				out += fg;
-				curFg = fg;
-			}
-			return out;
-		};
-		// A pixel counts as drawn when it is bright enough to beat the terminal
-		// background, not merely when something touched it. Keying off coverage
-		// instead emits near-black cells for the faintest atmosphere and ring
-		// samples, which on any non-black background punch dark specks out of the
-		// limb and leave the halo looking chewed.
-		const lit = (o: number) => px[o]! + px[o + 1]! + px[o + 2]! > 0.15;
-		for (let cy = 0; cy < CHAR_ROWS; cy++) {
-			let line = "";
-			curFg = "";
-			curBg = "";
-			for (let cx = 0; cx < cols; cx++) {
-				// Cell pixel offsets in mask order UL, UR, LL, LR.
-				offs[0] = (cy * 2 * W + cx * 2) * 4;
-				offs[1] = offs[0]! + 4;
-				offs[2] = ((cy * 2 + 1) * W + cx * 2) * 4;
-				offs[3] = offs[2]! + 4;
-				let mask = 0;
-				for (let i = 0; i < 4; i++) if (lit(offs[i]!)) mask |= 1 << i;
-				if (!mask) {
-					line += `${style("", "")} `;
-					continue;
-				}
-				if (mask !== 15) {
-					// Limb: draw only covered quadrants, background stays transparent.
-					line += `${style(seq(mask, false), "")}${QUAD[mask]}`;
-					continue;
-				}
-				// Interior: splitting the cell into bright and dark halves buys
-				// detail only where there is detail to keep. On smooth shading it
-				// just quantizes a gradient into speckle, so a flat cell takes one
-				// averaged color instead.
-				for (let i = 0; i < 4; i++) lums[i] = px[offs[i]!]! + px[offs[i]! + 1]! + px[offs[i]! + 2]!;
-				let lo = lums[0]!;
-				let hi = lums[0]!;
-				for (let i = 1; i < 4; i++) {
-					if (lums[i]! < lo) lo = lums[i]!;
-					if (lums[i]! > hi) hi = lums[i]!;
-				}
-				if (hi - lo < 0.12) {
-					line += `${style(seq(15, false), "")}█`;
-					continue;
-				}
-				const mean = (lums[0]! + lums[1]! + lums[2]! + lums[3]!) / 4;
-				let brightMask = 0;
-				for (let i = 0; i < 4; i++) if (lums[i]! >= mean) brightMask |= 1 << i;
-				line +=
-					brightMask === 15
-						? `${style(seq(15, false), "")}█`
-						: `${style(seq(brightMask, false), seq(15 & ~brightMask, true))}${QUAD[brightMask]}`;
-			}
-			if (curFg || curBg) line += "\x1b[0m";
-			rows.push(this.centered(line, width));
-		}
-
-		return rows;
-	}
-
-	invalidate(): void {}
-
-	dispose(): void {
-		clearInterval(this.timer);
-	}
-}
-
-// --- the talk panel ---
-
-type TranscriptWho = "you" | "asst" | "sys";
-type TranscriptEntry = { who: TranscriptWho; text: string };
-/** What the panel draws: settled entries, plus the one still being spoken. */
-type TranscriptView = { entries: readonly TranscriptEntry[]; open?: TranscriptEntry };
-
-const PANEL_ROWS = 8; // the globe's own height, so the panel is a fixed block
-const LABEL_W = 4; // "you" / "talk" / "·", right-aligned in this column
-const ORB_GUTTER = 2;
-const MIN_TEXT_W = 26; // narrower than this and the words are not worth wrapping
-const MAX_TEXT_W = 84; // a comfortable measure; wider rows read worse, not better
-// Notes carry their own leading arrow, so they take no speaker label and their
-// text lines up with everyone else's.
-const LABELS: Record<TranscriptWho, string> = { you: "you", asst: "talk", sys: "" };
-
-/** Greedy word wrap to `width` columns; a word longer than the line is split. */
-function wrapText(text: string, width: number): string[] {
-	if (width < 2) return [];
-	const lines: string[] = [];
-	let line = "";
-	const flush = () => {
-		while (visibleWidth(line) > width) {
-			const head = truncateToWidth(line, width, "");
-			lines.push(head);
-			line = line.slice(head.length);
-		}
-	};
-	for (const word of text.split(/\s+/)) {
-		if (!word) continue;
-		if (!line) line = word;
-		else if (visibleWidth(line) + 1 + visibleWidth(word) <= width) line += ` ${word}`;
-		else {
-			flush();
-			if (line) lines.push(line);
-			line = word;
-		}
-		flush();
-	}
-	if (line) lines.push(line);
-	return lines;
-}
-
-/**
- * The whole talk surface as one fixed block above the editor: the globe on the
- * left, the conversation in the width the globe was wasting on its right.
- *
- * The two used to sit on opposite sides of the editor, which put the input box
- * in the middle of a single conversation, and the transcript grew and shrank
- * with what had been said, so every utterance shoved the editor and the whole
- * scrollback up or down the screen. This is always exactly `PANEL_ROWS` tall —
- * fewer rows than the two widgets used to take between them — and the text is
- * bottom-aligned, so the newest line is always in the same place and the older
- * ones recede up and out.
- */
-class TalkPanel {
-	private readonly orb: TalkVisual;
-
-	constructor(
-		tui: TUI,
-		private readonly theme: Theme,
-		getState: () => TalkVisualState,
-		getLevel: () => number,
-		private readonly getView: () => TranscriptView,
-	) {
-		this.orb = new TalkVisual(tui, theme, getState, getLevel);
-	}
-
-	render(width: number): string[] {
-		const orbBox = Math.min(ORB_COLS + 2, width);
-		// Capped, not greedy: on a wide terminal a full-width row of speech runs
-		// well past a comfortable measure and is harder to follow, not easier.
-		const textWidth = Math.min(MAX_TEXT_W, width - orbBox - ORB_GUTTER);
-		// Too narrow to sit side by side: the globe carries the state on its own,
-		// and the words — which are spoken aloud anyway — give up the room.
-		if (textWidth < MIN_TEXT_W) return this.orb.render(width);
-		const orbLines = this.orb.render(orbBox);
-		const textLines = this.transcript(textWidth);
-		const gutter = " ".repeat(ORB_GUTTER);
-		return orbLines.map((orb, i) => {
-			const text = textLines[i];
-			if (!text) return orb;
-			const pad = " ".repeat(Math.max(0, orbBox - visibleWidth(orb)));
-			return `${orb}${pad}${gutter}${text}`;
-		});
-	}
-
-	/** Exactly PANEL_ROWS rendered rows, bottom-aligned. */
-	private transcript(width: number): string[] {
-		const { entries, open } = this.getView();
-		const all = open ? [...entries, open] : entries;
-		// Label, its trailing space, and a reserved column for the cursor block the
-		// open line ends with — without that column the line still being spoken
-		// renders one wider than the panel it was measured for.
-		const bodyWidth = Math.max(4, width - LABEL_W - 2);
-		const rows: string[] = [];
-		for (const [index, entry] of all.entries()) {
-			const wrapped = wrapText(entry.text, bodyWidth);
-			// The label sits on the first line of an utterance only; continuations
-			// hang under it, which reads far better than a speaker tag per row.
-			const latest = index === all.length - 1;
-			for (const [line, text] of wrapped.entries()) {
-				const cursor = latest && open !== undefined && line === wrapped.length - 1;
-				rows.push(this.row(line === 0 ? LABELS[entry.who] : "", text, entry.who, latest, cursor));
-			}
-		}
-		const tail = rows.slice(-PANEL_ROWS);
-		return Array(PANEL_ROWS - tail.length)
-			.fill("")
-			.concat(tail);
-	}
-
-	private row(label: string, text: string, who: TranscriptWho, latest: boolean, cursor: boolean): string {
-		const labelColor = who === "you" ? "muted" : who === "asst" ? "accent" : "dim";
-		// Only the newest utterance is at full strength; everything behind it
-		// recedes, so the eye lands on what is being said right now.
-		const textColor = who === "sys" ? "dim" : latest ? (who === "you" ? "userMessageText" : "text") : "muted";
-		const head = this.theme.fg(labelColor, label.padStart(LABEL_W));
-		const body = this.theme.fg(textColor, text);
-		return `${head} ${body}${cursor ? this.theme.fg("accent", "▌") : ""}`;
-	}
-
-	invalidate(): void {
-		this.orb.invalidate();
-	}
-
-	dispose(): void {
-		this.orb.dispose();
-	}
+	} catch {}
+	return typeof item.arguments === "string" ? item.arguments : "";
 }
 
 // --- the talk session ---
@@ -1343,12 +154,9 @@ class TalkSession {
 	}
 
 	private openTranscriptEntry(): TranscriptEntry | undefined {
-		const text = this.openLine?.text.trim();
-		return text ? { who: this.openLine!.who, text } : undefined;
-	}
-
-	private setVisualState(state: TalkVisualState): void {
-		this.visualState = state;
+		const open = this.openLine;
+		const text = open?.text.trim();
+		return open && text ? { who: open.who, text } : undefined;
 	}
 
 	private isPlaying(): boolean {
@@ -1445,7 +253,7 @@ class TalkSession {
 			const tag = `${this.model.replace(/^gpt-realtime-/, "")} · ${VOICE}`;
 			this.ctx.ui.setStatus("talk", `◉ talk · ${tag}${this.audio.echoCancelled ? "" : " · half-duplex"}`);
 		}
-		this.setVisualState("listening");
+		this.visualState = "listening";
 		this.markDirty();
 	}
 
@@ -1472,10 +280,10 @@ class TalkSession {
 		sendJson(this.ws, payload);
 	}
 
-	private sendItem(role: "user", text: string): void {
+	private sendUserItem(text: string): void {
 		this.send({
 			type: "conversation.item.create",
-			item: { type: "message", role, content: [{ type: "input_text", text }] },
+			item: { type: "message", role: "user", content: [{ type: "input_text", text }] },
 		});
 	}
 
@@ -1503,7 +311,7 @@ class TalkSession {
 		switch (msg.type) {
 			case "response.created":
 				this.responseActive = true;
-				this.setVisualState("thinking");
+				this.visualState = "thinking";
 				this.playedBytes = 0;
 				this.firstChunkAt = 0;
 				break;
@@ -1515,7 +323,7 @@ class TalkSession {
 				this.currentItemId = undefined;
 				this.playedBytes = 0;
 				this.responseActive = false;
-				this.setVisualState(this.activeHandoff ? "working" : "listening");
+				this.visualState = this.activeHandoff ? "working" : "listening";
 				if (this.pendingResponseCreate) {
 					this.pendingResponseCreate = false;
 					this.send({ type: "response.create" });
@@ -1534,7 +342,7 @@ class TalkSession {
 				break;
 			}
 			case "input_audio_buffer.speech_started":
-				this.setVisualState("hearing");
+				this.visualState = "hearing";
 				this.onBargeIn(typeof msg.item_id === "string" ? msg.item_id : undefined);
 				break;
 			case "conversation.item.input_audio_transcription.delta":
@@ -1585,7 +393,7 @@ class TalkSession {
 		// its wall-clock playback window so the orb animates in sync with the
 		// audio the speaker is actually emitting.
 		this.outLevels.push({ start, end: this.playbackEndsAt, rms: pcmRms(buf) });
-		if (this.outLevels.length > 600) this.outLevels.splice(0, this.outLevels.length - 600);
+		if (this.outLevels.length > MAX_OUT_LEVELS) this.outLevels.splice(0, this.outLevels.length - MAX_OUT_LEVELS);
 	}
 
 	private onBargeIn(speechItemId?: string): void {
@@ -1629,21 +437,9 @@ class TalkSession {
 		}
 		if (item.name !== "background_agent") return;
 
-		// Upstream extract_input_transcript: first non-empty string under the
-		// known keys, otherwise the raw arguments string.
-		let prompt = "";
-		try {
-			const args = JSON.parse(item.arguments || "{}");
-			for (const key of TOOL_ARGUMENT_KEYS) {
-				const value = args?.[key];
-				if (typeof value === "string" && value.trim()) {
-					prompt = value.trim();
-					break;
-				}
-			}
-		} catch {}
-		if (!prompt.trim() && typeof item.arguments === "string") prompt = item.arguments;
-		if (!prompt.trim() || prompt.trim() === "{}") {
+		const prompt = handoffPrompt(item);
+		const trimmed = prompt.trim();
+		if (!trimmed || trimmed === "{}") {
 			this.sendFunctionOutput(callId, "No prompt provided.");
 			this.createResponse();
 			return;
@@ -1655,13 +451,13 @@ class TalkSession {
 		// spent a row of the panel repeating you.
 		this.note(busy ? "→ steering the agent" : "→ handed to the agent");
 		if (busy) {
-			this.setVisualState("thinking");
+			this.visualState = "thinking";
 			this.pi.sendUserMessage(prompt, { deliverAs: "steer" });
 			this.sendFunctionOutput(callId, STEER_ACK);
 			this.createResponse();
 		} else {
 			this.activeHandoff = { callId };
-			this.setVisualState("working");
+			this.visualState = "working";
 			this.pi.sendUserMessage(prompt);
 		}
 	}
@@ -1674,7 +470,7 @@ class TalkSession {
 		// (realtime_backend_output), prefixing before truncation and skipping
 		// the prefix when the text already carries it.
 		const prefixed = text.startsWith(BACKEND_PREFIX) ? text : BACKEND_PREFIX + text;
-		this.sendItem("user", truncateToTokens(prefixed, BACKEND_OUTPUT_TOKEN_BUDGET));
+		this.sendUserItem(truncateToTokens(prefixed, BACKEND_OUTPUT_TOKEN_BUDGET));
 	}
 
 	onAgentEnd(): void {
@@ -1682,7 +478,7 @@ class TalkSession {
 		const { callId } = this.activeHandoff;
 		this.activeHandoff = undefined;
 		this.note("← agent finished");
-		this.setVisualState("thinking");
+		this.visualState = "thinking";
 		this.sendFunctionOutput(callId, HANDOFF_COMPLETE_ACK);
 		this.createResponse();
 	}
@@ -1692,15 +488,13 @@ class TalkSession {
 		// backend; context only, it should not speak up about it uninvited.
 		const trimmed = text.trim();
 		if (!trimmed) return;
-		this.sendItem("user", trimmed.startsWith(USER_PREFIX) ? trimmed : USER_PREFIX + trimmed);
+		this.sendUserItem(trimmed.startsWith(USER_PREFIX) ? trimmed : USER_PREFIX + trimmed);
 	}
 
 	// --- transcript widget ---
 
 	private note(text: string): void {
-		this.transcript.push({ who: "sys", text });
-		this.trimTranscript();
-		this.markDirty();
+		this.push({ who: "sys", text });
 	}
 
 	private streamDelta(who: "you" | "asst", delta: string): void {
@@ -1713,14 +507,19 @@ class TalkSession {
 
 	private endLine(who: "you" | "asst"): void {
 		if (this.openLine?.who !== who) return;
-		if (this.openLine.text.trim()) this.transcript.push({ who, text: this.openLine.text.trim() });
+		const text = this.openLine.text.trim();
 		this.openLine = undefined;
-		this.trimTranscript();
-		this.markDirty();
+		if (text) this.push({ who, text });
+		else this.markDirty();
 	}
 
-	private trimTranscript(): void {
-		if (this.transcript.length > 40) this.transcript.splice(0, this.transcript.length - 40);
+	/** Append an utterance, keeping the transcript bounded, and redraw. */
+	private push(entry: TranscriptEntry): void {
+		this.transcript.push(entry);
+		if (this.transcript.length > MAX_TRANSCRIPT_ENTRIES) {
+			this.transcript.splice(0, this.transcript.length - MAX_TRANSCRIPT_ENTRIES);
+		}
+		this.markDirty();
 	}
 
 	// In the TUI the panel reads the transcript straight off this session on
@@ -1758,17 +557,18 @@ class TalkSession {
 
 // --- extension wiring ---
 
+// `/talk <arg>`: the model tier each argument selects. Anything else is either
+// on/off or a typo.
+const MODEL_ARGS: Record<string, string | undefined> = {
+	mini: MINI_MODEL,
+	fast: MINI_MODEL,
+	voice: VOICE_MODEL,
+	"1.5": VOICE_MODEL,
+	audio: VOICE_MODEL,
+};
+
 export default function talk(pi: ExtensionAPI) {
 	let active: TalkSession | undefined;
-
-	const stopSession = (userInitiated: boolean) => {
-		const session = active;
-		active = undefined;
-		if (session) {
-			session.stop(userInitiated);
-			session.clearWidget();
-		}
-	};
 
 	pi.on("message_end", (event) => active?.onAgentMessage(event.message));
 	pi.on("agent_end", () => active?.onAgentEnd());
@@ -1776,7 +576,7 @@ export default function talk(pi: ExtensionAPI) {
 		// Mirror the user's own typed input (not extension-injected handoffs).
 		if (active && event.source !== "extension") active.onUserTyped(event.text);
 	});
-	pi.on("session_shutdown", () => stopSession(false));
+	pi.on("session_shutdown", () => active?.stop(false));
 
 	pi.registerCommand("talk", {
 		description: "Toggle live voice conversation (realtime speech driving this agent, Codex-style)",
@@ -1786,23 +586,22 @@ export default function talk(pi: ExtensionAPI) {
 				return;
 			}
 			const action = args.trim().toLowerCase();
-			if (action && !["on", "off", "mini", "fast", "voice", "1.5", "audio"].includes(action)) {
+			const argModel = MODEL_ARGS[action];
+			if (action && !argModel && action !== "on" && action !== "off") {
 				ctx.ui.notify(
 					"Use /talk, /talk on|off, /talk mini (cheaper/faster), or /talk voice (best audio, gpt-realtime-1.5)",
 					"warning",
 				);
 				return;
 			}
-			const mini = action === "mini" || action === "fast";
-			const voice = action === "voice" || action === "1.5" || action === "audio";
-			const turnOn = action === "on" || mini || voice ? true : action === "off" ? false : !active;
+			const turnOn = action === "on" || argModel ? true : action === "off" ? false : !active;
 
 			if (!turnOn) {
 				if (!active) {
 					ctx.ui.notify("Talk is already off", "info");
 					return;
 				}
-				stopSession(true);
+				active.stop(true);
 				ctx.ui.notify("Talk off", "info");
 				return;
 			}
@@ -1811,11 +610,11 @@ export default function talk(pi: ExtensionAPI) {
 				return;
 			}
 
-			const session = new TalkSession(pi, ctx, voice ? VOICE_MODEL : mini ? MINI_MODEL : MODEL, () => {
-				if (active === session) {
-					active = undefined;
-					session.clearWidget();
-				}
+			// stop() runs this on every path — user toggle, socket close, audio
+			// failure, shutdown — so teardown lives in one place.
+			const session = new TalkSession(pi, ctx, argModel ?? MODEL, () => {
+				if (active === session) active = undefined;
+				session.clearWidget();
 			});
 			try {
 				active = session;
@@ -1823,9 +622,7 @@ export default function talk(pi: ExtensionAPI) {
 				session.mountUI();
 				await session.start();
 			} catch (error) {
-				active = undefined;
 				session.stop(false);
-				session.clearWidget();
 				ctx.ui.notify(`Talk failed to start: ${clip(errorText(error), 140)}`, "error");
 			}
 		},
