@@ -1,6 +1,6 @@
 ---
 name: google-workspace
-description: "Google Docs and Google Sheets via the gws CLI. Use when the user wants to read or edit a Doc or spreadsheet, or shares a Docs/Sheets link or ID."
+description: "Google Docs, Sheets, Drive, and Gmail via the gws CLI. Use when the user wants to read or edit a Doc or spreadsheet, manage Drive files or sharing, read or send email, or shares a Docs/Sheets/Drive link or ID."
 metadata:
   version: 0.22.5
   upstream: "https://github.com/googleworkspace/cli"
@@ -19,6 +19,8 @@ Shared `gws` conventions live here; before running any command for a service, re
 |---|---|
 | Google Docs | [docs.md](docs.md) |
 | Google Sheets | [sheets.md](sheets.md) |
+| Google Drive | [drive.md](drive.md) |
+| Gmail | [gmail.md](gmail.md) |
 
 ## Setup
 
