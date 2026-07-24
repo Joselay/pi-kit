@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { errorText, isRecord } from "./lib/util.ts";
 
 const FAST_REQUEST_SERVICE_TIER = "priority";
 const FAST_STATE_PATH = join(getAgentDir(), "fast.json");
@@ -19,10 +20,6 @@ const CODEX_FAST_MODE_MODEL_IDS = [
 	"gpt-5.6-luna",
 ] as const;
 const CODEX_FAST_MODE_MODELS = new Set<string>(CODEX_FAST_MODE_MODEL_IDS);
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function isEnabledByEnv(): boolean {
 	const value = process.env.PI_CODEX_FAST_MODE?.trim().toLowerCase();
@@ -99,7 +96,7 @@ export default function fastMode(pi: ExtensionAPI) {
 			try {
 				writePersistedEnabled(enabled);
 			} catch (error) {
-				notify(ctx, `Failed to save fast mode state: ${error instanceof Error ? error.message : String(error)}`, "warning");
+				notify(ctx, `Failed to save fast mode state: ${errorText(error)}`, "warning");
 			}
 		}
 		updateStatus(ctx);
@@ -143,7 +140,7 @@ export default function fastMode(pi: ExtensionAPI) {
 			try {
 				writePersistedEnabled(enabled);
 			} catch (error) {
-				notify(ctx, `Fast mode changed but failed to save state: ${error instanceof Error ? error.message : String(error)}`, "warning");
+				notify(ctx, `Fast mode changed but failed to save state: ${errorText(error)}`, "warning");
 			}
 			updateStatus(ctx);
 			notify(ctx, enabled ? "Fast mode on (1.5x speed, consumes usage limits ~2-2.5x faster)" : "Fast mode off", "info");

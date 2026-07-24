@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { dirname, join, resolve } from "node:path";
 import { CustomEditor, getAgentDir, type ExtensionAPI, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { errorText } from "./lib/util.ts";
 
 const HISTORY_LIMIT = 100;
 const HISTORY_PATH = join(getAgentDir(), "recall.json");
@@ -126,7 +127,7 @@ export default function recall(pi: ExtensionAPI) {
 			writeStore(store);
 			if (ctx.mode === "tui" && !existed) historyTotal = Math.min(HISTORY_LIMIT, historyTotal + 1);
 		} catch (error) {
-			if (ctx.hasUI) ctx.ui.notify(`Could not save prompt history: ${error instanceof Error ? error.message : String(error)}`, "warning");
+			if (ctx.hasUI) ctx.ui.notify(`Could not save prompt history: ${errorText(error)}`, "warning");
 		}
 	});
 }

@@ -13,22 +13,20 @@
 // Auth is the pi `openai-codex` OAuth subscription resolved through ModelRuntime
 // (~/.pi/agent/auth.json). OAuth only — no API-key fallback.
 
-import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
 import {
-	ModelRuntime,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { FfplayPipe, pcmChunkMs, SAMPLE_RATE } from "./lib/audio.ts";
+import { resolveRealtimeOAuth } from "./lib/codex.ts";
+import { openRealtimeSocket, parseServerEvent, realtimeHeaders, sendJson } from "./lib/realtime.ts";
+import { clip, errorText, messageText } from "./lib/util.ts";
 
-const PROVIDER_ID = "openai-codex";
 const REALTIME_URL = process.env.PI_SAY_ENDPOINT?.trim() || "wss://api.openai.com/v1/realtime";
 const MODEL = process.env.PI_SAY_MODEL?.trim() || "gpt-realtime-2.1-mini";
 const VOICE = process.env.PI_SAY_VOICE?.trim() || "marin";
 
-const SAMPLE_RATE = 24000;
-const CONNECT_TIMEOUT_MS = 10_000;
 const PLAYBACK_TAIL_MS = 300;
 /** Longest text to speak in one utterance; realtime instructions cap. */
 const MAX_TEXT_CHARS = 6000;
@@ -39,76 +37,9 @@ const INSTRUCTIONS =
 	"summarize, or comment on anything. Read code identifiers naturally. Skip " +
 	"markdown syntax characters (#, *, backticks) but read their content.";
 
-function clip(text: string, max: number): string {
-	const flat = text.replace(/\s+/g, " ").trim();
-	return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
-}
-
-function errorText(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
-}
-
-function findBinary(name: string): string {
-	return [`/opt/homebrew/bin/${name}`, `/usr/local/bin/${name}`].find(existsSync) ?? name;
-}
-
-/** Same OAuth-only resolution as /talk and /translate. */
-async function resolveOAuth(): Promise<{ token: string; accountId?: string }> {
-	const runtime = await ModelRuntime.create();
-	const check = await (runtime as any).checkAuth(PROVIDER_ID);
-	if (!(runtime as any).isUsingOAuth(PROVIDER_ID) || check?.type !== "oauth") {
-		throw new Error("say needs the openai-codex OAuth subscription; run /login first");
-	}
-	const token = (await (runtime as any).getAuth(PROVIDER_ID))?.auth?.apiKey;
-	if (!token) throw new Error("could not resolve the OAuth token; run /login again");
-	let accountId: string | undefined;
-	try {
-		const payload = JSON.parse(Buffer.from(token.split(".")[1]!, "base64url").toString("utf8"));
-		const id = payload?.["https://api.openai.com/auth"]?.chatgpt_account_id;
-		if (typeof id === "string" && id) accountId = id;
-	} catch {}
-	return { token, accountId };
-}
-
-/** Playback-only ffplay pipe (no mic, so no AEC needed). */
-class Player {
-	private child?: ChildProcess;
-	private stopped = false;
-
-	play(buf: Buffer): void {
-		if (this.stopped) return;
-		if (!this.child || this.child.stdin?.destroyed) this.spawnPlayer();
-		this.child?.stdin?.write(buf);
-	}
-
-	private spawnPlayer(): void {
-		this.child = spawn(
-			findBinary("ffplay"),
-			[
-				"-hide_banner", "-loglevel", "error", "-nodisp", "-autoexit",
-				"-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "32", "-sync", "audio",
-				"-f", "s16le", "-ar", String(SAMPLE_RATE), "-ch_layout", "mono", "-i", "pipe:0",
-			],
-			{ stdio: ["pipe", "ignore", "ignore"] },
-		);
-		this.child.stdin?.on("error", () => {});
-		this.child.on("close", () => {
-			if (!this.stopped) this.child = undefined;
-		});
-	}
-
-	stop(): void {
-		this.stopped = true;
-		try {
-			this.child?.stdin?.end();
-		} catch {}
-		this.child?.kill("SIGKILL");
-	}
-}
-
 class SaySession {
-	private ws?: any;
-	private player = new Player();
+	private ws?: WebSocket;
+	private player = new FfplayPipe();
 	private closing = false;
 	private playbackEndsAt = 0;
 	private responseDone = false;
@@ -121,29 +52,10 @@ class SaySession {
 	) {}
 
 	async start(): Promise<void> {
-		const { token, accountId } = await resolveOAuth();
-		const headers: Record<string, string> = {
-			Authorization: `Bearer ${token}`,
-			originator: "pi",
-			"user-agent": `pi-say (${process.platform}; ${process.arch})`,
-		};
-		if (accountId) headers["chatgpt-account-id"] = accountId;
-
+		const creds = await resolveRealtimeOAuth("say");
 		const url = `${REALTIME_URL}?model=${encodeURIComponent(MODEL)}`;
-		const ws = new (globalThis as any).WebSocket(url, { headers });
+		const ws = await openRealtimeSocket(url, realtimeHeaders(creds, "say"));
 		this.ws = ws;
-
-		await new Promise<void>((resolve, reject) => {
-			const timer = setTimeout(() => reject(new Error("realtime connection timed out")), CONNECT_TIMEOUT_MS);
-			ws.addEventListener("open", () => {
-				clearTimeout(timer);
-				resolve();
-			});
-			ws.addEventListener("error", (event: any) => {
-				clearTimeout(timer);
-				reject(new Error(event?.message ?? "websocket error"));
-			});
-		});
 
 		this.send({
 			type: "session.update",
@@ -195,26 +107,19 @@ class SaySession {
 	}
 
 	private send(payload: unknown): void {
-		try {
-			if (this.ws?.readyState === 1) this.ws.send(JSON.stringify(payload));
-		} catch {}
+		sendJson(this.ws, payload);
 	}
 
 	private onServerEvent(event: any): void {
-		let msg: any;
-		try {
-			msg = JSON.parse(typeof event.data === "string" ? event.data : String(event.data));
-		} catch {
-			return;
-		}
+		const msg = parseServerEvent(event);
+		if (!msg) return;
 		switch (msg.type) {
 			case "response.output_audio.delta":
 			case "response.audio.delta": {
 				if (!msg.delta) break;
 				const buf = Buffer.from(msg.delta, "base64");
 				this.player.play(buf);
-				const chunkMs = (buf.length / 2 / SAMPLE_RATE) * 1000;
-				this.playbackEndsAt = Math.max(this.playbackEndsAt, Date.now()) + chunkMs;
+				this.playbackEndsAt = Math.max(this.playbackEndsAt, Date.now()) + pcmChunkMs(buf);
 				break;
 			}
 			case "response.done":
@@ -238,24 +143,12 @@ class SaySession {
 	}
 }
 
-function extractText(content: unknown): string {
-	if (typeof content === "string") return content.trim();
-	if (!Array.isArray(content)) return "";
-	return content
-		.filter((part): part is { type: "text"; text: string } =>
-			Boolean(part && typeof part === "object" && (part as any).type === "text"),
-		)
-		.map((part) => part.text)
-		.join("\n")
-		.trim();
-}
-
 function lastAssistantText(ctx: ExtensionContext): string | undefined {
 	const entries = ctx.sessionManager.getBranch();
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i]!;
 		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
-		const text = extractText((entry.message as { content?: unknown }).content);
+		const text = messageText(entry.message).trim();
 		if (text) return text;
 	}
 	return undefined;

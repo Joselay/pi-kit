@@ -21,29 +21,28 @@ Skills live in [`skills`](skills):
 
 Pi extensions live in [`extensions`](extensions):
 
+- [`lib/`](extensions/lib) - Shared helpers imported by the extensions below (not auto-loaded): `util.ts` (small utilities), `codex.ts` (Codex OAuth + ChatGPT `/wham` backend API), `audio.ts` (24 kHz PCM16 capture/playback with AEC helper + ffmpeg fallback), `realtime.ts` (realtime WebSocket plumbing).
 - [`account.ts`](extensions/account.ts) - `/account` Codex plan, real rate-limit windows, credits, and profile stats.
 - [`answer.ts`](extensions/answer.ts) - `/answer` interactive Q&A from the last assistant message.
-- [`autoreview.ts`](extensions/autoreview.ts) - `/autoreview` one-shot diff review by the `codex-auto-review` model (no agent turn).
 - [`btw.ts`](extensions/btw.ts) - Side-chat popover for tangential questions.
 - [`continue.ts`](extensions/continue.ts) - Shortcut to send `continue` when the agent stops.
 - [`cosmetic.ts`](extensions/cosmetic.ts) - All UI chrome: random image header, custom footer (model, context, Codex plan and usage), whimsical working messages, and the completion sound.
-- [`dictate.ts`](extensions/dictate.ts) - `/dictate` push-to-talk voice input via `gpt-realtime-whisper`.
+- [`dictate.ts`](extensions/dictate.ts) - `/dictate` push-to-talk voice input; `/dictate streaming|batch|best` picks the transcription mode (`gpt-realtime-whisper` live deltas / `gpt-4o-mini-transcribe` / `gpt-4o-transcribe`).
 - [`fast.ts`](extensions/fast.ts) - `/fast` for Codex priority mode.
-- [`files.ts`](extensions/files.ts) - `/files` browser for Git and session-referenced files.
 - [`dupe.ts`](extensions/dupe.ts) - Duplicate the current session into a new Ghostty split.
 - [`emoji.ts`](extensions/emoji.ts) - `:shortcode:` autocomplete and `/emoji` picker.
+- [`files.ts`](extensions/files.ts) - `/files` browser for Git and session-referenced files.
 - [`goal.ts`](extensions/goal.ts) - Long-running goals with budgets and progress tracking.
-- [`models.ts`](extensions/models.ts) - `/models` live Codex model catalog with per-model capability flags.
 - [`recall.ts`](extensions/recall.ts) - Project-scoped prompt history.
 - [`reset.ts`](extensions/reset.ts) - `/reset` for Codex usage-limit resets.
 - [`review.ts`](extensions/review.ts) - `/review` workflow for code changes and folders.
 - [`say.ts`](extensions/say.ts) - `/say` speak text or the last reply aloud (`gpt-realtime-2.1-mini` as TTS over OAuth).
 - [`semantic-recall.ts`](extensions/semantic-recall.ts) - `/recall` semantic search over past sessions; `/recall large|small` switches embedding tier (`text-embedding-3-large` / `text-embedding-3-small`, persisted).
+- [`talk.ts`](extensions/talk.ts) - `/talk` live voice conversation driving the agent (Codex-style realtime intermediary over OAuth); `/talk mini|voice` picks the cheaper or best-audio model tier.
 - [`todos.ts`](extensions/todos.ts) - File-based todo management and task refinement.
+- [`translate.ts`](extensions/translate.ts) - `/translate` live speech-to-speech translation via `gpt-realtime-translate`.
 - [`unified-edit.ts`](extensions/unified-edit.ts) - Replaces `edit` with row edit scripts and Codex-style patches.
 - [`usage.ts`](extensions/usage.ts) - Session usage and cost breakdown.
-- [`talk.ts`](extensions/talk.ts) - `/talk` live voice conversation driving the agent (Codex-style realtime intermediary over OAuth).
-- [`translate.ts`](extensions/translate.ts) - `/translate` live speech-to-speech translation via `gpt-realtime-translate`.
 - [`uv.ts`](extensions/uv.ts) - Replaces bash with a `uv`-aware version.
 
 ## Theme

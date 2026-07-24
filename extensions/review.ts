@@ -40,6 +40,7 @@ import {
 } from "@earendil-works/pi-tui";
 import path from "node:path";
 import { promises as fs } from "node:fs";
+import { errorText } from "./lib/util.ts";
 
 // State to track fresh session review (where we branched from).
 // Module-level state means only one review can be active at a time.
@@ -1398,7 +1399,7 @@ export default function reviewExtension(pi: ExtensionAPI) {
 				} catch (error) {
 					// Clean up state if navigation fails
 					reviewOriginId = undefined;
-					ctx.ui.notify(`Failed to start review: ${error instanceof Error ? error.message : String(error)}`, "error");
+					ctx.ui.notify(`Failed to start review: ${errorText(error)}`, "error");
 					return false;
 				}
 
@@ -1958,7 +1959,7 @@ Instructions:
 					replaceInstructions: true,
 				})
 					.then(done)
-					.catch((err) => done({ cancelled: false, error: err instanceof Error ? err.message : String(err) }));
+					.catch((err) => done({ cancelled: false, error: errorText(err) }));
 
 				return loader;
 			});
@@ -1971,7 +1972,7 @@ Instructions:
 				replaceInstructions: true,
 			});
 		} catch (error) {
-			return { cancelled: false, error: error instanceof Error ? error.message : String(error) };
+			return { cancelled: false, error: errorText(error) };
 		}
 	}
 
@@ -1998,7 +1999,7 @@ Instructions:
 					return "cancelled";
 				}
 			} catch (error) {
-				ctx.ui.notify(`Failed to return: ${error instanceof Error ? error.message : String(error)}`, "error");
+				ctx.ui.notify(`Failed to return: ${errorText(error)}`, "error");
 				return "error";
 			}
 

@@ -10,7 +10,7 @@
  * 4. Submits the compiled answers when done
  */
 
-import { complete, parseJsonWithRepair, type Model, type Api, type UserMessage } from "@earendil-works/pi-ai";
+import { parseJsonWithRepair, type Model, type Api, type UserMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { BorderedLoader } from "@earendil-works/pi-coding-agent";
 import {
@@ -24,6 +24,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import { errorText } from "./lib/util.ts";
 
 // Structured output format for question extraction
 interface ExtractedQuestion {
@@ -501,11 +502,17 @@ export default function (pi: ExtensionAPI) {
 						timestamp: Date.now(),
 					};
 
-					const response = await complete(
-						extractionModel,
-						{ systemPrompt: SYSTEM_PROMPT, messages: [userMessage] },
-						{ apiKey: auth.apiKey, headers: auth.headers, signal: loader.signal },
-					);
+					const provider = ctx.modelRegistry.getProvider(extractionModel.provider);
+					if (!provider) {
+						return { status: "error", message: `provider ${extractionModel.provider} is not available` };
+					}
+					const response = await provider
+						.stream(
+							extractionModel,
+							{ systemPrompt: SYSTEM_PROMPT, messages: [userMessage] },
+							{ apiKey: auth.apiKey, headers: auth.headers, signal: loader.signal },
+						)
+						.result();
 
 					if (response.stopReason === "aborted") {
 						return { status: "cancelled" };
@@ -529,7 +536,7 @@ export default function (pi: ExtensionAPI) {
 				doExtract()
 					.then(done)
 					.catch((error: unknown) => {
-						const message = error instanceof Error ? error.message : String(error);
+						const message = errorText(error);
 						done({ status: "error", message });
 					});
 

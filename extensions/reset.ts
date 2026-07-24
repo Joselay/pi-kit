@@ -1,15 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { BorderedLoader, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { CODEX_USAGE_CHANGED_EVENT, resolveCodexAuth, whamRequest, type CodexAuth } from "./lib/codex.ts";
+import { errorText } from "./lib/util.ts";
 
-// Same backend Codex CLI hits for /usage -> "Redeem usage limit reset"; the
-// /wham prefix is the ChatGPT-auth path style (see codex-rs backend-client).
-const CHATGPT_BASE_URL = process.env.PI_CODEX_CHATGPT_BASE_URL?.trim() || "https://chatgpt.com/backend-api";
-const REQUEST_TIMEOUT_MS = 10_000;
 const USER_AGENT = "pi-reset/0.1.0";
 const CANCEL_OPTION = "Cancel";
-const CODEX_USAGE_CHANGED_EVENT = "codex:usage-changed";
-
-type CodexAuth = { access: string; accountId: string };
 
 type ResetCredit = {
 	id?: string;
@@ -26,68 +21,8 @@ type ResetCreditsPayload = { credits?: ResetCredit[] | null; available_count?: n
 type ConsumeCode = "reset" | "nothing_to_reset" | "no_credit" | "already_redeemed";
 type ConsumePayload = { code?: ConsumeCode; windows_reset?: number };
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function accountIdFromAccessToken(access: string): string | undefined {
-	try {
-		const payloadPart = access.split(".")[1];
-		if (!payloadPart) return undefined;
-		const payload = JSON.parse(Buffer.from(payloadPart, "base64url").toString("utf8")) as unknown;
-		if (!isRecord(payload)) return undefined;
-		const authClaim = payload["https://api.openai.com/auth"];
-		if (!isRecord(authClaim)) return undefined;
-		return typeof authClaim.chatgpt_account_id === "string" ? authClaim.chatgpt_account_id : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-async function resolveCodexAuth(ctx: ExtensionContext): Promise<CodexAuth> {
-	// Use Pi's provider auth path so expired OAuth credentials are refreshed and
-	// auth.json remains an implementation detail.
-	const access = await ctx.modelRegistry.getApiKeyForProvider("openai-codex");
-	if (!access) {
-		const configured = ctx.modelRegistry.getProviderAuthStatus("openai-codex").configured;
-		throw new Error(configured ? "Couldn't refresh OpenAI Codex credentials. Try /login again." : "Log in to OpenAI Codex with /login first.");
-	}
-
-	const accountId = accountIdFromAccessToken(access);
-	if (!accountId) throw new Error("OpenAI Codex credentials are invalid. Try /login again.");
-	return { access, accountId };
-}
-
-async function apiRequest(auth: CodexAuth, path: string, body?: unknown, signal?: AbortSignal): Promise<unknown> {
-	const method = body === undefined ? "GET" : "POST";
-	const url = `${CHATGPT_BASE_URL}/wham${path}`;
-	const headers: Record<string, string> = {
-		authorization: `Bearer ${auth.access}`,
-		"chatgpt-account-id": auth.accountId,
-		"user-agent": USER_AGENT,
-	};
-	if (body !== undefined) headers["content-type"] = "application/json";
-
-	const response = await fetch(url, {
-		method,
-		headers,
-		body: body === undefined ? undefined : JSON.stringify(body),
-		signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]) : AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-	});
-	const text = await response.text();
-	if (!response.ok) {
-		const detail = text.replace(/\s+/g, " ").trim().slice(0, 200);
-		throw new Error(`${method} ${path} failed with status ${response.status}${detail ? `: ${detail}` : ""}`);
-	}
-	try {
-		return JSON.parse(text) as unknown;
-	} catch {
-		throw new Error(`${method} ${path} returned invalid JSON`);
-	}
-}
-
 async function fetchResetCredits(auth: CodexAuth, signal?: AbortSignal): Promise<{ credits: ResetCredit[]; availableCount: number }> {
-	const payload = (await apiRequest(auth, "/rate-limit-reset-credits", undefined, signal)) as ResetCreditsPayload;
+	const payload = (await whamRequest(auth, "/rate-limit-reset-credits", { userAgent: USER_AGENT, signal })) as ResetCreditsPayload;
 	const credits = (payload.credits ?? [])
 		.filter((credit) => typeof credit.id === "string" && (credit.status === undefined || credit.status === "available"))
 		.sort((a, b) => (parseEpoch(a.expires_at) ?? Infinity) - (parseEpoch(b.expires_at) ?? Infinity));
@@ -98,7 +33,7 @@ async function consumeResetCredit(auth: CodexAuth, redeemRequestId: string, cred
 	// redeem_request_id is an idempotency key; retries must reuse the same value.
 	const body: Record<string, string> = { redeem_request_id: redeemRequestId };
 	if (creditId) body.credit_id = creditId;
-	return (await apiRequest(auth, "/rate-limit-reset-credits/consume", body)) as ConsumePayload;
+	return (await whamRequest(auth, "/rate-limit-reset-credits/consume", { userAgent: USER_AGENT, body })) as ConsumePayload;
 }
 
 function parseEpoch(iso: string | null | undefined): number | undefined {
@@ -220,7 +155,7 @@ export default function usageReset(pi: ExtensionAPI) {
 			try {
 				loaded = await loadResetCredits(ctx);
 			} catch (error) {
-				notify(ctx, `Couldn't load usage limit resets: ${error instanceof Error ? error.message : String(error)}`, "error");
+				notify(ctx, `Couldn't load usage limit resets: ${errorText(error)}`, "error");
 				return;
 			}
 			if (!loaded) return;
@@ -246,7 +181,7 @@ export default function usageReset(pi: ExtensionAPI) {
 					await reportOutcome(ctx, auth, result, credit.id);
 					return;
 				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
+					const message = errorText(error);
 					const retry = await ctx.ui.confirm("Couldn't reset usage", `${message}\n\nTry again?`);
 					if (!retry) return;
 				}

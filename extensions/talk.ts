@@ -14,19 +14,20 @@
 // barge-in; falls back to ffmpeg/ffplay in half-duplex (mic muted while the
 // assistant speaks) when the helper is unavailable.
 
-import { spawn, execFile, execFileSync, type ChildProcess } from "node:child_process";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { readdirSync, statSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 import {
-	getAgentDir,
-	ModelRuntime,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { ensureAecAudio, pcmChunkMs, SAMPLE_RATE, type AudioIO } from "./lib/audio.ts";
+import { resolveRealtimeOAuth } from "./lib/codex.ts";
+import { openRealtimeSocket, parseServerEvent, realtimeHeaders, sendJson } from "./lib/realtime.ts";
+import { clip, errorText, messageText } from "./lib/util.ts";
 
-const PROVIDER_ID = "openai-codex";
 const REALTIME_URL = "wss://api.openai.com/v1/realtime";
 // Newest realtime model (July 2026); upstream Codex still pins gpt-realtime-1.5.
 // Verified to accept the ChatGPT OAuth bearer on the public GA endpoint.
@@ -42,9 +43,6 @@ const DEFAULT_VOICE = "marin";
 // Newest streaming speech-to-text model; upstream Codex still pins
 // gpt-4o-mini-transcribe (methods_v2.rs REALTIME_V2_INPUT_TRANSCRIPTION_MODEL).
 const TRANSCRIBE_MODEL = process.env.PI_TALK_TRANSCRIBE_MODEL?.trim() || "gpt-realtime-whisper";
-const SAMPLE_RATE = 24000;
-// Upstream clients stream 960-sample (40 ms) mono PCM16 frames = 1920 bytes.
-const MIC_FRAME_BYTES = 960 * 2;
 const PLAYBACK_TAIL_MS = 250;
 
 // Upstream realtime_conversation.rs constants.
@@ -58,10 +56,6 @@ const APPROX_BYTES_PER_TOKEN = 4;
 // Upstream tries these argument keys in order when extracting the delegated
 // prompt from a background_agent call (protocol_v2.rs TOOL_ARGUMENT_KEYS).
 const TOOL_ARGUMENT_KEYS = ["input_transcript", "input", "text", "prompt", "query"] as const;
-
-const TALK_DIR = join(getAgentDir(), "talk");
-const AEC_SOURCE = join(TALK_DIR, "talk-audio.swift");
-const AEC_BINARY = join(TALK_DIR, "talk-audio");
 
 const MODEL = process.env.PI_TALK_MODEL?.trim() || DEFAULT_MODEL;
 const MINI_MODEL = process.env.PI_TALK_MINI_MODEL?.trim() || DEFAULT_MINI_MODEL;
@@ -229,54 +223,12 @@ function truncateToTokens(text: string, budgetTokens: number): string {
 	}
 }
 
-function clip(text: string, max: number): string {
-	const flat = text.replace(/\s+/g, " ").trim();
-	return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
-}
-
-function errorText(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
-}
-
-function findBinary(name: string): string {
-	return [`/opt/homebrew/bin/${name}`, `/usr/local/bin/${name}`].find(existsSync) ?? name;
-}
-
 function userFirstName(): string {
 	try {
 		const full = execFileSync("id", ["-F"], { encoding: "utf8", timeout: 1000 }).trim();
 		if (full) return full.split(/\s+/)[0]!;
 	} catch {}
 	return userInfo().username || "there";
-}
-
-function messageText(message: any): string {
-	const content = message?.content;
-	if (typeof content === "string") return content;
-	if (Array.isArray(content)) {
-		return content
-			.filter((block: any) => block?.type === "text" && typeof block.text === "string")
-			.map((block: any) => block.text)
-			.join("\n");
-	}
-	return "";
-}
-
-async function resolveOAuth(): Promise<{ token: string; accountId?: string }> {
-	const runtime = await ModelRuntime.create();
-	const check = await (runtime as any).checkAuth(PROVIDER_ID);
-	if (!(runtime as any).isUsingOAuth(PROVIDER_ID) || check?.type !== "oauth") {
-		throw new Error("talk needs the openai-codex OAuth subscription; run /login first");
-	}
-	const token = (await (runtime as any).getAuth(PROVIDER_ID))?.auth?.apiKey;
-	if (!token) throw new Error("could not resolve the OAuth token; run /login again");
-	let accountId: string | undefined;
-	try {
-		const payload = JSON.parse(Buffer.from(token.split(".")[1]!, "base64url").toString("utf8"));
-		const id = payload?.["https://api.openai.com/auth"]?.chatgpt_account_id;
-		if (typeof id === "string" && id) accountId = id;
-	} catch {}
-	return { token, accountId };
 }
 
 // --- startup context (ported from Codex core/src/realtime_context.rs) ---
@@ -448,175 +400,12 @@ function buildStartupContext(ctx: ExtensionContext): string {
 	return `<startup_context>\n${parts.join("\n\n")}\n</startup_context>`;
 }
 
-// --- audio backends ---
-
-type MicFrameHandler = (frame: Buffer) => void;
-
-function reframeMic(onFrame: MicFrameHandler): (chunk: Buffer) => void {
-	let pending = Buffer.alloc(0);
-	return (chunk: Buffer) => {
-		pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
-		while (pending.length >= MIC_FRAME_BYTES) {
-			onFrame(pending.subarray(0, MIC_FRAME_BYTES));
-			pending = pending.subarray(MIC_FRAME_BYTES);
-		}
-	};
-}
-
-interface AudioIO {
-	/** True when the mic stream is echo-cancelled and can stay open during playback. */
-	readonly echoCancelled: boolean;
-	start(onFrame: MicFrameHandler, onFatal: (message: string) => void): Promise<void>;
-	play(buf: Buffer): void;
-	/** Drop all buffered playback immediately (barge-in). */
-	flush(): void;
-	stop(): void;
-}
-
-class AecAudio implements AudioIO {
-	readonly echoCancelled = true;
-	private child?: ChildProcess;
-	private stopped = false;
-
-	async start(onFrame: MicFrameHandler, onFatal: (message: string) => void): Promise<void> {
-		const child = spawn(AEC_BINARY, [], { stdio: ["pipe", "pipe", "pipe"] });
-		this.child = child;
-		child.stdin?.on("error", () => {});
-		child.stdout?.on("data", reframeMic(onFrame));
-		let stderr = "";
-		const ready = new Promise<void>((resolve, reject) => {
-			const timer = setTimeout(() => reject(new Error("audio helper did not become ready")), 5000);
-			child.stderr?.on("data", (chunk) => {
-				stderr += String(chunk);
-				if (/\bready\b/.test(stderr)) {
-					clearTimeout(timer);
-					resolve();
-				}
-			});
-			child.once("close", (code) => {
-				clearTimeout(timer);
-				reject(new Error(stderr.trim().split("\n").pop() || `audio helper exited (${code})`));
-			});
-		});
-		child.on("close", (code) => {
-			if (!this.stopped) onFatal(stderr.trim().split("\n").pop() || `audio helper exited (${code})`);
-		});
-		await ready;
-	}
-
-	play(buf: Buffer): void {
-		this.child?.stdin?.write(buf);
-	}
-
-	flush(): void {
-		if (this.child && this.child.exitCode === null) this.child.kill("SIGUSR1");
-	}
-
-	stop(): void {
-		this.stopped = true;
-		try {
-			this.child?.stdin?.end();
-		} catch {}
-		this.child?.kill("SIGKILL");
-	}
-}
-
-class FfmpegAudio implements AudioIO {
-	readonly echoCancelled = false;
-	private capture?: ChildProcess;
-	private player?: ChildProcess;
-	private stopped = false;
-
-	async start(onFrame: MicFrameHandler, onFatal: (message: string) => void): Promise<void> {
-		this.capture = spawn(
-			findBinary("ffmpeg"),
-			[
-				"-hide_banner", "-loglevel", "error",
-				"-f", "avfoundation", "-i", `:${AUDIO_DEVICE}`,
-				"-ac", "1", "-ar", String(SAMPLE_RATE),
-				"-f", "s16le", "pipe:1",
-			],
-			{ stdio: ["ignore", "pipe", "pipe"] },
-		);
-		this.capture.stdout?.on("data", reframeMic(onFrame));
-		this.capture.on("close", (code) => {
-			if (!this.stopped) onFatal(`microphone capture ended unexpectedly (code ${code})`);
-		});
-		this.spawnPlayer();
-	}
-
-	private spawnPlayer(): void {
-		this.player = spawn(
-			findBinary("ffplay"),
-			[
-				"-hide_banner", "-loglevel", "error", "-nodisp", "-autoexit",
-				"-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "32", "-sync", "audio",
-				"-f", "s16le", "-ar", String(SAMPLE_RATE), "-ch_layout", "mono", "-i", "pipe:0",
-			],
-			{ stdio: ["pipe", "ignore", "ignore"] },
-		);
-		this.player.stdin?.on("error", () => {});
-		this.player.on("close", () => {
-			// ffplay exits when its buffer drains; respawn a fresh player.
-			if (!this.stopped) this.spawnPlayer();
-		});
-	}
-
-	play(buf: Buffer): void {
-		if (!this.player || this.player.stdin?.destroyed) this.spawnPlayer();
-		this.player?.stdin?.write(buf);
-	}
-
-	flush(): void {
-		const dead = this.player;
-		this.player = undefined;
-		if (dead) {
-			try {
-				dead.stdin?.destroy();
-			} catch {}
-			dead.kill("SIGKILL");
-		}
-		if (!this.stopped) this.spawnPlayer();
-	}
-
-	stop(): void {
-		this.stopped = true;
-		this.capture?.kill("SIGKILL");
-		try {
-			this.player?.stdin?.end();
-		} catch {}
-		this.player?.kill("SIGKILL");
-	}
-}
-
-async function ensureAecAudio(notify: (message: string) => void): Promise<AudioIO> {
-	if (DISABLE_AEC || !existsSync(AEC_SOURCE)) return new FfmpegAudio();
-	const stale =
-		!existsSync(AEC_BINARY) || statSync(AEC_BINARY).mtimeMs < statSync(AEC_SOURCE).mtimeMs;
-	if (stale) {
-		try {
-			await new Promise<void>((resolve, reject) => {
-				execFile(
-					"swiftc",
-					["-O", AEC_SOURCE, "-o", AEC_BINARY],
-					{ timeout: 120_000 },
-					(error, _stdout, stderr) => (error ? reject(new Error(stderr || error.message)) : resolve()),
-				);
-			});
-		} catch (error) {
-			notify(`AEC helper build failed, falling back to half-duplex: ${clip(errorText(error), 120)}`);
-			return new FfmpegAudio();
-		}
-	}
-	return new AecAudio();
-}
-
 // --- the talk session ---
 
 type TranscriptWho = "you" | "asst" | "sys";
 
 class TalkSession {
-	private ws?: any;
+	private ws?: WebSocket;
 	private audio?: AudioIO;
 	private closing = false;
 
@@ -650,35 +439,19 @@ class TalkSession {
 	}
 
 	async start(): Promise<void> {
-		const { token, accountId } = await resolveOAuth();
-		this.audio = await ensureAecAudio((message) => this.ctx.ui.notify(message, "warning"));
-
-		const headers: Record<string, string> = {
-			Authorization: `Bearer ${token}`,
-			originator: "pi",
-			"user-agent": `pi-talk (${process.platform}; ${process.arch})`,
-		};
-		if (accountId) headers["chatgpt-account-id"] = accountId;
+		const creds = await resolveRealtimeOAuth("talk");
+		this.audio = await ensureAecAudio((message) => this.ctx.ui.notify(message, "warning"), {
+			disable: DISABLE_AEC,
+			device: AUDIO_DEVICE,
+		});
 
 		const prompt = BACKEND_PROMPT.replaceAll("{{ user_first_name }}", userFirstName());
 		const startupContext = buildStartupContext(this.ctx);
 		const instructions = startupContext ? `${prompt}\n\n${startupContext}` : prompt;
 
 		const url = `${REALTIME_URL}?model=${encodeURIComponent(this.model)}`;
-		const ws = new (globalThis as any).WebSocket(url, { headers });
+		const ws = await openRealtimeSocket(url, realtimeHeaders(creds, "talk"));
 		this.ws = ws;
-
-		await new Promise<void>((resolve, reject) => {
-			const timer = setTimeout(() => reject(new Error("realtime connection timed out")), 10_000);
-			ws.addEventListener("open", () => {
-				clearTimeout(timer);
-				resolve();
-			});
-			ws.addEventListener("error", (event: any) => {
-				clearTimeout(timer);
-				reject(new Error(event?.message ?? "websocket error"));
-			});
-		});
 
 		this.send({
 			type: "session.update",
@@ -762,9 +535,7 @@ class TalkSession {
 	}
 
 	private send(payload: unknown): void {
-		try {
-			if (this.ws?.readyState === 1) this.ws.send(JSON.stringify(payload));
-		} catch {}
+		sendJson(this.ws, payload);
 	}
 
 	private sendItem(role: "user", text: string): void {
@@ -793,12 +564,8 @@ class TalkSession {
 	// --- events from the realtime server ---
 
 	private onServerEvent(event: any): void {
-		let msg: any;
-		try {
-			msg = JSON.parse(typeof event.data === "string" ? event.data : String(event.data));
-		} catch {
-			return;
-		}
+		const msg = parseServerEvent(event);
+		if (!msg) return;
 		switch (msg.type) {
 			case "response.created":
 				this.responseActive = true;
@@ -867,8 +634,7 @@ class TalkSession {
 		const now = Date.now();
 		if (!this.firstChunkAt) this.firstChunkAt = now;
 		this.playedBytes += buf.length;
-		const chunkMs = (buf.length / 2 / SAMPLE_RATE) * 1000;
-		this.playbackEndsAt = Math.max(this.playbackEndsAt, this.firstChunkAt, now) + chunkMs;
+		this.playbackEndsAt = Math.max(this.playbackEndsAt, this.firstChunkAt, now) + pcmChunkMs(buf);
 	}
 
 	private onBargeIn(speechItemId?: string): void {

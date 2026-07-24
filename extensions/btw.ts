@@ -23,6 +23,7 @@ import {
 	type OverlayHandle,
 	type TUI,
 } from "@earendil-works/pi-tui";
+import { errorText, messageText } from "./lib/util.ts";
 
 const BTW_ENTRY_TYPE = "btw-thread-entry";
 const BTW_RESET_TYPE = "btw-thread-reset";
@@ -106,14 +107,6 @@ function createBtwResourceLoader(ctx: ExtensionContext, appendSystemPrompt: stri
 		extendResources: () => {},
 		reload: async () => {},
 	};
-}
-
-function extractText(parts: AssistantMessage["content"]): string {
-	return parts
-		.filter((part) => part.type === "text")
-		.map((part) => part.text)
-		.join("\n")
-		.trim();
 }
 
 function extractEventAssistantText(message: unknown): string {
@@ -470,7 +463,7 @@ export default function (pi: ExtensionAPI) {
 		try {
 			return getTranscriptLinesInner(width, theme);
 		} catch (error) {
-			return [theme.fg("error", `Render error: ${error instanceof Error ? error.message : String(error)}`)];
+			return [theme.fg("error", `Render error: ${errorText(error)}`)];
 		}
 	}
 
@@ -815,7 +808,7 @@ export default function (pi: ExtensionAPI) {
 				if (overlayRuntime === runtime) {
 					overlayRuntime = null;
 				}
-				notify(ctx, error instanceof Error ? error.message : String(error), "error");
+				notify(ctx, errorText(error), "error");
 			});
 	}
 
@@ -851,7 +844,7 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(response.errorMessage || "Summary request failed.");
 			}
 
-			return extractText(response.content) || "(No summary generated)";
+			return messageText(response).trim() || "(No summary generated)";
 		} finally {
 			try {
 				await session.abort();
@@ -880,7 +873,7 @@ export default function (pi: ExtensionAPI) {
 			await resetThread(ctx);
 			notify(ctx, "Injected BTW summary into main chat.", "info");
 		} catch (error) {
-			notify(ctx, error instanceof Error ? error.message : String(error), "error");
+			notify(ctx, errorText(error), "error");
 		}
 	}
 
@@ -949,7 +942,7 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(response.errorMessage || "BTW request failed.");
 			}
 
-			const answer = extractText(response.content) || "(No text response)";
+			const answer = messageText(response).trim() || "(No text response)";
 			pendingAnswer = answer;
 			const details: BtwDetails = {
 				question,
@@ -967,7 +960,7 @@ export default function (pi: ExtensionAPI) {
 			pendingAnswer = "";
 			pendingToolCalls = [];
 		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
+			const message = errorText(error);
 			pendingError = message;
 			notify(ctx, message, "error");
 		} finally {

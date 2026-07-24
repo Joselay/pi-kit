@@ -29,7 +29,7 @@
  * Use `/todos` to bring up the visual todo manager or just let the LLM use them
  * naturally.
  */
-import { DynamicBorder, copyToClipboard, getMarkdownTheme, keyHint, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, copyToClipboard, getMarkdownTheme, keyHint, type ExtensionAPI, type ExtensionContext, type KeybindingsManager, type Theme } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import path from "node:path";
@@ -52,6 +52,7 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
+import { errorText } from "./lib/util.ts";
 
 const TODO_DIR_NAME = ".pi/todos";
 const TODO_PATH_ENV = "PI_TODO_PATH";
@@ -89,9 +90,7 @@ interface TodoSettings {
 	gcDays: number;
 }
 
-type KeybindingMatcher = {
-	matches: (keyData: string, keybindingId: string) => boolean;
-};
+type KeybindingMatcher = Pick<KeybindingsManager, "matches">;
 
 const TodoParams = Type.Object({
 	action: StringEnum([
@@ -743,7 +742,7 @@ function getTodoSettingsPath(todosDir: string): string {
 
 function normalizeTodoSettings(raw: Partial<TodoSettings>): TodoSettings {
 	const gc = raw.gc ?? DEFAULT_TODO_SETTINGS.gc;
-	const gcDays = Number.isFinite(raw.gcDays) ? raw.gcDays : DEFAULT_TODO_SETTINGS.gcDays;
+	const gcDays = typeof raw.gcDays === "number" && Number.isFinite(raw.gcDays) ? raw.gcDays : DEFAULT_TODO_SETTINGS.gcDays;
 	return {
 		gc: Boolean(gc),
 		gcDays: Math.max(0, Math.floor(gcDays)),
@@ -1792,7 +1791,8 @@ export default function todosExtension(pi: ExtensionAPI) {
 			}
 
 			let nextPrompt: string | null = null;
-			let rootTui: TUI | null = null;
+			// Initializer typed wide so TS doesn't narrow to null across the closure.
+			let rootTui = null as TUI | null;
 			await ctx.ui.custom<void>((tui, theme, keybindings, done) => {
 				rootTui = tui;
 				let selector: TodoSelectorComponent | null = null;
@@ -1835,7 +1835,7 @@ export default function todosExtension(pi: ExtensionAPI) {
 						copyToClipboard(absolutePath);
 						ctx.ui.notify(`Copied ${absolutePath} to clipboard`, "info");
 					} catch (error) {
-						const message = error instanceof Error ? error.message : String(error);
+						const message = errorText(error);
 						ctx.ui.notify(message, "error");
 					}
 				};
@@ -1848,7 +1848,7 @@ export default function todosExtension(pi: ExtensionAPI) {
 						copyToClipboard(text);
 						ctx.ui.notify("Copied todo text to clipboard", "info");
 					} catch (error) {
-						const message = error instanceof Error ? error.message : String(error);
+						const message = errorText(error);
 						ctx.ui.notify(message, "error");
 					}
 				};

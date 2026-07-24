@@ -19,12 +19,12 @@ import { existsSync, readdirSync, readFileSync, renameSync, statSync, writeFileS
 import { join } from "node:path";
 import {
 	getAgentDir,
-	ModelRuntime,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
+import { resolveRealtimeOAuth } from "./lib/codex.ts";
+import { clip, errorText, messageText } from "./lib/util.ts";
 
-const PROVIDER_ID = "openai-codex";
 const EMBEDDINGS_URL =
 	process.env.PI_RECALL_ENDPOINT?.trim() || "https://api.openai.com/v1/embeddings";
 
@@ -96,32 +96,6 @@ interface RecallIndex {
 	files: Record<string, FileIndex>;
 }
 
-function errorText(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
-}
-
-function clip(text: string, max: number): string {
-	const flat = text.replace(/\s+/g, " ").trim();
-	return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
-}
-
-async function resolveOAuth(): Promise<{ token: string; accountId?: string }> {
-	const runtime = await ModelRuntime.create();
-	const check = await (runtime as any).checkAuth(PROVIDER_ID);
-	if (!(runtime as any).isUsingOAuth(PROVIDER_ID) || check?.type !== "oauth") {
-		throw new Error("recall needs the openai-codex OAuth subscription; run /login first");
-	}
-	const token = (await (runtime as any).getAuth(PROVIDER_ID))?.auth?.apiKey;
-	if (!token) throw new Error("could not resolve the OAuth token; run /login again");
-	let accountId: string | undefined;
-	try {
-		const payload = JSON.parse(Buffer.from(token.split(".")[1]!, "base64url").toString("utf8"));
-		const id = payload?.["https://api.openai.com/auth"]?.chatgpt_account_id;
-		if (typeof id === "string" && id) accountId = id;
-	} catch {}
-	return { token, accountId };
-}
-
 async function embed(
 	auth: { token: string; accountId?: string },
 	inputs: string[],
@@ -164,17 +138,6 @@ function similarity(a: Float32Array, b: Float32Array): number {
 	return dot;
 }
 
-function extractMessageText(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content
-		.filter((part): part is { type: "text"; text: string } =>
-			Boolean(part && typeof part === "object" && (part as any).type === "text"),
-		)
-		.map((part) => part.text)
-		.join("\n");
-}
-
 /** Pulls the embeddable user/assistant message chunks out of one session file. */
 function sessionChunks(path: string): { r: string; t: string }[] {
 	const chunks: { r: string; t: string }[] = [];
@@ -196,7 +159,7 @@ function sessionChunks(path: string): { r: string; t: string }[] {
 		if (entry?.type !== "message") continue;
 		const role = entry.message?.role;
 		if (role !== "user" && role !== "assistant") continue;
-		const text = extractMessageText(entry.message?.content).trim();
+		const text = messageText(entry.message).trim();
 		if (text.length < MIN_CHUNK_CHARS) continue;
 		chunks.push({ r: role, t: text.slice(0, MAX_CHUNK_CHARS) });
 	}
@@ -378,7 +341,7 @@ export default function semanticRecall(pi: ExtensionAPI) {
 				if (ctx.hasUI) ctx.ui.setStatus("recall", text);
 			};
 			try {
-				const auth = await resolveOAuth();
+				const auth = await resolveRealtimeOAuth("recall");
 				const index = query.toLowerCase() === "reindex"
 					? { version: INDEX_VERSION, model: activeModel, dimensions: DIMENSIONS, files: {} }
 					: loadIndex();

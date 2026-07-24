@@ -11,6 +11,7 @@ import { randomUUID } from "node:crypto";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { errorText } from "./lib/util.ts";
 
 const STATE_TYPE = "goal";
 const UI_MESSAGE_TYPE = "goal-ui";
@@ -570,7 +571,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 		} catch (err) {
 			continuationQueued = false;
 			if (ctx.hasUI) {
-				ctx.ui.notify(`Failed to queue goal continuation: ${err instanceof Error ? err.message : String(err)}`, "error");
+				ctx.ui.notify(`Failed to queue goal continuation: ${errorText(err)}`, "error");
 			}
 		}
 	}
@@ -723,7 +724,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 						showGoalMessage(`Goal paused\n\n${goalSummary(goal!)}`);
 						updateStatus(ctx);
 					} catch (err) {
-						showGoalMessage(`Failed to update thread goal: ${err instanceof Error ? err.message : String(err)}`);
+						showGoalMessage(`Failed to update thread goal: ${errorText(err)}`);
 					}
 					return;
 				}
@@ -735,7 +736,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 						updateStatus(ctx);
 						queueContinuation(ctx);
 					} catch (err) {
-						showGoalMessage(`Failed to update thread goal: ${err instanceof Error ? err.message : String(err)}`);
+						showGoalMessage(`Failed to update thread goal: ${errorText(err)}`);
 					}
 					return;
 				}
@@ -760,7 +761,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 						updateStatus(ctx);
 						if (goal?.status === "active") queueContinuation(ctx);
 					} catch (err) {
-						showGoalMessage(`Failed to edit thread goal: ${err instanceof Error ? err.message : String(err)}`);
+						showGoalMessage(`Failed to edit thread goal: ${errorText(err)}`);
 					}
 					return;
 				}
@@ -770,7 +771,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 			try {
 				objective = validateObjective(args);
 			} catch (err) {
-				showGoalMessage(err instanceof Error ? err.message : String(err));
+				showGoalMessage(errorText(err));
 				return;
 			}
 

@@ -4,11 +4,14 @@ import { join } from "node:path";
 import {
 	CustomEditor,
 	getAgentDir,
-	ModelRuntime,
 	type ExtensionAPI,
 	type ExtensionContext,
 	type KeybindingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { SAMPLE_RATE } from "./lib/audio.ts";
+import { resolveRealtimeOAuth } from "./lib/codex.ts";
+import { realtimeHeaders } from "./lib/realtime.ts";
+import { errorText } from "./lib/util.ts";
 import {
 	CURSOR_MARKER,
 	isKeyRelease,
@@ -31,9 +34,6 @@ const FINALIZE_TIMEOUT_MS = 15 * 1000;
 const TAIL_SILENCE_MS = 600;
 const STDERR_TAIL = 4000;
 
-// The realtime API only accepts 24 kHz PCM16.
-const SAMPLE_RATE = 24000;
-const PROVIDER_ID = "openai-codex";
 const AUTH_HINT = "run /login if this persists";
 const REALTIME_URL =
 	process.env.PI_DICTATE_ENDPOINT?.trim() || "wss://api.openai.com/v1/realtime?intent=transcription";
@@ -110,10 +110,6 @@ function executable(envName: string, fallback: string, candidates: string[]): st
 const FFMPEG = executable("PI_DICTATE_FFMPEG", "ffmpeg", ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]);
 const AUDIO_DEVICE = process.env.PI_DICTATE_AUDIO_DEVICE?.trim() || "0";
 
-function errorText(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
-}
-
 function tail(existing: string, chunk: unknown): string {
 	return (existing + String(chunk)).slice(-STDERR_TAIL);
 }
@@ -136,58 +132,6 @@ function modifierHeld(): Promise<boolean> {
 
 function stopChild(child: ChildProcess | undefined, signal: NodeJS.Signals = "SIGINT"): void {
 	if (child && child.exitCode === null && child.signalCode === null) child.kill(signal);
-}
-
-type Credentials = { token: string; accountId?: string };
-
-// ModelRuntime.create() reads pi's own credential store; cache it so a hold does
-// not pay the construction cost. getAuth() refreshes the token per call.
-let runtimePromise: Promise<any> | undefined;
-
-function modelRuntime(): Promise<any> {
-	runtimePromise ??= (ModelRuntime as any).create();
-	return runtimePromise!;
-}
-
-/**
- * Resolves the `openai-codex` OAuth subscription through pi's ModelRuntime (the
- * same path as the web-search and imagegen skills), so the token comes from
- * ~/.pi/agent/auth.json and is refreshed on our behalf. The ChatGPT access token
- * carries `aud: https://api.openai.com/v1`, so the realtime endpoint accepts it.
- */
-async function credentials(): Promise<Credentials> {
-	let runtime: any;
-	try {
-		runtime = await modelRuntime();
-	} catch (error) {
-		// A failed create() must not poison every later attempt.
-		runtimePromise = undefined;
-		throw new Error(`could not load pi's model runtime (${errorText(error)}); run /login`);
-	}
-
-	let check: any;
-	let token: string | undefined;
-	try {
-		check = await runtime.checkAuth(PROVIDER_ID);
-		token = (await runtime.getAuth(PROVIDER_ID))?.auth?.apiKey;
-	} catch (error) {
-		throw new Error(`pi's openai-codex OAuth check failed (${errorText(error)}); run /login`);
-	}
-	if (!runtime.isUsingOAuth(PROVIDER_ID) || check?.type !== "oauth") {
-		throw new Error("pi is not signed in to the openai-codex subscription; run /login");
-	}
-	if (!token) throw new Error("pi's openai-codex OAuth token could not be resolved; run /login");
-	return { token, accountId: accountIdFromToken(token) };
-}
-
-function accountIdFromToken(token: string): string | undefined {
-	try {
-		const payload = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8"));
-		const accountId = payload?.["https://api.openai.com/auth"]?.chatgpt_account_id;
-		return typeof accountId === "string" && accountId ? accountId : undefined;
-	} catch {
-		return undefined;
-	}
 }
 
 const SILENCE_TAIL = Buffer.alloc(Math.floor((SAMPLE_RATE * 2 * TAIL_SILENCE_MS) / 1000)).toString("base64");
@@ -215,15 +159,8 @@ async function openLiveTranscription(mode: DictateMode, onDelta: (delta: string)
 	const transcription: Record<string, string> = { model, language: LANGUAGE };
 	if (model.includes("whisper")) transcription.delay = DELAY;
 	const finalizeTimeoutMs = mode === "streaming" ? FINALIZE_TIMEOUT_MS : BATCH_FINALIZE_TIMEOUT_MS;
-	const { token, accountId } = await credentials();
-	const headers: Record<string, string> = {
-		Authorization: `Bearer ${token}`,
-		originator: "pi",
-		"user-agent": `pi-dictate (${process.platform}; ${process.arch})`,
-	};
-	if (accountId) headers["chatgpt-account-id"] = accountId;
-
-	const ws = new (globalThis as any).WebSocket(REALTIME_URL, { headers });
+	const creds = await resolveRealtimeOAuth("dictate");
+	const ws = new WebSocket(REALTIME_URL, { headers: realtimeHeaders(creds, "dictate") });
 	const queue: string[] = [];
 	let ready = false;
 	let done = false;
@@ -519,7 +456,7 @@ export default function dictate(pi: ExtensionAPI) {
 	function warmUp(): void {
 		// Surfaces a stale login, and builds the ModelRuntime, before the user has
 		// spoken into a dead session.
-		void credentials().catch(() => {});
+		void resolveRealtimeOAuth("dictate").catch(() => {});
 		void modifierHeld();
 	}
 

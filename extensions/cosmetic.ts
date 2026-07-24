@@ -11,6 +11,7 @@ import type { EventEmitter } from "node:events";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { CODEX_FAST_STATUS_KEY, modelSupportsCodexFastMode } from "./fast";
+import { CODEX_USAGE_CHANGED_EVENT } from "./lib/codex.ts";
 
 const IMAGES_DIR = new URL("../images/", import.meta.url);
 const WORKING_MESSAGES_PATH = new URL("../cosmetic/working-messages.json", import.meta.url);
@@ -111,7 +112,6 @@ const footerColors = {
 } as const;
 
 const CODEX_SPARK_MODEL_ID = "gpt-5.3-codex-spark";
-const CODEX_USAGE_CHANGED_EVENT = "codex:usage-changed";
 
 /**
  * Plan tier comes free with the OAuth token: the ChatGPT access token is a JWT

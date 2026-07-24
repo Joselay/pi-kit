@@ -18,6 +18,7 @@ import {
 	Spacer,
 	Text,
 } from "@earendil-works/pi-tui";
+import { errorText } from "./lib/util.ts";
 
 const DATA_URL = new URL("../emoji/emoji.json", import.meta.url);
 const MAX_SUGGESTIONS = 20;
@@ -42,7 +43,7 @@ const loadEntries = (): EmojiEntry[] => {
 			loadError = null;
 		} catch (error) {
 			cachedEntries = [];
-			loadError = error instanceof Error ? error.message : String(error);
+			loadError = errorText(error);
 		}
 	}
 	return cachedEntries;

@@ -20,6 +20,7 @@ import { constants } from "node:fs";
 import { access, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, resolve as resolvePath } from "node:path";
+import { errorText } from "./lib/util.ts";
 import { pathToFileURL } from "node:url";
 
 const TOOL_DESCRIPTION = `Edit files with one marked row edit script.
@@ -1520,7 +1521,7 @@ function requestUnifiedEditPreview(
 		.then((plan): Preview => previewForPlan(plan))
 		.catch((err): Preview | undefined => {
 			if (!argsComplete) return undefined;
-			return { error: err instanceof Error ? err.message : String(err) };
+			return { error: errorText(err) };
 		})
 		.then((preview) => {
 			if (component.previewArgsKey !== requestKey) return;

@@ -17,12 +17,10 @@
  */
 
 import { type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { resolveCodexAuth, whamRequest, type CodexAuth } from "./lib/codex.ts";
+import { errorText } from "./lib/util.ts";
 
-const CHATGPT_BASE_URL = process.env.PI_CODEX_CHATGPT_BASE_URL?.trim() || "https://chatgpt.com/backend-api";
-const REQUEST_TIMEOUT_MS = 10_000;
 const USER_AGENT = "pi-account/0.1.0";
-
-type CodexAuth = { access: string; accountId: string };
 
 /** GET /wham/usage - rate_limit_status_payload.rs, flattened with reset credits. */
 type RateLimitWindow = {
@@ -148,63 +146,6 @@ type AccountSnapshot = {
 	errors: Record<string, string>;
 };
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function accountIdFromAccessToken(access: string): string | undefined {
-	try {
-		const payloadPart = access.split(".")[1];
-		if (!payloadPart) return undefined;
-		const payload = JSON.parse(Buffer.from(payloadPart, "base64url").toString("utf8")) as unknown;
-		if (!isRecord(payload)) return undefined;
-		const authClaim = payload["https://api.openai.com/auth"];
-		if (!isRecord(authClaim)) return undefined;
-		return typeof authClaim.chatgpt_account_id === "string" ? authClaim.chatgpt_account_id : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-async function resolveCodexAuth(ctx: ExtensionCommandContext): Promise<CodexAuth> {
-	const access = await ctx.modelRegistry.getApiKeyForProvider("openai-codex");
-	if (!access) {
-		const configured = ctx.modelRegistry.getProviderAuthStatus("openai-codex").configured;
-		throw new Error(
-			configured ? "Couldn't refresh OpenAI Codex credentials. Try /login again." : "Log in to OpenAI Codex with /login first.",
-		);
-	}
-	const accountId = accountIdFromAccessToken(access);
-	if (!accountId) throw new Error("OpenAI Codex credentials are invalid. Try /login again.");
-	return { access, accountId };
-}
-
-async function apiGet(auth: CodexAuth, path: string): Promise<unknown | undefined> {
-	const response = await fetch(`${CHATGPT_BASE_URL}/wham${path}`, {
-		method: "GET",
-		headers: {
-			authorization: `Bearer ${auth.access}`,
-			"chatgpt-account-id": auth.accountId,
-			"user-agent": USER_AGENT,
-		},
-		signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-	});
-	const text = await response.text();
-	// Not every endpoint exists for every plan; treat that as "no data", not failure.
-	if (response.status === 404) return undefined;
-	if (!response.ok) {
-		const detail = text.replace(/\s+/g, " ").trim().slice(0, 200);
-		throw new Error(`status ${response.status}${detail ? `: ${detail}` : ""}`);
-	}
-	// A few of these endpoints legitimately answer with an empty body.
-	if (!text.trim()) return {};
-	try {
-		return JSON.parse(text) as unknown;
-	} catch {
-		throw new Error("invalid JSON");
-	}
-}
-
 /** Every endpoint is best-effort: one 404 shouldn't blank the whole report. */
 async function loadSnapshot(auth: CodexAuth): Promise<AccountSnapshot> {
 	const snapshot: AccountSnapshot = { errors: {} };
@@ -220,10 +161,11 @@ async function loadSnapshot(auth: CodexAuth): Promise<AccountSnapshot> {
 	await Promise.all(
 		requests.map(async ([key, path]) => {
 			try {
-				const payload = await apiGet(auth, path);
+				// 404s are "no data": not every endpoint exists for every plan.
+				const payload = await whamRequest(auth, path, { userAgent: USER_AGENT, allow404: true });
 				if (payload !== undefined) (snapshot as Record<string, unknown>)[key] = payload;
 			} catch (error) {
-				snapshot.errors[path] = error instanceof Error ? error.message : String(error);
+				snapshot.errors[path] = errorText(error);
 			}
 		}),
 	);
@@ -521,7 +463,7 @@ export default function account(pi: ExtensionAPI) {
 
 				pi.sendMessage({ customType: "account-info", content, display: true }, { triggerTurn: false });
 			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
+				const message = errorText(error);
 				ctx.ui.notify(`Couldn't load account info: ${message}`, "error");
 			} finally {
 				busy = false;
