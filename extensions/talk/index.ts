@@ -543,21 +543,11 @@ function buildStartupContext(ctx: ExtensionContext): string {
 // --- talk UI ---
 
 type TalkVisualState = "connecting" | "listening" | "hearing" | "thinking" | "speaking" | "working";
-type OrbColor = "text" | "accent" | "muted" | "dim" | "success" | "warning";
-
-const ORB_LABELS: Record<TalkVisualState, string> = {
-	connecting: "CONNECTING",
-	listening: "LISTENING",
-	hearing: "HEARING YOU",
-	thinking: "THINKING",
-	speaking: "SPEAKING",
-	working: "AGENT WORKING",
-};
-
-const PARTIAL_BARS = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"] as const;
 
 type Rgb = readonly [number, number, number];
-// Two-tone plasma gradient per state for the true-color globe.
+// Two-tone plasma gradient per state for the true-color globe. With no caption
+// under the globe, hue is the only thing naming the state, so the six sit in
+// distinct families: slate, cyan, green, magenta, indigo, amber.
 const STATE_COLORS: Record<TalkVisualState, readonly [Rgb, Rgb]> = {
 	connecting: [
 		[55, 65, 90],
@@ -572,12 +562,12 @@ const STATE_COLORS: Record<TalkVisualState, readonly [Rgb, Rgb]> = {
 		[90, 240, 160],
 	],
 	thinking: [
-		[90, 50, 200],
-		[220, 110, 255],
+		[110, 30, 150],
+		[255, 95, 210],
 	],
 	speaking: [
-		[50, 90, 235],
-		[170, 150, 255],
+		[55, 70, 220],
+		[150, 140, 255],
 	],
 	working: [
 		[190, 110, 30],
@@ -596,8 +586,6 @@ const SIN_TILT = Math.sin(TILT);
 const COS_TILT = Math.cos(TILT);
 const HALO = 0.2; // atmosphere thickness outside the limb, in globe radii
 const FRAME_MS = 50;
-const HIST_MS = 80; // VU strip scroll cadence, independent of framerate
-const LABEL_HOLD_S = 2.5; // how long a state change stays spelled out
 
 /** Frame-rate independent smoothing factor for an exponential approach. */
 function ease(rate: number, dt: number): number {
@@ -620,15 +608,15 @@ function pcmRms(buf: Buffer): number {
 }
 
 /**
- * The talk visualizer widget: a true-color 3D plasma globe. Live audio spins
- * it faster, swells it, and lights it from within; it condenses in from
- * dithered pixels while connecting, churns while thinking, and grows orbiting
- * sparks while the agent works. A scrolling VU strip sits underneath.
+ * The talk visualizer widget: a true-color 3D plasma globe, and nothing else —
+ * no caption, no meter. Live audio spins it faster, swells it, and lights it
+ * from within; it gathers itself out of inbound motes while connecting, churns
+ * while thinking, grows orbiting sparks while the agent works, and carries the
+ * state in its hue.
  */
 class TalkVisual {
 	private clock = 0; // seconds since mount; drives every time-based motion
 	private last = Date.now();
-	private histAcc = 0;
 	private level = 0; // smoothed 0..1 loudness driving the animation
 	private spin = 0; // accumulated globe rotation; audio accelerates it smoothly
 	// Per-state drivers, smoothed so a state change crossfades instead of popping.
@@ -637,9 +625,6 @@ class TalkVisual {
 	private churn = 1.4;
 	private sparkAmt = 0;
 	private condense = 1;
-	private lastState?: TalkVisualState;
-	private labelHold = LABEL_HOLD_S;
-	private history: number[] = [];
 	private pixels?: Float32Array; // reused across frames
 	private timer: ReturnType<typeof setInterval>;
 
@@ -670,16 +655,6 @@ class TalkVisual {
 		this.spin += (0.7 + this.level * 2.5) * dt;
 
 		const state = this.getState();
-		// Each state has its own motion — motes, sparks, audio swell — so the
-		// name is only spelled out around the change, when the motion has not
-		// established itself yet.
-		if (state !== this.lastState) {
-			this.lastState = state;
-			this.labelHold = LABEL_HOLD_S;
-		} else if (this.labelHold > 0) {
-			this.labelHold = Math.max(0, this.labelHold - dt);
-		}
-
 		const [ta, tb] = STATE_COLORS[state];
 		const cf = ease(5, dt);
 		for (let i = 0; i < 3; i++) {
@@ -691,13 +666,6 @@ class TalkVisual {
 		this.churn += (churn - this.churn) * ease(4, dt);
 		this.sparkAmt += ((state === "working" ? 1 : 0) - this.sparkAmt) * ease(3.5, dt);
 		this.condense += ((state === "connecting" ? 1 : 0) - this.condense) * ease(2.5, dt);
-
-		this.histAcc += dt;
-		while (this.histAcc >= HIST_MS / 1000) {
-			this.histAcc -= HIST_MS / 1000;
-			this.history.push(this.level);
-			if (this.history.length > 64) this.history.shift();
-		}
 		this.tui.requestRender();
 	}
 
@@ -707,21 +675,9 @@ class TalkVisual {
 	}
 
 	render(width: number): string[] {
+		// Too narrow to shade a sphere; fall back to a themed marker.
 		if (width < 12) return [this.centered(this.theme.fg("accent", "◉ TALK"), width)];
-
-		const state = this.getState();
-		const color: OrbColor =
-			state === "hearing" ? "success" : state === "working" || state === "thinking" ? "warning" : "accent";
-		const rows = this.renderOrb(width, state);
-		// One line for both: the globe shows the level right now, the strip shows
-		// it was live a moment ago, and the state name comes and goes. Whatever
-		// is present stays centred under the globe, so the strip slides once when
-		// the name drops away rather than sitting off-centre forever.
-		const label = this.labelHold > 0 ? `● ${ORB_LABELS[state]}` : "";
-		const bars = Math.max(0, Math.min(16, width - visibleWidth(label) - 4));
-		const parts = [label && this.theme.fg(color, label), bars && this.strip(bars, color)].filter(Boolean);
-		rows.push(this.centered(parts.join("  "), width));
-		return rows;
+		return this.renderOrb(width, this.getState());
 	}
 
 	// A true-color 3D globe rendered in quadrant-block "pixels" (2x2 per
@@ -999,14 +955,6 @@ class TalkVisual {
 		}
 
 		return rows;
-	}
-
-	/** Scrolling VU strip of recent loudness; ~2s of history in `cells` cells. */
-	private strip(cells: number, color: OrbColor): string {
-		return this.history
-			.slice(-cells)
-			.map((v) => this.theme.fg(v > 0.08 ? color : "dim", PARTIAL_BARS[Math.min(8, 1 + Math.round(v * 7))]!))
-			.join("");
 	}
 
 	invalidate(): void {}
