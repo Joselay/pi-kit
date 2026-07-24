@@ -644,7 +644,6 @@ class TalkVisual {
 		private readonly tui: TUI,
 		private readonly theme: Theme,
 		private readonly getState: () => TalkVisualState,
-		private readonly getDetail: () => string,
 		private readonly getLevel: () => number,
 	) {
 		const [a, b] = STATE_COLORS.connecting;
@@ -698,11 +697,14 @@ class TalkVisual {
 		if (width < 12) return [this.centered(this.theme.fg("accent", "◉ TALK"), width)];
 
 		const state = this.getState();
-		const labelColor: OrbColor =
+		const color: OrbColor =
 			state === "hearing" ? "success" : state === "working" || state === "thinking" ? "warning" : "accent";
 		const rows = this.renderOrb(width, state);
-		rows.push(this.centered(this.theme.fg(labelColor, `● ${ORB_LABELS[state]}`), width));
-		rows.push(this.centered(this.theme.fg("dim", this.getDetail()), width));
+		// State and level share one line: the globe already shows the level right
+		// now, the strip is there to show it was live a moment ago.
+		const label = this.theme.fg(color, `● ${ORB_LABELS[state]}`);
+		const bars = Math.max(0, Math.min(16, width - visibleWidth(label) - 4));
+		rows.push(this.centered(bars ? `${label}  ${this.strip(bars, color)}` : label, width));
 		return rows;
 	}
 
@@ -980,15 +982,15 @@ class TalkVisual {
 			rows.push(this.centered(line, width));
 		}
 
-		// Scrolling VU strip of recent loudness under the globe.
-		const stripColor: OrbColor =
-			state === "hearing" ? "success" : state === "working" || state === "thinking" ? "warning" : "accent";
-		const cells = this.history.slice(-Math.min(21, cols));
-		const strip = cells
-			.map((v) => this.theme.fg(v > 0.08 ? stripColor : "dim", PARTIAL_BARS[Math.min(8, 1 + Math.round(v * 7))]!))
-			.join("");
-		rows.push(this.centered(strip, width));
 		return rows;
+	}
+
+	/** Scrolling VU strip of recent loudness; ~2s of history in `cells` cells. */
+	private strip(cells: number, color: OrbColor): string {
+		return this.history
+			.slice(-cells)
+			.map((v) => this.theme.fg(v > 0.08 ? color : "dim", PARTIAL_BARS[Math.min(8, 1 + Math.round(v * 7))]!))
+			.join("");
 	}
 
 	invalidate(): void {}
@@ -1026,7 +1028,6 @@ class TalkSession {
 
 	private transcript: { who: TranscriptWho; text: string }[] = [];
 	private openLine?: { who: "you" | "asst"; text: string };
-	private statusText = "connecting…";
 	private visualState: TalkVisualState = "connecting";
 	private renderTimer?: ReturnType<typeof setTimeout>;
 
@@ -1046,7 +1047,6 @@ class TalkSession {
 					tui,
 					theme,
 					() => (this.isPlaying() ? "speaking" : this.visualState),
-					() => this.statusText,
 					() => this.audioLevel(),
 				),
 			{ placement: "aboveEditor" },
@@ -1144,7 +1144,13 @@ class TalkSession {
 			{ triggerTurn: false },
 		);
 
-		this.statusText = `listening — ${this.model} · ${VOICE} · ${this.audio.echoCancelled ? "echo-cancelled (speakers OK)" : "half-duplex (no AEC)"}`;
+		// Session facts live in the status bar rather than under the globe: they
+		// are fixed for the session, and the widget line is for what changes.
+		// Echo cancellation is the normal case, so only call out its absence.
+		if (this.ctx.hasUI) {
+			const tag = `${this.model.replace(/^gpt-realtime-/, "")} · ${VOICE}`;
+			this.ctx.ui.setStatus("talk", `◉ talk · ${tag}${this.audio.echoCancelled ? "" : " · half-duplex"}`);
+		}
 		this.setVisualState("listening");
 		this.markDirty();
 	}
@@ -1431,7 +1437,7 @@ class TalkSession {
 	private render(): void {
 		if (this.closing || !this.ctx.hasUI) return;
 		const label = (who: TranscriptWho) => (who === "you" ? "you " : who === "asst" ? "talk" : "  ·  ");
-		const lines = this.transcript.slice(-8).map((entry) => `${label(entry.who)}│ ${clip(entry.text, 110)}`);
+		const lines = this.transcript.slice(-4).map((entry) => `${label(entry.who)}│ ${clip(entry.text, 110)}`);
 		if (this.openLine) {
 			const text = this.openLine.text;
 			const tail = text.length > 108 ? `…${text.slice(-107)}` : text;
