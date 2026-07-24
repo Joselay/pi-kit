@@ -21,7 +21,7 @@ Skills live in [`skills`](skills):
 
 Pi extensions live in [`extensions`](extensions):
 
-- [`lib/`](extensions/lib) - Shared helpers imported by the extensions below (not auto-loaded): `util.ts` (small utilities), `codex.ts` (Codex OAuth + ChatGPT `/wham` backend API), `audio.ts` (24 kHz PCM16 capture/playback with AEC helper + ffmpeg fallback), `realtime.ts` (realtime WebSocket plumbing).
+- [`lib/`](extensions/lib) - Shared helpers imported by the extensions below (not auto-loaded): `util.ts` (small utilities), `state.ts` (state-file paths under `state/`), `codex.ts` (Codex OAuth + ChatGPT `/wham` backend API), `audio.ts` (24 kHz PCM16 capture/playback with AEC helper + ffmpeg fallback), `realtime.ts` (realtime WebSocket plumbing).
 - [`account.ts`](extensions/account.ts) - `/account` Codex plan, real rate-limit windows, credits, and profile stats.
 - [`answer.ts`](extensions/answer.ts) - `/answer` interactive Q&A from the last assistant message.
 - [`btw.ts`](extensions/btw.ts) - Side-chat popover for tangential questions.
@@ -50,10 +50,11 @@ Pi extensions live in [`extensions`](extensions):
 
 ## Support Files
 
-- [`analyze-edits.py`](analyze-edits.py) - `uv run analyze-edits.py` for edit-tool usage and failure stats from session logs.
-- [`emoji`](emoji) - Emoji dataset for the emoji extension; regenerate with `uv run emoji/build.py`.
-- [`shims`](shims) - Python command shims used by the uv extension.
-- [`talk`](talk) - Swift echo-cancellation audio helper for the talk extension (compiled on demand).
-- [`cosmetic`](cosmetic) - Working-message list for the cosmetic extension.
-- [`images`](images) - Header artwork.
-- [`sounds`](sounds) - Completion notification sound.
+- [`scripts/analyze-edits.py`](scripts/analyze-edits.py) - `uv run scripts/analyze-edits.py` for edit-tool usage and failure stats from session logs.
+- [`assets/emoji`](assets/emoji) - Emoji dataset for the emoji extension; regenerate with `uv run assets/emoji/build.py`.
+- [`assets/shims`](assets/shims) - Python command shims used by the uv extension.
+- [`assets/talk`](assets/talk) - Swift echo-cancellation audio helper for the talk extension (compiled on demand).
+- [`assets/working-messages.json`](assets/working-messages.json) - Working-message list for the cosmetic extension.
+- [`assets/images`](assets/images) - Header artwork.
+- [`assets/sounds`](assets/sounds) - Completion notification sound.
+- `state/` - Gitignored extension state (`fast.json`, `dictate.json`, `recall.json`, ...), managed via [`extensions/lib/state.ts`](extensions/lib/state.ts).

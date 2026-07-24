@@ -26,7 +26,7 @@ import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const shimsPath = join(__dirname, "..", "shims");
+const shimsPath = join(__dirname, "..", "assets", "shims");
 
 function getBlockedCommandMessage(command: string): string | null {
   // Match commands at the start of a shell segment (start/newline/; /&& /|| /|)

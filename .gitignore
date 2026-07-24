@@ -1,15 +1,17 @@
 # Credentials and secrets
 auth.json
 
-# Runtime and generated state
+# Pi-owned runtime state
 sessions/
-talk/talk-audio
 models-store.json
 trust.json
-fast.json
-dictate.json
-recall.json
 pi-debug.log
+
+# Extension-owned state (see extensions/lib/state.ts)
+state/
+
+# Generated on demand
+assets/talk/talk-audio
 __pycache__/
 
 # Downloaded tools and packages

@@ -4,7 +4,7 @@
 # ///
 """Analyze edit tool invocations in pi session JSONL files.
 
-Usage: uv run analyze-edits.py [session.jsonl|dir ...]
+Usage: uv run scripts/analyze-edits.py [session.jsonl|dir ...]
 
 Defaults to ~/.pi/agent/sessions when no arguments are given.
 

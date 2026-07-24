@@ -1,11 +1,12 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { CustomEditor, getAgentDir, type ExtensionAPI, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import { CustomEditor, type ExtensionAPI, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { statePath } from "./lib/state.ts";
 import { errorText } from "./lib/util.ts";
 
 const HISTORY_LIMIT = 100;
-const HISTORY_PATH = join(getAgentDir(), "recall.json");
+const HISTORY_PATH = statePath("recall.json");
 type Store = Record<string, string[]>;
 
 function addPrompt(history: string[], text: string): boolean {

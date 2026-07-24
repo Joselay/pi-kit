@@ -13,9 +13,9 @@ import { join } from "node:path";
 import { CODEX_FAST_STATUS_KEY, modelSupportsCodexFastMode } from "./fast";
 import { CODEX_USAGE_CHANGED_EVENT } from "./lib/codex.ts";
 
-const IMAGES_DIR = new URL("../images/", import.meta.url);
-const WORKING_MESSAGES_PATH = new URL("../cosmetic/working-messages.json", import.meta.url);
-const SOUND_PATH = join(getAgentDir(), "sounds", "notification.mp3");
+const IMAGES_DIR = new URL("../assets/images/", import.meta.url);
+const WORKING_MESSAGES_PATH = new URL("../assets/working-messages.json", import.meta.url);
+const SOUND_PATH = join(getAgentDir(), "assets", "sounds", "notification.mp3");
 const AUDIO_PLAYER = "/usr/bin/afplay";
 
 function pickRandom<T>(items: readonly T[]): T {

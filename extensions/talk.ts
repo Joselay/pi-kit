@@ -9,7 +9,7 @@
 // ModelRuntime (same pattern as the web-search/imagegen skills); the GA
 // realtime WebSocket accepts the ChatGPT bearer directly.
 //
-// Audio: prefers the AEC helper (~/.pi/agent/talk/talk-audio.swift,
+// Audio: prefers the AEC helper (~/.pi/agent/assets/talk/talk-audio.swift,
 // compiled on demand) for full-duplex speaker use with echo cancellation and
 // barge-in; falls back to ffmpeg/ffplay in half-duplex (mic muted while the
 // assistant speaks) when the helper is unavailable.

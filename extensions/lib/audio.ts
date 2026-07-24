@@ -1,6 +1,6 @@
 // Shared realtime audio stack for the voice extensions (/talk, /translate,
 // /say, /dictate): 24 kHz mono PCM16 in and out, with either the Swift AEC
-// helper (~/.pi/agent/talk/talk-audio, compiled from talk-audio.swift on
+// helper (~/.pi/agent/assets/talk/talk-audio, compiled from talk-audio.swift on
 // demand) for full-duplex speaker use, or an ffmpeg/ffplay half-duplex
 // fallback.
 
@@ -15,7 +15,7 @@ export const SAMPLE_RATE = 24000;
 /** Upstream clients stream 960-sample (40 ms) mono PCM16 frames = 1920 bytes. */
 export const MIC_FRAME_BYTES = 960 * 2;
 
-const TALK_DIR = join(getAgentDir(), "talk");
+const TALK_DIR = join(getAgentDir(), "assets", "talk");
 const AEC_SOURCE = join(TALK_DIR, "talk-audio.swift");
 const AEC_BINARY = join(TALK_DIR, "talk-audio");
 

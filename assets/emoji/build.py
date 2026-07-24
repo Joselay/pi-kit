@@ -7,7 +7,7 @@ gemoji is the upstream source of GitHub's shortcode API and stores
 fully-qualified glyphs (including U+FE0F variation selectors), so
 :heart: renders as the red emoji rather than the raw text-style glyph.
 
-Usage: uv run emoji/build.py
+Usage: uv run assets/emoji/build.py
 """
 
 import json

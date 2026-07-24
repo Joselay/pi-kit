@@ -1,9 +1,7 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import {
 	CustomEditor,
-	getAgentDir,
 	type ExtensionAPI,
 	type ExtensionContext,
 	type KeybindingsManager,
@@ -11,6 +9,7 @@ import {
 import { SAMPLE_RATE } from "./lib/audio.ts";
 import { resolveRealtimeOAuth } from "./lib/codex.ts";
 import { realtimeHeaders } from "./lib/realtime.ts";
+import { statePath } from "./lib/state.ts";
 import { errorText } from "./lib/util.ts";
 import {
 	CURSOR_MARKER,
@@ -23,7 +22,7 @@ import {
 	type TUI,
 } from "@earendil-works/pi-tui";
 
-const STATE_PATH = join(getAgentDir(), "dictate.json");
+const STATE_PATH = statePath("dictate.json");
 const MAX_RECORDING_MS = 5 * 60 * 1000;
 const HOLD_DELAY_MS = 500;
 const PRESPAWN_DELAY_MS = 120;

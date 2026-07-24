@@ -1,10 +1,10 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { statePath } from "./lib/state.ts";
 import { errorText, isRecord } from "./lib/util.ts";
 
 const FAST_REQUEST_SERVICE_TIER = "priority";
-const FAST_STATE_PATH = join(getAgentDir(), "fast.json");
+const FAST_STATE_PATH = statePath("fast.json");
 export const CODEX_FAST_STATUS_KEY = "codex-fast";
 
 type Model = ExtensionContext["model"];
