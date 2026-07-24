@@ -23,7 +23,9 @@ import {
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
+	type Theme,
 } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth, visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import { ensureAecAudio, pcmChunkMs, SAMPLE_RATE, type AudioIO } from "../lib/audio.ts";
 import { resolveRealtimeOAuth } from "../lib/codex.ts";
 import { openRealtimeSocket, parseServerEvent, realtimeHeaders, sendJson } from "../lib/realtime.ts";
@@ -538,6 +540,308 @@ function buildStartupContext(ctx: ExtensionContext): string {
 	return `<startup_context>\n${parts.join("\n\n")}\n</startup_context>`;
 }
 
+// --- talk UI ---
+
+type TalkVisualState = "connecting" | "listening" | "hearing" | "thinking" | "speaking" | "working";
+type OrbColor = "text" | "accent" | "muted" | "dim" | "success" | "warning";
+
+const ORB_LABELS: Record<TalkVisualState, string> = {
+	connecting: "CONNECTING",
+	listening: "LISTENING",
+	hearing: "HEARING YOU",
+	thinking: "THINKING",
+	speaking: "SPEAKING",
+	working: "AGENT WORKING",
+};
+
+const PARTIAL_BARS = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"] as const;
+
+type Rgb = readonly [number, number, number];
+// Two-tone plasma gradient per state for the true-color globe.
+const STATE_COLORS: Record<TalkVisualState, readonly [Rgb, Rgb]> = {
+	connecting: [
+		[55, 65, 90],
+		[110, 125, 160],
+	],
+	listening: [
+		[18, 60, 160],
+		[64, 190, 255],
+	],
+	hearing: [
+		[10, 120, 80],
+		[90, 240, 160],
+	],
+	thinking: [
+		[90, 50, 200],
+		[220, 110, 255],
+	],
+	speaking: [
+		[50, 90, 235],
+		[170, 150, 255],
+	],
+	working: [
+		[190, 110, 30],
+		[255, 190, 80],
+	],
+};
+const RIM_TINT: Rgb = [90, 128, 217]; // cool edge light, 0..255
+const SPARK_COLOR: Rgb = [255, 226, 130];
+// Quadrant glyph indexed by pixel mask: UL=1, UR=2, LL=4, LR=8.
+const QUAD = [" ", "▘", "▝", "▀", "▖", "▌", "▞", "▛", "▗", "▚", "▐", "▜", "▄", "▙", "▟", "█"] as const;
+
+/** RMS loudness of a PCM16LE mono buffer, subsampled for cheapness; 0..1. */
+function pcmRms(buf: Buffer): number {
+	const samples = buf.length >> 1;
+	if (!samples) return 0;
+	const step = Math.max(1, Math.floor(samples / 128));
+	let sum = 0;
+	let count = 0;
+	for (let i = 0; i < samples; i += step) {
+		const v = buf.readInt16LE(i << 1) / 32768;
+		sum += v * v;
+		count++;
+	}
+	return Math.sqrt(sum / count);
+}
+
+/**
+ * The talk visualizer widget: a true-color 3D plasma globe. Live audio spins
+ * it faster, swells it, and lights it from within; it condenses in from
+ * dithered pixels while connecting, churns while thinking, and grows orbiting
+ * sparks while the agent works. A scrolling VU strip sits underneath.
+ */
+class TalkVisual {
+	private frame = 0;
+	private level = 0; // smoothed 0..1 loudness driving the animation
+	private spin = 0; // accumulated globe rotation; audio accelerates it smoothly
+	private history: number[] = [];
+	private timer: ReturnType<typeof setInterval>;
+
+	constructor(
+		private readonly tui: TUI,
+		private readonly theme: Theme,
+		private readonly getState: () => TalkVisualState,
+		private readonly getDetail: () => string,
+		private readonly getLevel: () => number,
+	) {
+		this.timer = setInterval(() => {
+			this.frame += 1;
+			// Fast attack, slow release: snap to speech onsets, ease out after.
+			const target = this.getLevel();
+			this.level += (target - this.level) * (target > this.level ? 0.55 : 0.18);
+			this.spin += 0.055 + this.level * 0.2;
+			this.history.push(this.level);
+			if (this.history.length > 64) this.history.shift();
+			this.tui.requestRender();
+		}, 80);
+		this.timer.unref?.();
+	}
+
+	private centered(line: string, width: number): string {
+		const fitted = truncateToWidth(line, Math.max(0, width), "");
+		return `${" ".repeat(Math.max(0, Math.floor((width - visibleWidth(fitted)) / 2)))}${fitted}`;
+	}
+
+	render(width: number): string[] {
+		if (width < 12) return [this.centered(this.theme.fg("accent", "◉ TALK"), width)];
+
+		const state = this.getState();
+		const labelColor: OrbColor =
+			state === "hearing" ? "success" : state === "working" || state === "thinking" ? "warning" : "accent";
+		const rows = this.renderOrb(width, state);
+		rows.push(this.centered(this.theme.fg(labelColor, `● ${ORB_LABELS[state]}`), width));
+		rows.push(this.centered(this.theme.fg("dim", this.getDetail()), width));
+		return rows;
+	}
+
+	// A true-color 3D globe rendered in quadrant-block "pixels" (2x2 per
+	// character cell) with 2x2 supersampling per pixel. Each sample is
+	// projected onto a sphere and shaded with Lambert diffuse from a drifting
+	// light, a specular hot spot, a cool rim light, and an anti-aliased limb,
+	// over swirling two-tone plasma bands. Interior cells split their four
+	// pixels into bright/dark groups (fg/bg) so real detail survives the
+	// two-colors-per-cell limit; edge cells keep a transparent background.
+	// Audio spins it faster, swells it, and lights it from within.
+	private renderOrb(width: number, state: TalkVisualState): string[] {
+		const audio = state === "speaking" || state === "hearing";
+		const t = this.frame * 0.1;
+		const spin = this.spin;
+		const cols = Math.min(21, Math.max(17, width - 4));
+		const charRows = 8;
+		const W = cols * 2;
+		const H = charRows * 2;
+		const rows: string[] = [];
+
+		// Live audio swells the globe; idle states breathe gently instead.
+		const swell = audio ? this.level * 0.16 : 0.03 * Math.sin(this.frame * 0.07);
+		const edgeBase = state === "connecting" ? 0.6 + 0.05 * Math.sin(this.frame * 0.16) : 0.8 + swell;
+		// Light drifting around the upper hemisphere; half vector for specular.
+		const ln = Math.hypot(0.62 * Math.cos(t * 0.3), -0.52, 0.6);
+		const lx = (0.62 * Math.cos(t * 0.3)) / ln;
+		const ly = -0.52 / ln;
+		const lz = 0.6 / ln;
+		const hn = Math.hypot(lx, ly, lz + 1);
+		const hx = lx / hn;
+		const hy = ly / hn;
+		const hz = (lz + 1) / hn;
+		// Thinking churns the surface harder; audio adds turbulence with level.
+		const churn = state === "thinking" ? 2.4 : 1.4 + (audio ? this.level : 0);
+		const [ca, cb] = STATE_COLORS[state];
+
+		// Shade one sample point; pre-gamma rgb (0..1) premultiplied by limb
+		// coverage, or undefined outside the globe.
+		const shade = (nx: number, ny: number): [number, number, number] | undefined => {
+			const angle = Math.atan2(ny, nx);
+			const radius = Math.hypot(nx, ny);
+			const wobble =
+				0.035 * Math.sin(angle * 3 + t * 1.3) +
+				0.022 * Math.sin(angle * 2 - t * 1.8) +
+				(audio ? 0.045 * this.level * Math.sin(angle * 5 + spin * 1.6) : 0);
+			const edge = Math.min(1, edgeBase + wobble);
+			if (radius > edge) return undefined;
+			const sx = nx / edge;
+			const sy = ny / edge;
+			const sz = Math.sqrt(Math.max(0, 1 - sx * sx - sy * sy));
+			const diffuse = Math.max(0, sx * lx + sy * ly + sz * lz);
+			const spec = Math.max(0, sx * hx + sy * hy + sz * hz) ** 32;
+			const rim = (1 - sz) ** 3 * 0.28;
+			const lon = Math.atan2(sx, sz) + spin;
+			const lat = Math.asin(Math.max(-1, Math.min(1, sy)));
+			const band = 0.5 + 0.5 * Math.sin(lon * 2.6 + Math.sin(lat * 2.2 + spin * 0.6) * churn);
+			const detail = 0.9 + 0.1 * Math.sin(lon * 6 + Math.sin(lat * 4 + spin * 1.3) * 2);
+			const glow = audio ? this.level * 0.45 * (1 - radius / edge) : 0;
+			const light = (0.1 + 0.9 * diffuse) * detail + glow;
+			const aa = Math.min(1, (edge - radius) * 10);
+			const out: [number, number, number] = [0, 0, 0];
+			for (let i = 0; i < 3; i++) {
+				const base = (ca[i]! + (cb[i]! - ca[i]!) * band) / 255;
+				out[i] = Math.max(0, Math.min(1, (base * light + spec * 0.85 + (rim * RIM_TINT[i]!) / 255) * aa));
+			}
+			return out;
+		};
+
+		// Supersampled pixel grid: rgb + coverage per pixel.
+		const px = new Float32Array(W * H * 4);
+		for (let py = 0; py < H; py++) {
+			for (let x = 0; x < W; x++) {
+				// Connecting: matter still condensing — dithered, mostly hollow.
+				if (state === "connecting" && (x * 31 + py * 17 + this.frame) % 4 < 2) {
+					const cnx = (x - (W - 1) / 2) / (W * 0.45);
+					const cny = (py - (H - 1) / 2) / (H * 0.48);
+					if (Math.hypot(cnx, cny) > 0.3) continue;
+				}
+				let r = 0;
+				let g = 0;
+				let b = 0;
+				let cov = 0;
+				for (const dx of [-0.25, 0.25]) {
+					for (const dy of [-0.25, 0.25]) {
+						const s = shade((x + dx - (W - 1) / 2) / (W * 0.45), (py + dy - (H - 1) / 2) / (H * 0.48));
+						if (!s) continue;
+						r += s[0];
+						g += s[1];
+						b += s[2];
+						cov += 1;
+					}
+				}
+				if (!cov) continue;
+				const o = (py * W + x) * 4;
+				px[o] = r / 4;
+				px[o + 1] = g / 4;
+				px[o + 2] = b / 4;
+				px[o + 3] = cov / 4;
+			}
+		}
+
+		// Sparks orbit the globe while the agent works.
+		if (state === "working") {
+			for (let k = 0; k < 3; k++) {
+				const a = spin * 0.6 + (k * Math.PI * 2) / 3;
+				const sxp = Math.round((W - 1) / 2 + Math.cos(a) * W * 0.46);
+				const syp = Math.round((H - 1) / 2 + Math.sin(a) * H * 0.42);
+				for (const xx of [sxp, sxp + 1]) {
+					if (xx < 0 || xx >= W || syp < 0 || syp >= H) continue;
+					const o = (syp * W + xx) * 4;
+					px[o] = SPARK_COLOR[0] / 255;
+					px[o + 1] = SPARK_COLOR[1] / 255;
+					px[o + 2] = SPARK_COLOR[2] / 255;
+					px[o + 3] = 1;
+				}
+			}
+		}
+
+		const fgSeq = (c: Rgb) => `\x1b[38;2;${c[0]};${c[1]};${c[2]}m`;
+		const bgSeq = (c: Rgb) => `\x1b[48;2;${c[0]};${c[1]};${c[2]}m`;
+		const GAMMA = 0.85;
+		for (let cy = 0; cy < charRows; cy++) {
+			let line = "";
+			for (let cx = 0; cx < cols; cx++) {
+				// Cell pixel offsets in mask order UL, UR, LL, LR.
+				const offs = [
+					(cy * 2 * W + cx * 2) * 4,
+					(cy * 2 * W + cx * 2 + 1) * 4,
+					((cy * 2 + 1) * W + cx * 2) * 4,
+					((cy * 2 + 1) * W + cx * 2 + 1) * 4,
+				];
+				const avg = (sel: number): Rgb => {
+					let r = 0;
+					let g = 0;
+					let b = 0;
+					let n = 0;
+					for (let i = 0; i < 4; i++) {
+						if (!(sel & (1 << i))) continue;
+						const o = offs[i]!;
+						r += px[o]!;
+						g += px[o + 1]!;
+						b += px[o + 2]!;
+						n += 1;
+					}
+					return [
+						Math.round(255 * (r / n) ** GAMMA),
+						Math.round(255 * (g / n) ** GAMMA),
+						Math.round(255 * (b / n) ** GAMMA),
+					];
+				};
+				let mask = 0;
+				for (let i = 0; i < 4; i++) if (px[offs[i]! + 3]! > 0.2) mask |= 1 << i;
+				if (!mask) {
+					line += " ";
+				} else if (mask === 15) {
+					// Interior: split pixels into bright/dark groups for detail.
+					const lums = offs.map((o) => px[o]! + px[o + 1]! + px[o + 2]!);
+					const mean = (lums[0]! + lums[1]! + lums[2]! + lums[3]!) / 4;
+					let brightMask = 0;
+					for (let i = 0; i < 4; i++) if (lums[i]! >= mean) brightMask |= 1 << i;
+					line +=
+						brightMask === 15
+							? `${fgSeq(avg(15))}█\x1b[0m`
+							: `${fgSeq(avg(brightMask))}${bgSeq(avg(15 & ~brightMask))}${QUAD[brightMask]}\x1b[0m`;
+				} else {
+					// Limb: draw only covered quadrants, background stays transparent.
+					line += `${fgSeq(avg(mask))}${QUAD[mask]}\x1b[0m`;
+				}
+			}
+			rows.push(this.centered(line, width));
+		}
+
+		// Scrolling VU strip of recent loudness under the globe.
+		const stripColor: OrbColor =
+			state === "hearing" ? "success" : state === "working" || state === "thinking" ? "warning" : "accent";
+		const cells = this.history.slice(-Math.min(21, cols));
+		const strip = cells
+			.map((v) => this.theme.fg(v > 0.08 ? stripColor : "dim", PARTIAL_BARS[Math.min(8, 1 + Math.round(v * 7))]!))
+			.join("");
+		rows.push(this.centered(strip, width));
+		return rows;
+	}
+
+	invalidate(): void {}
+
+	dispose(): void {
+		clearInterval(this.timer);
+	}
+}
+
 // --- the talk session ---
 
 type TranscriptWho = "you" | "asst" | "sys";
@@ -553,6 +857,10 @@ class TalkSession {
 	private playedBytes = 0;
 	private currentItemId?: string;
 
+	// Live loudness feeding the orb animation.
+	private micLevel = 0;
+	private outLevels: { start: number; end: number; rms: number }[] = [];
+
 	// response.create serialization (upstream RealtimeResponseCreateQueue).
 	private responseActive = false;
 	private pendingResponseCreate = false;
@@ -563,6 +871,7 @@ class TalkSession {
 	private transcript: { who: TranscriptWho; text: string }[] = [];
 	private openLine?: { who: "you" | "asst"; text: string };
 	private statusText = "connecting…";
+	private visualState: TalkVisualState = "connecting";
 	private renderTimer?: ReturnType<typeof setTimeout>;
 
 	constructor(
@@ -572,8 +881,37 @@ class TalkSession {
 		private readonly onClosed: () => void,
 	) {}
 
+	mountUI(): void {
+		if (this.ctx.mode !== "tui") return;
+		this.ctx.ui.setWidget(
+			"talk-orb",
+			(tui, theme) =>
+				new TalkVisual(
+					tui,
+					theme,
+					() => (this.isPlaying() ? "speaking" : this.visualState),
+					() => this.statusText,
+					() => this.audioLevel(),
+				),
+			{ placement: "aboveEditor" },
+		);
+	}
+
+	private setVisualState(state: TalkVisualState): void {
+		this.visualState = state;
+	}
+
 	private isPlaying(): boolean {
 		return Date.now() < this.playbackEndsAt + PLAYBACK_TAIL_MS;
+	}
+
+	/** 0..1 level for the orb: the speaker chunk playing right now, else the mic. */
+	private audioLevel(): number {
+		const now = Date.now();
+		while (this.outLevels.length && this.outLevels[0]!.end <= now) this.outLevels.shift();
+		const chunk = this.outLevels[0];
+		const rms = this.isPlaying() ? (chunk && chunk.start <= now + 40 ? chunk.rms : 0) : this.micLevel;
+		return Math.min(1, Math.sqrt(Math.max(0, rms - 0.006)) * 2.6);
 	}
 
 	async start(): Promise<void> {
@@ -630,6 +968,7 @@ class TalkSession {
 
 		await this.audio.start(
 			(frame) => {
+				this.micLevel = pcmRms(frame);
 				if (ws.readyState !== 1) return;
 				// Half-duplex fallback: without AEC, drop mic frames while the
 				// assistant is speaking to avoid a speaker->mic feedback loop.
@@ -650,6 +989,7 @@ class TalkSession {
 		);
 
 		this.statusText = `listening — ${this.model} · ${VOICE} · ${this.audio.echoCancelled ? "echo-cancelled (speakers OK)" : "half-duplex (no AEC)"}`;
+		this.setVisualState("listening");
 		this.markDirty();
 	}
 
@@ -707,6 +1047,7 @@ class TalkSession {
 		switch (msg.type) {
 			case "response.created":
 				this.responseActive = true;
+				this.setVisualState("thinking");
 				this.playedBytes = 0;
 				this.firstChunkAt = 0;
 				break;
@@ -718,6 +1059,7 @@ class TalkSession {
 				this.currentItemId = undefined;
 				this.playedBytes = 0;
 				this.responseActive = false;
+				this.setVisualState(this.activeHandoff ? "working" : "listening");
 				if (this.pendingResponseCreate) {
 					this.pendingResponseCreate = false;
 					this.send({ type: "response.create" });
@@ -736,6 +1078,7 @@ class TalkSession {
 				break;
 			}
 			case "input_audio_buffer.speech_started":
+				this.setVisualState("hearing");
 				this.onBargeIn(typeof msg.item_id === "string" ? msg.item_id : undefined);
 				break;
 			case "conversation.item.input_audio_transcription.delta":
@@ -780,7 +1123,13 @@ class TalkSession {
 		const now = Date.now();
 		if (!this.firstChunkAt) this.firstChunkAt = now;
 		this.playedBytes += buf.length;
-		this.playbackEndsAt = Math.max(this.playbackEndsAt, this.firstChunkAt, now) + pcmChunkMs(buf);
+		const start = Math.max(this.playbackEndsAt, this.firstChunkAt, now);
+		this.playbackEndsAt = start + pcmChunkMs(buf);
+		// Chunks arrive faster than realtime; remember each one's loudness over
+		// its wall-clock playback window so the orb animates in sync with the
+		// audio the speaker is actually emitting.
+		this.outLevels.push({ start, end: this.playbackEndsAt, rms: pcmRms(buf) });
+		if (this.outLevels.length > 600) this.outLevels.splice(0, this.outLevels.length - 600);
 	}
 
 	private onBargeIn(speechItemId?: string): void {
@@ -801,6 +1150,7 @@ class TalkSession {
 		}
 		this.playedBytes = 0;
 		this.playbackEndsAt = 0;
+		this.outLevels.length = 0;
 		this.audio?.flush();
 		this.endLine("asst");
 	}
@@ -846,11 +1196,13 @@ class TalkSession {
 		const busy = this.activeHandoff !== undefined || !this.ctx.isIdle();
 		this.note(`→ agent: ${clip(prompt, 80)}`);
 		if (busy) {
+			this.setVisualState("thinking");
 			this.pi.sendUserMessage(prompt, { deliverAs: "steer" });
 			this.sendFunctionOutput(callId, STEER_ACK);
 			this.createResponse();
 		} else {
 			this.activeHandoff = { callId };
+			this.setVisualState("working");
 			this.pi.sendUserMessage(prompt);
 		}
 	}
@@ -871,6 +1223,7 @@ class TalkSession {
 		const { callId } = this.activeHandoff;
 		this.activeHandoff = undefined;
 		this.note("← agent finished");
+		this.setVisualState("thinking");
 		this.sendFunctionOutput(callId, HANDOFF_COMPLETE_ACK);
 		this.createResponse();
 	}
@@ -928,12 +1281,13 @@ class TalkSession {
 			const tail = text.length > 108 ? `…${text.slice(-107)}` : text;
 			lines.push(`${label(this.openLine.who)}│ ${tail}▌`);
 		}
-		this.ctx.ui.setWidget("talk", [`◉ ${this.statusText}`, ...lines], { placement: "belowEditor" });
+		this.ctx.ui.setWidget("talk-transcript", lines.length ? lines : undefined, { placement: "belowEditor" });
 	}
 
 	clearWidget(): void {
 		if (this.ctx.hasUI) {
-			this.ctx.ui.setWidget("talk", undefined);
+			this.ctx.ui.setWidget("talk-orb", undefined);
+			this.ctx.ui.setWidget("talk-transcript", undefined);
 			this.ctx.ui.setStatus("talk", undefined);
 		}
 	}
@@ -1003,6 +1357,7 @@ export default function talk(pi: ExtensionAPI) {
 			try {
 				active = session;
 				if (ctx.hasUI) ctx.ui.setStatus("talk", "◉ talk");
+				session.mountUI();
 				await session.start();
 			} catch (error) {
 				active = undefined;
