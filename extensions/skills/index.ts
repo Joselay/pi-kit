@@ -135,7 +135,10 @@ function loadSkillIndex(pi: ExtensionAPI): SkillIndex {
 			if (!name || BUILTIN_COMMANDS.has(name)) continue;
 			if (byName.has(name)) continue;
 			const filePath = command.sourceInfo?.path ?? "";
-			const baseDir = command.sourceInfo?.baseDir ?? (filePath ? dirname(filePath) : "");
+			// pi's _expandSkillCommand uses skill.baseDir === dirname(SKILL.md).
+			// Do NOT use sourceInfo.baseDir: the resource loader rewrites it to the
+			// source root (e.g. the agent dir), not the skill's own directory.
+			const baseDir = filePath ? dirname(filePath) : "";
 			byName.set(name, { description: command.description ?? "", filePath, baseDir });
 		} else {
 			// Extension/prompt command names must not be shadowed by short form.
