@@ -586,8 +586,22 @@ const STATE_COLORS: Record<TalkVisualState, readonly [Rgb, Rgb]> = {
 };
 const RIM_TINT: Rgb = [90, 128, 217]; // cool edge light, 0..255
 const SPARK_COLOR: Rgb = [255, 226, 130];
+const POLE_TINT: Rgb = [200, 236, 255]; // polar aurora
 // Quadrant glyph indexed by pixel mask: UL=1, UR=2, LL=4, LR=8.
 const QUAD = [" ", "▘", "▝", "▀", "▖", "▌", "▞", "▛", "▗", "▚", "▐", "▜", "▄", "▙", "▟", "█"] as const;
+// Spin axis tipped toward the viewer, so one pole stays visible and the
+// parallels curve; without it a spinning sphere reads as a cylinder.
+const TILT = 0.42;
+const SIN_TILT = Math.sin(TILT);
+const COS_TILT = Math.cos(TILT);
+const HALO = 0.2; // atmosphere thickness outside the limb, in globe radii
+const FRAME_MS = 50;
+const HIST_MS = 80; // VU strip scroll cadence, independent of framerate
+
+/** Frame-rate independent smoothing factor for an exponential approach. */
+function ease(rate: number, dt: number): number {
+	return 1 - Math.exp(-rate * dt);
+}
 
 /** RMS loudness of a PCM16LE mono buffer, subsampled for cheapness; 0..1. */
 function pcmRms(buf: Buffer): number {
@@ -611,10 +625,19 @@ function pcmRms(buf: Buffer): number {
  * sparks while the agent works. A scrolling VU strip sits underneath.
  */
 class TalkVisual {
-	private frame = 0;
+	private clock = 0; // seconds since mount; drives every time-based motion
+	private last = Date.now();
+	private histAcc = 0;
 	private level = 0; // smoothed 0..1 loudness driving the animation
 	private spin = 0; // accumulated globe rotation; audio accelerates it smoothly
+	// Per-state drivers, smoothed so a state change crossfades instead of popping.
+	private readonly colA: [number, number, number];
+	private readonly colB: [number, number, number];
+	private churn = 1.4;
+	private sparkAmt = 0;
+	private condense = 1;
 	private history: number[] = [];
+	private pixels?: Float32Array; // reused across frames
 	private timer: ReturnType<typeof setInterval>;
 
 	constructor(
@@ -624,17 +647,46 @@ class TalkVisual {
 		private readonly getDetail: () => string,
 		private readonly getLevel: () => number,
 	) {
-		this.timer = setInterval(() => {
-			this.frame += 1;
-			// Fast attack, slow release: snap to speech onsets, ease out after.
-			const target = this.getLevel();
-			this.level += (target - this.level) * (target > this.level ? 0.55 : 0.18);
-			this.spin += 0.055 + this.level * 0.2;
+		const [a, b] = STATE_COLORS.connecting;
+		this.colA = [a[0], a[1], a[2]];
+		this.colB = [b[0], b[1], b[2]];
+		this.timer = setInterval(() => this.tick(), FRAME_MS);
+		this.timer.unref?.();
+	}
+
+	// Everything animated is integrated against wall-clock dt rather than frame
+	// count, so the motion is identical whether or not frames arrive on time.
+	private tick(): void {
+		const now = Date.now();
+		const dt = Math.min(0.25, Math.max(0.001, (now - this.last) / 1000));
+		this.last = now;
+		this.clock += dt;
+
+		// Fast attack, slow release: snap to speech onsets, ease out after.
+		const target = this.getLevel();
+		this.level += (target - this.level) * ease(target > this.level ? 10 : 2.5, dt);
+		this.spin += (0.7 + this.level * 2.5) * dt;
+
+		const state = this.getState();
+		const [ta, tb] = STATE_COLORS[state];
+		const cf = ease(5, dt);
+		for (let i = 0; i < 3; i++) {
+			this.colA[i]! += (ta[i]! - this.colA[i]!) * cf;
+			this.colB[i]! += (tb[i]! - this.colB[i]!) * cf;
+		}
+		const audio = state === "speaking" || state === "hearing";
+		const churn = state === "thinking" ? 2.4 : 1.4 + (audio ? this.level : 0);
+		this.churn += (churn - this.churn) * ease(4, dt);
+		this.sparkAmt += ((state === "working" ? 1 : 0) - this.sparkAmt) * ease(3.5, dt);
+		this.condense += ((state === "connecting" ? 1 : 0) - this.condense) * ease(2.5, dt);
+
+		this.histAcc += dt;
+		while (this.histAcc >= HIST_MS / 1000) {
+			this.histAcc -= HIST_MS / 1000;
 			this.history.push(this.level);
 			if (this.history.length > 64) this.history.shift();
-			this.tui.requestRender();
-		}, 80);
-		this.timer.unref?.();
+		}
+		this.tui.requestRender();
 	}
 
 	private centered(line: string, width: number): string {
@@ -656,26 +708,33 @@ class TalkVisual {
 
 	// A true-color 3D globe rendered in quadrant-block "pixels" (2x2 per
 	// character cell) with 2x2 supersampling per pixel. Each sample is
-	// projected onto a sphere and shaded with Lambert diffuse from a drifting
-	// light, a specular hot spot, a cool rim light, and an anti-aliased limb,
-	// over swirling two-tone plasma bands crossed by a scrolling meridian/
-	// parallel graticule that makes the rotation read. Interior cells split their four
-	// pixels into bright/dark groups (fg/bg) so real detail survives the
-	// two-colors-per-cell limit; edge cells keep a transparent background.
-	// Audio spins it faster, swells it, and lights it from within.
+	// projected onto a tilted sphere and shaded with Lambert diffuse from a
+	// drifting light, a specular hot spot, a cool rim light, a polar aurora, an
+	// anti-aliased limb and a scattering atmosphere just outside it, over
+	// swirling two-tone plasma bands crossed by a meridian/parallel graticule
+	// that makes the rotation read. Interior cells split their four pixels into
+	// bright/dark groups (fg/bg) so real detail survives the two-colors-per-cell
+	// limit; edge cells keep a transparent background. Audio spins it faster,
+	// swells it, and lights it from within.
 	private renderOrb(width: number, state: TalkVisualState): string[] {
 		const audio = state === "speaking" || state === "hearing";
-		const t = this.frame * 0.1;
+		const t = this.clock * 1.25;
 		const spin = this.spin;
+		const level = this.level;
 		const cols = Math.min(21, Math.max(17, width - 4));
 		const charRows = 8;
 		const W = cols * 2;
 		const H = charRows * 2;
 		const rows: string[] = [];
 
-		// Live audio swells the globe; idle states breathe gently instead.
-		const swell = audio ? this.level * 0.16 : 0.03 * Math.sin(this.frame * 0.07);
-		const edgeBase = state === "connecting" ? 0.6 + 0.05 * Math.sin(this.frame * 0.16) : 0.8 + swell;
+		// Live audio swells the globe; idle states breathe gently instead. While
+		// matter is still condensing the globe sits small and translucent, then
+		// inflates and solidifies as `condense` decays, so connecting flows into
+		// listening without a cut.
+		const swell = audio ? level * 0.16 : 0.03 * Math.sin(t * 0.7);
+		const seed = 0.62 + 0.04 * Math.sin(t * 1.6);
+		const edgeBase = seed + (0.8 + swell - seed) * (1 - this.condense);
+		const form = 0.5 + 0.5 * (1 - this.condense);
 		// Light drifting around the upper hemisphere; half vector for specular.
 		const ln = Math.hypot(0.62 * Math.cos(t * 0.3), -0.52, 0.6);
 		const lx = (0.62 * Math.cos(t * 0.3)) / ln;
@@ -686,70 +745,95 @@ class TalkVisual {
 		const hy = ly / hn;
 		const hz = (lz + 1) / hn;
 		// Thinking churns the surface harder; audio adds turbulence with level.
-		const churn = state === "thinking" ? 2.4 : 1.4 + (audio ? this.level : 0);
-		const [ca, cb] = STATE_COLORS[state];
+		const churn = this.churn;
+		const ca = this.colA;
+		const cb = this.colB;
 
-		// Shade one sample point; pre-gamma rgb (0..1) premultiplied by limb
-		// coverage, or undefined outside the globe.
-		const shade = (nx: number, ny: number): [number, number, number] | undefined => {
+		// Shade one sample point into `smp` as pre-gamma rgb (0..1) premultiplied
+		// by coverage, plus that coverage; false when the sample misses both the
+		// globe and its atmosphere. A shared scratch buffer keeps this allocation
+		// free — it runs a few thousand times per frame.
+		const smp = new Float32Array(4);
+		const shade = (nx: number, ny: number): boolean => {
 			const angle = Math.atan2(ny, nx);
 			const radius = Math.hypot(nx, ny);
 			const wobble =
 				0.035 * Math.sin(angle * 3 + t * 1.3) +
 				0.022 * Math.sin(angle * 2 - t * 1.8) +
-				(audio ? 0.045 * this.level * Math.sin(angle * 5 + spin * 1.6) : 0);
+				(audio ? 0.045 * level * Math.sin(angle * 5 + spin * 1.6) : 0);
 			const edge = Math.min(1, edgeBase + wobble);
-			if (radius > edge) return undefined;
+			if (radius > edge + HALO) return false;
+			if (radius > edge) {
+				// Atmosphere: scattered light hugging the limb, strongest on the
+				// lit side and fading outward, which gives the globe depth
+				// against the background instead of a hard cutout edge.
+				const fall = 1 - (radius - edge) / HALO;
+				const facing = 0.35 + 0.65 * Math.max(0, (nx * lx + ny * ly) / radius);
+				const a = fall * fall * facing * (0.5 + 0.5 * (audio ? level : 0)) * 0.55 * form;
+				for (let i = 0; i < 3; i++) smp[i] = ((RIM_TINT[i]! * 0.55 + cb[i]! * 0.45) / 255) * a;
+				smp[3] = a;
+				return true;
+			}
 			const sx = nx / edge;
 			const sy = ny / edge;
 			const sz = Math.sqrt(Math.max(0, 1 - sx * sx - sy * sy));
 			const diffuse = Math.max(0, sx * lx + sy * ly + sz * lz);
 			const spec = Math.max(0, sx * hx + sy * hy + sz * hz) ** 32;
 			const rim = (1 - sz) ** 3 * 0.28;
-			const lon = Math.atan2(sx, sz) + spin;
-			const lat = Math.asin(Math.max(-1, Math.min(1, sy)));
+			// Tip the spin axis toward the viewer before taking lat/lon, so the
+			// pole stays in view and the parallels curve across the disc.
+			const ty = sy * COS_TILT - sz * SIN_TILT;
+			const tz = sy * SIN_TILT + sz * COS_TILT;
+			const lon = Math.atan2(sx, tz) + spin;
+			const lat = Math.asin(Math.max(-1, Math.min(1, ty)));
 			const band = 0.5 + 0.5 * Math.sin(lon * 2.6 + Math.sin(lat * 2.2 + spin * 0.6) * churn);
 			const detail = 0.9 + 0.1 * Math.sin(lon * 6 + Math.sin(lat * 4 + spin * 1.3) * 2);
-			const glow = audio ? this.level * 0.45 * (1 - radius / edge) : 0;
+			const glow = audio ? level * 0.45 * (1 - radius / edge) : 0;
 			// Meridian/parallel graticule scrolling with the spin so the
 			// rotation reads as a turning globe: thin, front-facing, fading
 			// into the shadowed hemisphere and compressing toward the limb.
 			const meridian = Math.abs(Math.cos(lon * 6)) ** 18;
 			const parallel = Math.abs(Math.cos(lat * 6)) ** 18;
 			const grid = Math.max(meridian, parallel) * sz * (0.3 + 0.7 * diffuse);
+			// Polar aurora: cold light capping the axis, brightest where the
+			// surface turns away from the light, so the night side is not dead.
+			const polar = Math.max(0, Math.abs(ty) - 0.74) / 0.26;
+			const cap = polar * polar * (0.25 + 0.45 * (1 - diffuse));
 			const light = (0.1 + 0.9 * diffuse) * detail + glow + grid * 0.32;
-			const aa = Math.min(1, (edge - radius) * 10);
-			const out: [number, number, number] = [0, 0, 0];
+			const aa = Math.min(1, (edge - radius) * 10) * form;
 			for (let i = 0; i < 3; i++) {
 				const base = (ca[i]! + (cb[i]! - ca[i]!) * band) / 255;
-				out[i] = Math.max(0, Math.min(1, (base * light + spec * 0.85 + (rim * RIM_TINT[i]!) / 255) * aa));
+				const v = base * light + spec * 0.85 + (rim * RIM_TINT[i]! + cap * POLE_TINT[i]!) / 255;
+				smp[i] = Math.max(0, Math.min(1, v)) * aa;
 			}
-			return out;
+			smp[3] = aa;
+			return true;
 		};
 
-		// Supersampled pixel grid: rgb + coverage per pixel.
-		const px = new Float32Array(W * H * 4);
+		// Supersampled pixel grid: rgb + coverage per pixel, in a buffer reused
+		// across frames.
+		const size = W * H * 4;
+		if (!this.pixels || this.pixels.length !== size) this.pixels = new Float32Array(size);
+		const px = this.pixels;
+		px.fill(0);
+		const midX = (W - 1) / 2;
+		const midY = (H - 1) / 2;
+		const scaleX = W * 0.45;
+		const scaleY = H * 0.48;
 		for (let py = 0; py < H; py++) {
 			for (let x = 0; x < W; x++) {
-				// Connecting: matter still condensing — dithered, mostly hollow.
-				if (state === "connecting" && (x * 31 + py * 17 + this.frame) % 4 < 2) {
-					const cnx = (x - (W - 1) / 2) / (W * 0.45);
-					const cny = (py - (H - 1) / 2) / (H * 0.48);
-					if (Math.hypot(cnx, cny) > 0.3) continue;
-				}
 				let r = 0;
 				let g = 0;
 				let b = 0;
 				let cov = 0;
-				for (const dx of [-0.25, 0.25]) {
-					for (const dy of [-0.25, 0.25]) {
-						const s = shade((x + dx - (W - 1) / 2) / (W * 0.45), (py + dy - (H - 1) / 2) / (H * 0.48));
-						if (!s) continue;
-						r += s[0];
-						g += s[1];
-						b += s[2];
-						cov += 1;
-					}
+				for (let s = 0; s < 4; s++) {
+					const dx = s & 1 ? 0.25 : -0.25;
+					const dy = s & 2 ? 0.25 : -0.25;
+					if (!shade((x + dx - midX) / scaleX, (py + dy - midY) / scaleY)) continue;
+					r += smp[0]!;
+					g += smp[1]!;
+					b += smp[2]!;
+					cov += smp[3]!;
 				}
 				if (!cov) continue;
 				const o = (py * W + x) * 4;
@@ -760,80 +844,139 @@ class TalkVisual {
 			}
 		}
 
-		// Sparks orbit the globe while the agent works, each trailing a short
-		// comet tail that fades behind it. Tail segments are drawn first so the
-		// bright head wins any pixels they share.
-		if (state === "working") {
-			const TRAIL = 5;
+		// Plot one mote at a globe-space position (in radii). The same axial tilt
+		// as the surface takes it to view space, anything on the far side is
+		// occluded by the globe rather than drawn over it, and the blend is
+		// additive so a mote crossing the lit face reads as a highlight instead
+		// of a hole punched in the surface.
+		const plot = (gx: number, gy: number, gz: number, tint: Rgb, weight: number): void => {
+			const vy = gy * COS_TILT + gz * SIN_TILT;
+			const vz = -gy * SIN_TILT + gz * COS_TILT;
+			if (vz < 0 && Math.hypot(gx, vy) < 1) return;
+			const w = weight * (0.45 + 0.55 * ((vz / (Math.hypot(gx, gy, gz) || 1) + 1) / 2));
+			if (w <= 0.02) return;
+			const sy = Math.round(midY + vy * edgeBase * scaleY);
+			if (sy < 0 || sy >= H) return;
+			const sx = Math.round(midX + gx * edgeBase * scaleX);
+			for (let d = 0; d < 2; d++) {
+				const xx = sx + d;
+				if (xx < 0 || xx >= W) continue;
+				const o = (sy * W + xx) * 4;
+				for (let i = 0; i < 3; i++) px[o + i] = Math.min(1, px[o + i]! + (tint[i]! / 255) * w);
+				px[o + 3] = Math.min(1, px[o + 3]! + w);
+			}
+		};
+
+		// Sparks orbit the globe while the agent works, on three inclined rings
+		// that actually go around it. Each trails a short comet tail, drawn
+		// tail-first so the bright head wins shared pixels, and the whole swarm
+		// fades in and out with the state instead of popping.
+		if (this.sparkAmt > 0.02) {
+			const TRAIL = 6;
+			const ORBIT = 1.14; // radii; just clear of the atmosphere
 			for (let k = 0; k < 3; k++) {
+				const si = Math.sin(0.3 + k * 0.55);
+				const ci = Math.cos(0.3 + k * 0.55);
 				for (let tr = TRAIL - 1; tr >= 0; tr--) {
-					const fade = 1 - tr / TRAIL;
-					const a = spin * 0.6 - tr * 0.13 + (k * Math.PI * 2) / 3;
-					const sxp = Math.round((W - 1) / 2 + Math.cos(a) * W * 0.46);
-					const syp = Math.round((H - 1) / 2 + Math.sin(a) * H * 0.42);
-					for (const xx of [sxp, sxp + 1]) {
-						if (xx < 0 || xx >= W || syp < 0 || syp >= H) continue;
-						const o = (syp * W + xx) * 4;
-						px[o] = (SPARK_COLOR[0] / 255) * fade;
-						px[o + 1] = (SPARK_COLOR[1] / 255) * fade;
-						px[o + 2] = (SPARK_COLOR[2] / 255) * fade;
-						px[o + 3] = 1;
-					}
+					const a = spin * 0.6 - tr * 0.12 + (k * Math.PI * 2) / 3;
+					const sa = Math.sin(a) * ORBIT;
+					plot(Math.cos(a) * ORBIT, sa * si, sa * ci, SPARK_COLOR, (1 - tr / TRAIL) * this.sparkAmt);
 				}
 			}
 		}
 
-		const fgSeq = (c: Rgb) => `\x1b[38;2;${c[0]};${c[1]};${c[2]}m`;
-		const bgSeq = (c: Rgb) => `\x1b[48;2;${c[0]};${c[1]};${c[2]}m`;
+		// Connecting: matter is still gathering, so motes spiral inward along
+		// their own latitudes and wink out as they are absorbed at the surface,
+		// while the globe itself stays translucent until they finish arriving.
+		if (this.condense > 0.02) {
+			for (let k = 0; k < 9; k++) {
+				const elev = ((k % 5) - 2) * 0.36;
+				const ce = Math.cos(elev);
+				const se = Math.sin(elev);
+				const phase = (this.clock * 0.5 + k * 0.111) % 1;
+				for (let tr = 4; tr >= 0; tr--) {
+					const p = phase - tr * 0.05;
+					if (p <= 0) continue;
+					// Stays within the frame: 1.55 radii is just inside the canvas.
+					const r = 1.55 - 0.5 * p;
+					const a = k * 2.4 + spin * 0.8 + p * 3;
+					const weight = this.condense * Math.sin(p * Math.PI) * (1 - tr / 5);
+					plot(Math.cos(a) * ce * r, se * r, Math.sin(a) * ce * r, POLE_TINT, weight);
+				}
+			}
+		}
+
 		const GAMMA = 0.85;
+		const offs = new Int32Array(4);
+		const lums = new Float64Array(4);
+		const seq = (sel: number, bg: boolean): string => {
+			let r = 0;
+			let g = 0;
+			let b = 0;
+			let n = 0;
+			for (let i = 0; i < 4; i++) {
+				if (!(sel & (1 << i))) continue;
+				const o = offs[i]!;
+				r += px[o]!;
+				g += px[o + 1]!;
+				b += px[o + 2]!;
+				n += 1;
+			}
+			const q = (v: number) => Math.round(255 * (v / n) ** GAMMA);
+			return `\x1b[${bg ? 48 : 38};2;${q(r)};${q(g)};${q(b)}m`;
+		};
+		let curFg = "";
+		let curBg = "";
+		// Emit an SGR change only where a cell actually needs one: a run of empty
+		// background costs one reset instead of one escape pair per cell, which
+		// roughly halves the bytes pushed to the terminal each frame.
+		const style = (fg: string, bg: string): string => {
+			let out = "";
+			if (curBg && bg !== curBg) {
+				out += "\x1b[0m";
+				curFg = "";
+				curBg = "";
+			}
+			if (bg && bg !== curBg) {
+				out += bg;
+				curBg = bg;
+			}
+			if (fg && fg !== curFg) {
+				out += fg;
+				curFg = fg;
+			}
+			return out;
+		};
 		for (let cy = 0; cy < charRows; cy++) {
 			let line = "";
+			curFg = "";
+			curBg = "";
 			for (let cx = 0; cx < cols; cx++) {
 				// Cell pixel offsets in mask order UL, UR, LL, LR.
-				const offs = [
-					(cy * 2 * W + cx * 2) * 4,
-					(cy * 2 * W + cx * 2 + 1) * 4,
-					((cy * 2 + 1) * W + cx * 2) * 4,
-					((cy * 2 + 1) * W + cx * 2 + 1) * 4,
-				];
-				const avg = (sel: number): Rgb => {
-					let r = 0;
-					let g = 0;
-					let b = 0;
-					let n = 0;
-					for (let i = 0; i < 4; i++) {
-						if (!(sel & (1 << i))) continue;
-						const o = offs[i]!;
-						r += px[o]!;
-						g += px[o + 1]!;
-						b += px[o + 2]!;
-						n += 1;
-					}
-					return [
-						Math.round(255 * (r / n) ** GAMMA),
-						Math.round(255 * (g / n) ** GAMMA),
-						Math.round(255 * (b / n) ** GAMMA),
-					];
-				};
+				offs[0] = (cy * 2 * W + cx * 2) * 4;
+				offs[1] = offs[0]! + 4;
+				offs[2] = ((cy * 2 + 1) * W + cx * 2) * 4;
+				offs[3] = offs[2]! + 4;
 				let mask = 0;
-				for (let i = 0; i < 4; i++) if (px[offs[i]! + 3]! > 0.2) mask |= 1 << i;
+				for (let i = 0; i < 4; i++) if (px[offs[i]! + 3]! > 0.12) mask |= 1 << i;
 				if (!mask) {
-					line += " ";
+					line += `${style("", "")} `;
 				} else if (mask === 15) {
 					// Interior: split pixels into bright/dark groups for detail.
-					const lums = offs.map((o) => px[o]! + px[o + 1]! + px[o + 2]!);
+					for (let i = 0; i < 4; i++) lums[i] = px[offs[i]!]! + px[offs[i]! + 1]! + px[offs[i]! + 2]!;
 					const mean = (lums[0]! + lums[1]! + lums[2]! + lums[3]!) / 4;
 					let brightMask = 0;
 					for (let i = 0; i < 4; i++) if (lums[i]! >= mean) brightMask |= 1 << i;
 					line +=
 						brightMask === 15
-							? `${fgSeq(avg(15))}█\x1b[0m`
-							: `${fgSeq(avg(brightMask))}${bgSeq(avg(15 & ~brightMask))}${QUAD[brightMask]}\x1b[0m`;
+							? `${style(seq(15, false), "")}█`
+							: `${style(seq(brightMask, false), seq(15 & ~brightMask, true))}${QUAD[brightMask]}`;
 				} else {
 					// Limb: draw only covered quadrants, background stays transparent.
-					line += `${fgSeq(avg(mask))}${QUAD[mask]}\x1b[0m`;
+					line += `${style(seq(mask, false), "")}${QUAD[mask]}`;
 				}
 			}
+			if (curFg || curBg) line += "\x1b[0m";
 			rows.push(this.centered(line, width));
 		}
 
