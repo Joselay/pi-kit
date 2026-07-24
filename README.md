@@ -39,6 +39,7 @@ Pi extensions live in [`extensions`](extensions):
 - [`todos/`](extensions/todos) - File-based todo management and task refinement.
 - [`translate/`](extensions/translate) - `/translate` live speech-to-speech translation via `gpt-realtime-translate`.
 - [`unified-edit/`](extensions/unified-edit) - Replaces `edit` with row edit scripts and Codex-style patches.
+- [`skills/`](extensions/skills) - Short skill slash commands: `/imagegen` autocompletes, expands, and color-highlights (instead of `/skill:imagegen`).
 - [`usage/`](extensions/usage) - Session usage and cost breakdown.
 - [`uv/`](extensions/uv) - Replaces bash with a `uv`-aware version.
 
