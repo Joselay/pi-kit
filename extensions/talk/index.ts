@@ -47,6 +47,10 @@ const DEFAULT_VOICE = "marin";
 // gpt-4o-mini-transcribe (methods_v2.rs REALTIME_V2_INPUT_TRANSCRIPTION_MODEL).
 const TRANSCRIBE_MODEL = process.env.PI_TALK_TRANSCRIBE_MODEL?.trim() || "gpt-realtime-whisper";
 const PLAYBACK_TAIL_MS = 250;
+// Longest a response.create is allowed to stay outstanding before the gate that
+// serializes them is forced back open. Generous: it only has to beat a response
+// that will never arrive.
+const RESPONSE_TIMEOUT_MS = 60_000;
 
 // Upstream realtime_conversation.rs constants.
 const BACKEND_PREFIX = "[BACKEND] ";
@@ -78,6 +82,19 @@ const VAD_THRESHOLD = VAD_THRESHOLD_ENV === "off" ? undefined : Number(VAD_THRES
 
 const MAX_TRANSCRIPT_ENTRIES = 40;
 const MAX_OUT_LEVELS = 600;
+// Ids of calls already handled and items already settled. Only the recent past
+// can still be referred to, and a long session should not accumulate every id
+// it ever saw.
+const MAX_TRACKED_IDS = 256;
+
+/** Records an id, evicting the oldest once the set is full (Sets keep order). */
+function remember(ids: Set<string>, id: string): void {
+	ids.add(id);
+	if (ids.size > MAX_TRACKED_IDS) {
+		const oldest = ids.values().next();
+		if (!oldest.done) ids.delete(oldest.value);
+	}
+}
 
 /** RMS loudness of a PCM16LE mono buffer, subsampled for cheapness; 0..1. */
 function pcmRms(buf: Buffer): number {
@@ -129,6 +146,7 @@ class TalkSession {
 	// response.create serialization (upstream RealtimeResponseCreateQueue).
 	private responseActive = false;
 	private pendingResponseCreate = false;
+	private responseTimer?: ReturnType<typeof setTimeout>;
 
 	private activeHandoff?: { callId: string };
 	private processedCalls = new Set<string>();
@@ -283,6 +301,7 @@ class TalkSession {
 			if (this.ws?.readyState === 1) this.ws.close();
 		} catch {}
 		if (this.renderTimer) clearTimeout(this.renderTimer);
+		if (this.responseTimer) clearTimeout(this.responseTimer);
 		if (userInitiated) {
 			this.pi.sendMessage(
 				{ customType: "talk-realtime", content: REALTIME_END, display: false },
@@ -316,7 +335,41 @@ class TalkSession {
 			this.pendingResponseCreate = true;
 			return;
 		}
+		this.sendResponseCreate();
+	}
+
+	/**
+	 * Actually put a response.create on the wire. Upstream's send_create_now marks
+	 * the response active as soon as it is sent rather than waiting for
+	 * response.created: two creates issued back to back — an agent finishing while
+	 * a steer lands, say — are separated by a round trip, and without the optimistic
+	 * flag the second one races through the open gate and the server rejects it.
+	 */
+	private sendResponseCreate(): void {
+		this.responseActive = true;
+		this.armResponseTimeout();
 		this.send({ type: "response.create" });
+	}
+
+	/**
+	 * Failsafe for the response gate. Everything that opens it is closed by a
+	 * `response.done`, but a response that never lands — or an active-response
+	 * error arriving after the response it referred to already finished — would
+	 * otherwise leave the gate shut and the voice mute for the rest of the
+	 * session. Reopening it late is a stray reply at worst.
+	 */
+	private armResponseTimeout(): void {
+		if (this.responseTimer) clearTimeout(this.responseTimer);
+		this.responseTimer = setTimeout(() => {
+			this.responseTimer = undefined;
+			if (!this.responseActive || this.closing) return;
+			this.responseActive = false;
+			if (this.pendingResponseCreate) {
+				this.pendingResponseCreate = false;
+				this.sendResponseCreate();
+			}
+		}, RESPONSE_TIMEOUT_MS);
+		this.responseTimer.unref?.();
 	}
 
 	// --- events from the realtime server ---
@@ -339,10 +392,14 @@ class TalkSession {
 				this.currentItemId = undefined;
 				this.playedBytes = 0;
 				this.responseActive = false;
+				if (this.responseTimer) {
+					clearTimeout(this.responseTimer);
+					this.responseTimer = undefined;
+				}
 				this.visualState = this.activeHandoff ? "working" : "listening";
 				if (this.pendingResponseCreate) {
 					this.pendingResponseCreate = false;
-					this.send({ type: "response.create" });
+					this.sendResponseCreate();
 				}
 				break;
 			case "response.output_audio.delta":
@@ -359,7 +416,7 @@ class TalkSession {
 			}
 			case "input_audio_buffer.speech_started":
 				this.visualState = "hearing";
-				this.onBargeIn(typeof msg.item_id === "string" ? msg.item_id : undefined);
+				this.onBargeIn();
 				break;
 			case "conversation.item.input_audio_transcription.delta":
 				this.streamDelta("you", msg.delta ?? "");
@@ -399,8 +456,15 @@ class TalkSession {
 					// once the active response finishes (upstream queue behavior).
 					this.responseActive = true;
 					this.pendingResponseCreate = true;
+					this.armResponseTimeout();
 				} else {
+					// Upstream tears the conversation down on any error event. A
+					// rejected session.update is the one that matters — the session
+					// stays up but with default instructions, no tools and no
+					// transcription — and a note under the globe was too quiet to
+					// notice, so surface it properly as well.
 					this.note(`error: ${clip(message, 110)}`);
+					if (this.ctx.hasUI) this.ctx.ui.notify(`talk: ${clip(message, 160)}`, "error");
 				}
 				break;
 			}
@@ -423,20 +487,36 @@ class TalkSession {
 		if (this.outLevels.length > MAX_OUT_LEVELS) this.outLevels.splice(0, this.outLevels.length - MAX_OUT_LEVELS);
 	}
 
-	private onBargeIn(speechItemId?: string): void {
+	/**
+	 * How much of the current assistant item the user actually heard, in ms.
+	 * Chunks arrive faster than realtime, so the bytes received are ahead of the
+	 * speaker; whatever is still queued behind the playback clock was cut off by
+	 * the barge-in and was never heard.
+	 */
+	private playedMs(): number {
+		const receivedMs = (this.playedBytes / 2 / SAMPLE_RATE) * 1000;
+		const queuedMs = Math.max(0, this.playbackEndsAt - Date.now());
+		return Math.max(0, Math.round(receivedMs - queuedMs));
+	}
+
+	private onBargeIn(): void {
 		// The user started talking mid-reply: truncate the assistant item to what
-		// was actually heard (upstream takes the tracked output item and sends
-		// conversation.item.truncate, but only when the event's item_id is absent
-		// or matches it), then stop local playback immediately.
+		// was actually heard, then stop local playback immediately.
+		//
+		// Upstream also requires the event's item_id to match the tracked output
+		// item, but on the GA endpoint speech_started carries the id of the *user*
+		// item the server will create when speech stops — never the assistant's
+		// audio item — so that guard would make this dead code and the server
+		// would keep believing it said the whole reply.
 		if (!this.currentItemId && !this.isPlaying()) return;
 		const itemId = this.currentItemId;
 		this.currentItemId = undefined;
-		if (itemId && (!speechItemId || speechItemId === itemId)) {
+		if (itemId) {
 			this.send({
 				type: "conversation.item.truncate",
 				item_id: itemId,
 				content_index: 0,
-				audio_end_ms: Math.round((this.playedBytes / 2 / SAMPLE_RATE) * 1000),
+				audio_end_ms: this.playedMs(),
 			});
 		}
 		this.playedBytes = 0;
@@ -446,7 +526,7 @@ class TalkSession {
 		// What was actually spoken before the interruption is the honest record of
 		// this item, so keep it and ignore the full transcript the server sends
 		// afterwards — that arrives late and would read as the reply twice.
-		if (this.endLine("asst") && itemId) this.settledItems.add(itemId);
+		if (this.endLine("asst") && itemId) remember(this.settledItems, itemId);
 	}
 
 	// --- background_agent handoff (the Codex intermediary/backend loop) ---
@@ -457,7 +537,7 @@ class TalkSession {
 		// audio item on both handoff and noop requests.
 		const callId = item?.call_id ?? item?.id;
 		if (!callId || this.processedCalls.has(callId)) return;
-		this.processedCalls.add(callId);
+		remember(this.processedCalls, callId);
 		this.currentItemId = undefined;
 		this.playedBytes = 0;
 
@@ -475,20 +555,56 @@ class TalkSession {
 			return;
 		}
 
-		const busy = this.activeHandoff !== undefined || !this.ctx.isIdle();
 		// The prompt itself lands in the scrollback as a user message a moment
 		// later, and it is what you just said out loud — echoing it here only
 		// spent a row of the panel repeating you.
-		this.note(busy ? "→ steering the agent" : "→ handed to the agent");
-		if (busy) {
+		//
+		// Upstream keys this on whether a handoff is already outstanding, not on
+		// whether the agent happens to be busy. A turn the user started by typing
+		// is busy but has no handoff behind it, and acknowledging that as mere
+		// steering left this call with nobody to complete it — the agent would
+		// finish and the voice would never say so.
+		if (this.activeHandoff) {
+			this.note("→ steering the agent");
 			this.visualState = "thinking";
-			this.pi.sendUserMessage(prompt, { deliverAs: "steer" });
+			this.deliverPrompt(prompt, true);
 			this.sendFunctionOutput(callId, STEER_ACK);
 			this.createResponse();
-		} else {
-			this.activeHandoff = { callId };
-			this.visualState = "working";
-			this.pi.sendUserMessage(prompt);
+			return;
+		}
+		const streaming = !this.ctx.isIdle();
+		this.note(streaming ? "→ steering the agent" : "→ handed to the agent");
+		this.activeHandoff = { callId };
+		this.visualState = "working";
+		if (!this.deliverPrompt(prompt, streaming)) {
+			// Nothing will ever complete this call now, and a function call left
+			// unanswered stops the model producing any further response at all.
+			this.activeHandoff = undefined;
+			this.visualState = "listening";
+			this.sendFunctionOutput(callId, "Could not reach the agent.");
+			this.createResponse();
+		}
+	}
+
+	/**
+	 * Hands a prompt to the coding agent; false when it could not be delivered.
+	 * `sendUserMessage` throws if the agent turns out to be streaming and no
+	 * delivery mode was given, and `isIdle()` can go stale between the check and
+	 * the send, so an unqualified send gets one retry as a steer.
+	 */
+	private deliverPrompt(prompt: string, steer: boolean): boolean {
+		try {
+			this.pi.sendUserMessage(prompt, steer ? { deliverAs: "steer" } : undefined);
+			return true;
+		} catch (error) {
+			if (!steer) {
+				try {
+					this.pi.sendUserMessage(prompt, { deliverAs: "steer" });
+					return true;
+				} catch {}
+			}
+			this.note(`agent handoff failed: ${clip(errorText(error), 80)}`);
+			return false;
 		}
 	}
 
@@ -501,6 +617,12 @@ class TalkSession {
 		// the prefix when the text already carries it.
 		const prefixed = text.startsWith(BACKEND_PREFIX) ? text : BACKEND_PREFIX + text;
 		this.sendUserItem(truncateToTokens(prefixed, BACKEND_OUTPUT_TOKEN_BUDGET));
+		// With a handoff outstanding, its tool result is what will prompt the
+		// model to speak. Without one — the user typed straight to the agent —
+		// nothing else would, so ask for a response here (upstream's standalone
+		// handoff does the same) and let `remain_silent` decline it. That tool
+		// was otherwise unreachable, having no response to opt out of.
+		if (!this.activeHandoff) this.createResponse();
 	}
 
 	onAgentEnd(): void {
@@ -531,7 +653,7 @@ class TalkSession {
 	private alreadySettled(itemId: unknown): boolean {
 		if (typeof itemId !== "string" || !itemId) return false;
 		if (this.settledItems.has(itemId)) return true;
-		this.settledItems.add(itemId);
+		remember(this.settledItems, itemId);
 		return false;
 	}
 
@@ -614,7 +736,12 @@ export default function talk(pi: ExtensionAPI) {
 	let active: TalkSession | undefined;
 
 	pi.on("message_end", (event) => active?.onAgentMessage(event.message));
-	pi.on("agent_end", () => active?.onAgentEnd());
+	// `agent_end` closes one low-level run, after which pi may still auto-retry,
+	// auto-compact, or pick up a queued follow-up — and the steer path queues one
+	// by design. Completing the handoff there had the voice announcing the result
+	// while the agent was still working. `agent_settled` is the point nothing
+	// further runs on its own.
+	pi.on("agent_settled", () => active?.onAgentEnd());
 	pi.on("input", (event) => {
 		// Mirror the user's own typed input (not extension-injected handoffs).
 		if (active && event.source !== "extension") active.onUserTyped(event.text);
