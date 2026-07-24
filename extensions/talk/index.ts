@@ -597,6 +597,7 @@ const COS_TILT = Math.cos(TILT);
 const HALO = 0.2; // atmosphere thickness outside the limb, in globe radii
 const FRAME_MS = 50;
 const HIST_MS = 80; // VU strip scroll cadence, independent of framerate
+const LABEL_HOLD_S = 2.5; // how long a state change stays spelled out
 
 /** Frame-rate independent smoothing factor for an exponential approach. */
 function ease(rate: number, dt: number): number {
@@ -636,6 +637,8 @@ class TalkVisual {
 	private churn = 1.4;
 	private sparkAmt = 0;
 	private condense = 1;
+	private lastState?: TalkVisualState;
+	private labelHold = LABEL_HOLD_S;
 	private history: number[] = [];
 	private pixels?: Float32Array; // reused across frames
 	private timer: ReturnType<typeof setInterval>;
@@ -667,6 +670,16 @@ class TalkVisual {
 		this.spin += (0.7 + this.level * 2.5) * dt;
 
 		const state = this.getState();
+		// Each state has its own motion — motes, sparks, audio swell — so the
+		// name is only spelled out around the change, when the motion has not
+		// established itself yet.
+		if (state !== this.lastState) {
+			this.lastState = state;
+			this.labelHold = LABEL_HOLD_S;
+		} else if (this.labelHold > 0) {
+			this.labelHold = Math.max(0, this.labelHold - dt);
+		}
+
 		const [ta, tb] = STATE_COLORS[state];
 		const cf = ease(5, dt);
 		for (let i = 0; i < 3; i++) {
@@ -700,11 +713,14 @@ class TalkVisual {
 		const color: OrbColor =
 			state === "hearing" ? "success" : state === "working" || state === "thinking" ? "warning" : "accent";
 		const rows = this.renderOrb(width, state);
-		// State and level share one line: the globe already shows the level right
-		// now, the strip is there to show it was live a moment ago.
-		const label = this.theme.fg(color, `● ${ORB_LABELS[state]}`);
+		// One line for both: the globe shows the level right now, the strip shows
+		// it was live a moment ago, and the state name comes and goes. Whatever
+		// is present stays centred under the globe, so the strip slides once when
+		// the name drops away rather than sitting off-centre forever.
+		const label = this.labelHold > 0 ? `● ${ORB_LABELS[state]}` : "";
 		const bars = Math.max(0, Math.min(16, width - visibleWidth(label) - 4));
-		rows.push(this.centered(bars ? `${label}  ${this.strip(bars, color)}` : label, width));
+		const parts = [label && this.theme.fg(color, label), bars && this.strip(bars, color)].filter(Boolean);
+		rows.push(this.centered(parts.join("  "), width));
 		return rows;
 	}
 
