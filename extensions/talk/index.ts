@@ -545,33 +545,35 @@ function buildStartupContext(ctx: ExtensionContext): string {
 type TalkVisualState = "connecting" | "listening" | "hearing" | "thinking" | "speaking" | "working";
 
 type Rgb = readonly [number, number, number];
-// Two-tone plasma gradient per state for the true-color globe. With no caption
-// under the globe, hue is the only thing naming the state, so the six sit in
-// distinct families: slate, cyan, green, magenta, indigo, amber.
+// Two-tone gradient per state for the true-color globe. With no caption under
+// the globe, hue is the only thing naming the state, so the six sit in distinct
+// families: slate, cyan, green, magenta, indigo, amber. The dark tone shades the
+// shadowed half of each surface band, the bright tone the lit half, and the
+// bright tone alone tints the ring, the storms and the inner glow.
 const STATE_COLORS: Record<TalkVisualState, readonly [Rgb, Rgb]> = {
 	connecting: [
-		[55, 65, 90],
-		[110, 125, 160],
+		[40, 48, 70],
+		[120, 140, 175],
 	],
 	listening: [
-		[18, 60, 160],
-		[64, 190, 255],
+		[14, 46, 130],
+		[80, 200, 255],
 	],
 	hearing: [
-		[10, 120, 80],
-		[90, 240, 160],
+		[8, 100, 74],
+		[110, 250, 170],
 	],
 	thinking: [
-		[110, 30, 150],
-		[255, 95, 210],
+		[96, 24, 132],
+		[255, 110, 215],
 	],
 	speaking: [
-		[55, 70, 220],
-		[150, 140, 255],
+		[40, 52, 190],
+		[130, 120, 255],
 	],
 	working: [
-		[190, 110, 30],
-		[255, 190, 80],
+		[168, 92, 22],
+		[255, 195, 90],
 	],
 };
 const RIM_TINT: Rgb = [90, 128, 217]; // cool edge light, 0..255
@@ -579,13 +581,52 @@ const SPARK_COLOR: Rgb = [255, 226, 130];
 const POLE_TINT: Rgb = [200, 236, 255]; // polar aurora
 // Quadrant glyph indexed by pixel mask: UL=1, UR=2, LL=4, LR=8.
 const QUAD = [" ", "▘", "▝", "▀", "▖", "▌", "▞", "▛", "▗", "▚", "▐", "▜", "▄", "▙", "▟", "█"] as const;
-// Spin axis tipped toward the viewer, so one pole stays visible and the
-// parallels curve; without it a spinning sphere reads as a cylinder.
-const TILT = 0.42;
+// Spin axis tipped toward the viewer, so one pole stays visible, the bands
+// curve, and the ring opens into an ellipse instead of collapsing to a line.
+const TILT = 0.45;
 const SIN_TILT = Math.sin(TILT);
 const COS_TILT = Math.cos(TILT);
-const HALO = 0.2; // atmosphere thickness outside the limb, in globe radii
-const FRAME_MS = 50;
+const HALO = 0.26; // atmosphere thickness outside the limb, in globe radii
+const FRAME_MS = 33;
+const CHAR_ROWS = 8;
+// A quadrant "pixel" is half a cell wide and half a cell tall, and cells are
+// about twice as tall as they are wide — so a pixel is twice as tall as it is
+// wide. Every length below is in vertical pixels and scales by this
+// horizontally, which is what makes the disc an actual circle.
+const PIXEL_ASPECT = 2;
+const GLOBE_R = 5.2; // globe radius, in vertical pixels of the 16-pixel canvas
+const RING_R = 1.5; // outermost ring radius, in globe radii
+
+/**
+ * Concentric strands of the ring, with a gap between the inner pair and the
+ * outer one. Each carries its own count of travelling bright arcs (`k`) at its
+ * own rate (`sp`), so the ring shows its rotation instead of sitting there as a
+ * painted-on ellipse.
+ */
+const STRANDS = [
+	{ r: 1.22, w: 0.5, k: 3, sp: 1.0 },
+	{ r: 1.32, w: 0.95, k: 2, sp: 1.35 },
+	{ r: 1.46, w: 0.4, k: 4, sp: 0.75 },
+];
+
+/**
+ * Storm spots fixed to the surface. At a dozen pixels across a meridian
+ * graticule is either invisible or aliased into moire, but a handful of
+ * landmarks appearing at one limb and crossing to the other make the rotation
+ * unmistakable. Latitudes are spaced by the golden ratio and longitudes by the
+ * golden angle so the six never line up, and each drifts at its own rate so the
+ * face never repeats exactly.
+ */
+const SPOTS = Array.from({ length: 6 }, (_, i) => {
+	const lat = (((i * 0.618) % 1) - 0.5) * 1.5;
+	return {
+		lon: i * 2.39996, // golden angle, in radians
+		drift: 0.05 + ((i * 0.37) % 1) * 0.12,
+		size: 0.34 + ((i * 0.29) % 1) * 0.3,
+		cosLat: Math.cos(lat),
+		sinLat: Math.sin(lat),
+	};
+});
 
 /** Frame-rate independent smoothing factor for an exponential approach. */
 function ease(rate: number, dt: number): number {
@@ -608,11 +649,14 @@ function pcmRms(buf: Buffer): number {
 }
 
 /**
- * The talk visualizer widget: a true-color 3D plasma globe, and nothing else —
- * no caption, no meter. Live audio spins it faster, swells it, and lights it
- * from within; it gathers itself out of inbound motes while connecting, churns
- * while thinking, grows orbiting sparks while the agent works, and carries the
- * state in its hue.
+ * The talk visualizer widget: a true-color 3D globe with a ring in its own
+ * equatorial plane, and nothing else — no caption, no strip. Two channels carry
+ * the whole session: the hue says which state it is in, and the ring meters
+ * energy — loudness while audio flows, the agent's own machinery when there is
+ * nothing to hear. Live audio also spins the globe faster, swells it and lights
+ * it from within; matter spirals in and flattens into the ring while
+ * connecting, the surface churns while thinking, and the ring burns amber while
+ * the agent works.
  */
 class TalkVisual {
 	private clock = 0; // seconds since mount; drives every time-based motion
@@ -622,9 +666,12 @@ class TalkVisual {
 	// Per-state drivers, smoothed so a state change crossfades instead of popping.
 	private readonly colA: [number, number, number];
 	private readonly colB: [number, number, number];
-	private churn = 1.4;
+	private churn = 1;
 	private sparkAmt = 0;
 	private condense = 1;
+	private busy = 0; // machinery running with no audio to measure
+	private energy = 0; // what the ring meters: loudness, or busyness when silent
+	private orbit = 0; // accumulated ring rotation; energy accelerates it
 	private pixels?: Float32Array; // reused across frames
 	private timer: ReturnType<typeof setInterval>;
 
@@ -652,7 +699,7 @@ class TalkVisual {
 		// Fast attack, slow release: snap to speech onsets, ease out after.
 		const target = this.getLevel();
 		this.level += (target - this.level) * ease(target > this.level ? 10 : 2.5, dt);
-		this.spin += (0.7 + this.level * 2.5) * dt;
+		this.spin += (0.42 + this.level * 1.1) * dt;
 
 		const state = this.getState();
 		const [ta, tb] = STATE_COLORS[state];
@@ -662,10 +709,16 @@ class TalkVisual {
 			this.colB[i]! += (tb[i]! - this.colB[i]!) * cf;
 		}
 		const audio = state === "speaking" || state === "hearing";
-		const churn = state === "thinking" ? 2.4 : 1.4 + (audio ? this.level : 0);
+		const churn = state === "thinking" ? 2.2 : 0.9 + (audio ? this.level * 0.9 : 0);
 		this.churn += (churn - this.churn) * ease(4, dt);
 		this.sparkAmt += ((state === "working" ? 1 : 0) - this.sparkAmt) * ease(3.5, dt);
 		this.condense += ((state === "connecting" ? 1 : 0) - this.condense) * ease(2.5, dt);
+		// The ring meters energy. While audio is flowing that is live loudness;
+		// while the agent is thinking or working there is nothing to hear, so it
+		// meters the machinery instead and the ring keeps turning on its own.
+		this.busy += ((state === "working" ? 0.85 : state === "thinking" ? 0.45 : 0) - this.busy) * ease(3, dt);
+		this.energy = Math.max(audio ? this.level : 0, this.busy);
+		this.orbit += (0.6 + this.energy * 2.4) * dt;
 		this.tui.requestRender();
 	}
 
@@ -681,106 +734,181 @@ class TalkVisual {
 	}
 
 	// A true-color 3D globe rendered in quadrant-block "pixels" (2x2 per
-	// character cell) with 2x2 supersampling per pixel. Each sample is
-	// projected onto a tilted sphere and shaded with Lambert diffuse from a
-	// drifting light, a specular hot spot, a cool rim light, a polar aurora, an
-	// anti-aliased limb and a scattering atmosphere just outside it, over
-	// swirling two-tone plasma bands crossed by a meridian/parallel graticule
-	// that makes the rotation read. Interior cells split their four pixels into
-	// bright/dark groups (fg/bg) so real detail survives the two-colors-per-cell
-	// limit; edge cells keep a transparent background. Audio spins it faster,
-	// swells it, and lights it from within.
+	// character cell) with 2x2 supersampling per pixel. Each sample is projected
+	// onto a tilted sphere and shaded with wrapped Lambert diffuse from a
+	// drifting key light, a dim opposite fill, a tight specular hot spot, a cool
+	// fresnel rim, a polar aurora and a scattering atmosphere just outside the
+	// limb, over warped latitude bands crossed by storm spots that ride the
+	// rotation. A three-strand ring in the globe's own equatorial plane passes
+	// behind the far limb and across the lit face. Interior cells split their
+	// four pixels into bright/dark groups (fg/bg) when there is contrast to keep,
+	// so real detail survives the two-colors-per-cell limit without quantizing
+	// smooth gradients into speckle; edge cells keep a transparent background.
 	private renderOrb(width: number, state: TalkVisualState): string[] {
 		const audio = state === "speaking" || state === "hearing";
-		const t = this.clock * 1.25;
-		const spin = this.spin;
+		const t = this.clock;
 		const level = this.level;
-		const cols = Math.min(21, Math.max(17, width - 4));
-		const charRows = 8;
+		const H = CHAR_ROWS * 2;
+		// Wide enough for the globe and its ring, never wider than the box it is
+		// drawn into; the radius then shrinks to whatever actually fits.
+		const cols = Math.max(9, Math.min(Math.ceil(GLOBE_R * RING_R * 2) + 1, width - 2));
 		const W = cols * 2;
-		const H = charRows * 2;
 		const rows: string[] = [];
 
-		// Live audio swells the globe; idle states breathe gently instead. While
+		// Live audio swells the globe, gently — the ring is the loudness tell, and
+		// the body only needs to agree with it. Idle states breathe instead. While
 		// matter is still condensing the globe sits small and translucent, then
 		// inflates and solidifies as `condense` decays, so connecting flows into
 		// listening without a cut.
-		const swell = audio ? level * 0.16 : 0.03 * Math.sin(t * 0.7);
-		const seed = 0.62 + 0.04 * Math.sin(t * 1.6);
-		const edgeBase = seed + (0.8 + swell - seed) * (1 - this.condense);
+		const swell = audio ? level * 0.08 : 0.025 * Math.sin(t * 0.7);
+		const grow = 0.72 + 0.28 * (1 - this.condense);
 		const form = 0.5 + 0.5 * (1 - this.condense);
-		// Light drifting around the upper hemisphere; half vector for specular.
-		const ln = Math.hypot(0.62 * Math.cos(t * 0.3), -0.52, 0.6);
-		const lx = (0.62 * Math.cos(t * 0.3)) / ln;
-		const ly = -0.52 / ln;
-		const lz = 0.6 / ln;
+		const R = Math.min(GLOBE_R, cols / 2 / RING_R) * (1 + swell) * grow;
+
+		const cosSpin = Math.cos(this.spin);
+		const sinSpin = Math.sin(this.spin);
+		const churn = this.churn;
+		const ca = this.colA;
+		const cb = this.colB;
+		const glowAmt = audio ? level : 0;
+
+		// Key light drifting slowly around the upper left; half vector for specular.
+		const la = 0.5 + 0.35 * Math.sin(t * 0.25);
+		const ln = Math.hypot(-la, -0.6, 0.62);
+		const lx = -la / ln;
+		const ly = -0.6 / ln;
+		const lz = 0.62 / ln;
+		// Dim fill from the opposite side. Without it the unlit limb falls all the
+		// way to background black and the silhouette stops reading as a circle.
+		const fn = Math.hypot(la, 0.5, 0.5);
+		const fx = la / fn;
+		const fy = 0.5 / fn;
+		const fz = 0.5 / fn;
 		const hn = Math.hypot(lx, ly, lz + 1);
 		const hx = lx / hn;
 		const hy = ly / hn;
 		const hz = (lz + 1) / hn;
-		// Thinking churns the surface harder; audio adds turbulence with level.
-		const churn = this.churn;
-		const ca = this.colA;
-		const cb = this.colB;
+
+		// Storm centres as unit vectors in the globe's own frame, so comparing them
+		// against a sample is one dot product and no trigonometry per pixel.
+		const spots = SPOTS.map((s) => {
+			const lon = s.lon + s.drift * t;
+			return {
+				x: s.cosLat * Math.sin(lon),
+				y: s.sinLat,
+				z: s.cosLat * Math.cos(lon),
+				inner: 1 - s.size,
+				inv: 1 / s.size,
+			};
+		});
 
 		// Shade one sample point into `smp` as pre-gamma rgb (0..1) premultiplied
 		// by coverage, plus that coverage; false when the sample misses both the
 		// globe and its atmosphere. A shared scratch buffer keeps this allocation
 		// free — it runs a few thousand times per frame.
+		const OUT = (1 + HALO) * (1 + HALO);
 		const smp = new Float32Array(4);
 		const shade = (nx: number, ny: number): boolean => {
-			const angle = Math.atan2(ny, nx);
-			const radius = Math.hypot(nx, ny);
-			const wobble =
-				0.035 * Math.sin(angle * 3 + t * 1.3) +
-				0.022 * Math.sin(angle * 2 - t * 1.8) +
-				(audio ? 0.045 * level * Math.sin(angle * 5 + spin * 1.6) : 0);
-			const edge = Math.min(1, edgeBase + wobble);
-			if (radius > edge + HALO) return false;
-			if (radius > edge) {
-				// Atmosphere: scattered light hugging the limb, strongest on the
-				// lit side and fading outward, which gives the globe depth
-				// against the background instead of a hard cutout edge.
-				const fall = 1 - (radius - edge) / HALO;
-				const facing = 0.35 + 0.65 * Math.max(0, (nx * lx + ny * ly) / radius);
-				const a = fall * fall * facing * (0.5 + 0.5 * (audio ? level : 0)) * 0.55 * form;
-				for (let i = 0; i < 3; i++) smp[i] = ((RIM_TINT[i]! * 0.55 + cb[i]! * 0.45) / 255) * a;
-				smp[3] = a;
-				return true;
+			const d2 = nx * nx + ny * ny;
+			if (d2 > OUT) return false;
+			const r = Math.sqrt(d2);
+			let cr = 0;
+			let cg = 0;
+			let cbl = 0;
+			let alpha = 0;
+
+			// Analytic limb coverage — one pixel of feather right at the edge — so
+			// the silhouette is a clean anti-aliased circle at any radius, without
+			// the supersampler having to resolve it.
+			const cov = Math.min(1, (1 - r) * R + 0.5);
+			if (cov > 0) {
+				const sz = Math.sqrt(Math.max(0, 1 - d2));
+				const ndl = nx * lx + ny * ly + sz * lz;
+				// Wrapped diffuse: softens the terminator so the shadowed side still
+				// carries some shape instead of going flat black.
+				const diffuse = Math.max(0, (ndl + 0.22) / 1.22);
+				const fill = Math.max(0, nx * fx + ny * fy + sz * fz) * 0.2;
+				let s = nx * hx + ny * hy + sz * hz;
+				s = s > 0 ? s : 0;
+				// ^32 by repeated squaring rather than Math.pow, which is several
+				// times the cost of the whole rest of this function per sample.
+				const s2 = s * s;
+				const s4 = s2 * s2;
+				const s8 = s4 * s4;
+				const s16 = s8 * s8;
+				const spec = s16 * s16; // a tight highlight rather than a wash
+				const fres = 1 - sz;
+				const rim = fres * fres * fres * 0.55;
+
+				// Globe frame: untilt onto the spin axis, then unspin, so everything
+				// below is fixed to the surface and rides the rotation.
+				const ty = ny * COS_TILT - sz * SIN_TILT;
+				const tz = ny * SIN_TILT + sz * COS_TILT;
+				const gx = nx * cosSpin + tz * sinSpin;
+				const gz = -nx * sinSpin + tz * cosSpin;
+
+				// Latitude bands warped by a slow swirl, the way a gas giant reads.
+				// Being latitude-aligned they never alias into moire the way
+				// meridians do at this resolution. Compressed rather than full
+				// swing: at full contrast the dark half of a band reads as a dent in
+				// the sphere rather than as a marking on it.
+				const raw = 0.5 + 0.5 * Math.sin(ty * 7.2 + 0.5 * churn * Math.sin(gx * 2.4 + gz * 1.3 + t * 0.8));
+				const band = 0.24 + 0.62 * raw * raw * (3 - 2 * raw);
+
+				let spot = 0;
+				for (const p of spots) {
+					const dot = gx * p.x + ty * p.y + gz * p.z;
+					if (dot <= p.inner) continue;
+					const m = Math.min(1, (dot - p.inner) * p.inv);
+					spot += m * m * (3 - 2 * m);
+				}
+				if (spot > 1) spot = 1;
+
+				// Polar aurora: cold light capping the axis, brightest where the
+				// surface turns away from the light, so the night side is not dead.
+				const polar = Math.max(0, Math.abs(ty) - 0.7) / 0.3;
+				const cap = polar * polar * (0.2 + 0.5 * (1 - diffuse));
+				// Live audio lights the globe from within.
+				const emis = glowAmt * 0.22 * (1 - d2);
+				const light = 0.07 + 0.93 * diffuse + fill;
+				const a = cov * form;
+				for (let i = 0; i < 3; i++) {
+					const base = (ca[i]! + (cb[i]! - ca[i]!) * band) / 255;
+					const hot = cb[i]! / 255;
+					const v =
+						base * light +
+						spot * 0.55 * hot * (0.3 + 0.7 * diffuse) +
+						spot * spot * 0.16 +
+						emis * hot +
+						spec * 0.26 +
+						(rim * RIM_TINT[i]! + cap * POLE_TINT[i]!) / 255;
+					const c = (v > 1 ? 1 : v) * a;
+					if (i === 0) cr = c;
+					else if (i === 1) cg = c;
+					else cbl = c;
+				}
+				alpha = a;
 			}
-			const sx = nx / edge;
-			const sy = ny / edge;
-			const sz = Math.sqrt(Math.max(0, 1 - sx * sx - sy * sy));
-			const diffuse = Math.max(0, sx * lx + sy * ly + sz * lz);
-			const spec = Math.max(0, sx * hx + sy * hy + sz * hz) ** 32;
-			const rim = (1 - sz) ** 3 * 0.28;
-			// Tip the spin axis toward the viewer before taking lat/lon, so the
-			// pole stays in view and the parallels curve across the disc.
-			const ty = sy * COS_TILT - sz * SIN_TILT;
-			const tz = sy * SIN_TILT + sz * COS_TILT;
-			const lon = Math.atan2(sx, tz) + spin;
-			const lat = Math.asin(Math.max(-1, Math.min(1, ty)));
-			const band = 0.5 + 0.5 * Math.sin(lon * 2.6 + Math.sin(lat * 2.2 + spin * 0.6) * churn);
-			const detail = 0.9 + 0.1 * Math.sin(lon * 6 + Math.sin(lat * 4 + spin * 1.3) * 2);
-			const glow = audio ? level * 0.45 * (1 - radius / edge) : 0;
-			// Meridian/parallel graticule scrolling with the spin so the
-			// rotation reads as a turning globe: thin, front-facing, fading
-			// into the shadowed hemisphere and compressing toward the limb.
-			const meridian = Math.abs(Math.cos(lon * 6)) ** 18;
-			const parallel = Math.abs(Math.cos(lat * 6)) ** 18;
-			const grid = Math.max(meridian, parallel) * sz * (0.3 + 0.7 * diffuse);
-			// Polar aurora: cold light capping the axis, brightest where the
-			// surface turns away from the light, so the night side is not dead.
-			const polar = Math.max(0, Math.abs(ty) - 0.74) / 0.26;
-			const cap = polar * polar * (0.25 + 0.45 * (1 - diffuse));
-			const light = (0.1 + 0.9 * diffuse) * detail + glow + grid * 0.32;
-			const aa = Math.min(1, (edge - radius) * 10) * form;
-			for (let i = 0; i < 3; i++) {
-				const base = (ca[i]! + (cb[i]! - ca[i]!) * band) / 255;
-				const v = base * light + spec * 0.85 + (rim * RIM_TINT[i]! + cap * POLE_TINT[i]!) / 255;
-				smp[i] = Math.max(0, Math.min(1, v)) * aa;
+
+			// Atmosphere: scattered light hugging the limb, strongest on the lit
+			// side and fading outward, which gives the globe depth against the
+			// background instead of a hard cutout edge.
+			const fall = 1 - Math.max(0, r - 0.94) / HALO;
+			if (fall > 0 && r > 0.6) {
+				const facing = 0.45 + 0.55 * Math.max(0, (nx * lx + ny * ly) / (r || 1));
+				const a = fall * fall * facing * (0.5 + 0.5 * glowAmt) * 0.85 * form * (1 - cov * 0.55);
+				if (a > 0) {
+					cr += ((RIM_TINT[0] * 0.5 + cb[0]! * 0.5) / 255) * a;
+					cg += ((RIM_TINT[1] * 0.5 + cb[1]! * 0.5) / 255) * a;
+					cbl += ((RIM_TINT[2] * 0.5 + cb[2]! * 0.5) / 255) * a;
+					alpha += a;
+				}
 			}
-			smp[3] = aa;
+			if (alpha <= 0) return false;
+			smp[0] = cr;
+			smp[1] = cg;
+			smp[2] = cbl;
+			smp[3] = alpha > 1 ? 1 : alpha;
 			return true;
 		};
 
@@ -792,8 +920,8 @@ class TalkVisual {
 		px.fill(0);
 		const midX = (W - 1) / 2;
 		const midY = (H - 1) / 2;
-		const scaleX = W * 0.45;
-		const scaleY = H * 0.48;
+		const scaleX = 1 / (R * PIXEL_ASPECT);
+		const scaleY = 1 / R;
 		for (let py = 0; py < H; py++) {
 			for (let x = 0; x < W; x++) {
 				let r = 0;
@@ -803,7 +931,7 @@ class TalkVisual {
 				for (let s = 0; s < 4; s++) {
 					const dx = s & 1 ? 0.25 : -0.25;
 					const dy = s & 2 ? 0.25 : -0.25;
-					if (!shade((x + dx - midX) / scaleX, (py + dy - midY) / scaleY)) continue;
+					if (!shade((x + dx - midX) * scaleX, (py + dy - midY) * scaleY)) continue;
 					r += smp[0]!;
 					g += smp[1]!;
 					b += smp[2]!;
@@ -818,64 +946,105 @@ class TalkVisual {
 			}
 		}
 
-		// Plot one mote at a globe-space position (in radii). The same axial tilt
+		// Plot one point at a globe-space position (in radii). The same axial tilt
 		// as the surface takes it to view space, anything on the far side is
 		// occluded by the globe rather than drawn over it, and the blend is
-		// additive so a mote crossing the lit face reads as a highlight instead
+		// additive so a point crossing the lit face reads as a highlight instead
 		// of a hole punched in the surface.
-		const plot = (gx: number, gy: number, gz: number, tint: Rgb, weight: number): void => {
+		const plot = (gx: number, gy: number, gz: number, tint: Rgb, weight: number, rad: number): void => {
 			const vy = gy * COS_TILT + gz * SIN_TILT;
 			const vz = -gy * SIN_TILT + gz * COS_TILT;
-			if (vz < 0 && Math.hypot(gx, vy) < 1) return;
-			const w = weight * (0.45 + 0.55 * ((vz / (Math.hypot(gx, gy, gz) || 1) + 1) / 2));
-			if (w <= 0.02) return;
-			const sy = Math.round(midY + vy * edgeBase * scaleY);
-			if (sy < 0 || sy >= H) return;
-			const sx = Math.round(midX + gx * edgeBase * scaleX);
-			for (let d = 0; d < 2; d++) {
-				const xx = sx + d;
-				if (xx < 0 || xx >= W) continue;
-				const o = (sy * W + xx) * 4;
-				for (let i = 0; i < 3; i++) px[o + i] = Math.min(1, px[o + i]! + (tint[i]! / 255) * w);
-				px[o + 3] = Math.min(1, px[o + 3]! + w);
+			let w = weight;
+			if (vz < 0) {
+				// Going behind: fade across the limb instead of clipping, so a point
+				// sinks under the globe and comes back out rather than blinking.
+				const occ = (Math.hypot(gx, vy) - 1) / 0.14;
+				if (occ <= 0) return;
+				if (occ < 1) w *= occ;
+			}
+			w *= 0.45 + 0.55 * ((vz / (Math.hypot(gx, gy, gz) || 1) + 1) / 2);
+			if (w <= 0.015) return;
+			// Sub-pixel splat: a round, anti-aliased falloff, stretched
+			// horizontally because pixels are half as wide as they are tall, so it
+			// stays circular on screen and glides between pixels instead of
+			// snapping from one to the next.
+			const cx = midX + gx * R * PIXEL_ASPECT;
+			const cy = midY + vy * R;
+			const radX = rad * PIXEL_ASPECT;
+			const y1 = Math.floor(cy + rad);
+			const x1 = Math.floor(cx + radX);
+			for (let yy = Math.ceil(cy - rad); yy <= y1; yy++) {
+				if (yy < 0 || yy >= H) continue;
+				const dy = (yy - cy) / rad;
+				const dy2 = dy * dy;
+				for (let xx = Math.ceil(cx - radX); xx <= x1; xx++) {
+					if (xx < 0 || xx >= W) continue;
+					const dx = (xx - cx) / radX;
+					const d2 = dx * dx + dy2;
+					if (d2 >= 1) continue;
+					const f = 1 - d2;
+					const ww = w * f * f;
+					const o = (yy * W + xx) * 4;
+					for (let i = 0; i < 3; i++) px[o + i] = Math.min(1, px[o + i]! + (tint[i]! / 255) * ww);
+					px[o + 3] = Math.min(1, px[o + 3]! + ww);
+				}
 			}
 		};
 
-		// Sparks orbit the globe while the agent works, on three inclined rings
-		// that actually go around it. Each trails a short comet tail, drawn
-		// tail-first so the bright head wins shared pixels, and the whole swarm
-		// fades in and out with the state instead of popping.
-		if (this.sparkAmt > 0.02) {
-			const TRAIL = 6;
-			const ORBIT = 1.14; // radii; just clear of the atmosphere
-			for (let k = 0; k < 3; k++) {
-				const si = Math.sin(0.3 + k * 0.55);
-				const ci = Math.cos(0.3 + k * 0.55);
-				for (let tr = TRAIL - 1; tr >= 0; tr--) {
-					const a = spin * 0.6 - tr * 0.12 + (k * Math.PI * 2) / 3;
-					const sa = Math.sin(a) * ORBIT;
-					plot(Math.cos(a) * ORBIT, sa * si, sa * ci, SPARK_COLOR, (1 - tr / TRAIL) * this.sparkAmt);
-				}
+		// The ring is the meter the level strip used to be, and it lies in the
+		// globe's own equatorial plane so the two read as one object: the far half
+		// slips behind the limb, the near half crosses the lit face. Loose motes
+		// never resolve at this size — a continuous curve does, and it brightens,
+		// gains beads and runs faster as energy rises. The tint tracks the live
+		// palette, warming to amber sparks while the agent works.
+		const energy = this.energy;
+		const ringTint: [number, number, number] = [0, 0, 0];
+		for (let i = 0; i < 3; i++) {
+			const idle = POLE_TINT[i]! * 0.4 + cb[i]! * 0.6;
+			ringTint[i] = idle + (SPARK_COLOR[i]! - idle) * this.sparkAmt;
+		}
+		const ringAmt = (0.55 + 0.45 * energy) * form;
+		for (const st of STRANDS) {
+			// One sample per ~0.75px of arc, so a strand is a continuous line
+			// rather than a dotted one, whatever radius it ended up drawn at.
+			const circ = Math.PI * st.r * R * (PIXEL_ASPECT + SIN_TILT);
+			const segs = Math.max(24, Math.ceil(circ / 0.75));
+			for (let i = 0; i < segs; i++) {
+				const a = (i / segs) * Math.PI * 2;
+				// Brightness travelling around the strand: a uniform ring would
+				// hide its own rotation, arcs sweeping along it do not.
+				const dens = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(a * st.k - this.orbit * st.sp * 2));
+				plot(Math.cos(a) * st.r, 0, Math.sin(a) * st.r, ringTint, st.w * dens * ringAmt * 0.6, 0.8);
+			}
+		}
+		// Beads riding the ring: the fast, legible end of the meter, drawn
+		// tail-first so each bright head wins the pixels it shares with its trail.
+		const beads = 2 + Math.round(energy * 3);
+		for (let b = 0; b < beads; b++) {
+			const head = this.orbit * (1.1 + b * 0.13) + b * 2.4;
+			for (let tr = 5; tr >= 0; tr--) {
+				const a = head - tr * 0.09;
+				plot(Math.cos(a) * 1.33, 0, Math.sin(a) * 1.33, ringTint, (1 - tr / 6) ** 1.5 * ringAmt * 1.5, 0.95);
 			}
 		}
 
-		// Connecting: matter is still gathering, so motes spiral inward along
-		// their own latitudes and wink out as they are absorbed at the surface,
-		// while the globe itself stays translucent until they finish arriving.
+		// Connecting: matter spirals inward and flattens into the ring plane as it
+		// arrives, so the session assembles itself out of the geometry it is about
+		// to settle into rather than out of unrelated confetti.
 		if (this.condense > 0.02) {
-			for (let k = 0; k < 9; k++) {
-				const elev = ((k % 5) - 2) * 0.36;
-				const ce = Math.cos(elev);
-				const se = Math.sin(elev);
-				const phase = (this.clock * 0.5 + k * 0.111) % 1;
-				for (let tr = 4; tr >= 0; tr--) {
-					const p = phase - tr * 0.05;
+			for (let k = 0; k < 7; k++) {
+				const elev0 = (((k * 0.618) % 1) - 0.5) * 1.5;
+				const phase = (this.clock * 0.6 + k * 0.143) % 1;
+				for (let tr = 5; tr >= 0; tr--) {
+					const p = phase - tr * 0.045;
 					if (p <= 0) continue;
-					// Stays within the frame: 1.55 radii is just inside the canvas.
-					const r = 1.55 - 0.5 * p;
-					const a = k * 2.4 + spin * 0.8 + p * 3;
-					const weight = this.condense * Math.sin(p * Math.PI) * (1 - tr / 5);
-					plot(Math.cos(a) * ce * r, se * r, Math.sin(a) * ce * r, POLE_TINT, weight);
+					// Stays within the frame: 1.75 radii is just inside the canvas.
+					const rr = 1.75 - 0.42 * p;
+					const elev = elev0 * (1 - p) * (1 - p);
+					const a = k * 2.39996 + this.orbit * 0.9 + p * 3.4;
+					const ce = Math.cos(elev);
+					const weight = this.condense * Math.sin(p * Math.PI) * (1 - tr / 6) * 1.1;
+					plot(Math.cos(a) * ce * rr, Math.sin(elev) * rr, Math.sin(a) * ce * rr, POLE_TINT, weight, 0.9);
 				}
 			}
 		}
@@ -883,6 +1052,7 @@ class TalkVisual {
 		const GAMMA = 0.85;
 		const offs = new Int32Array(4);
 		const lums = new Float64Array(4);
+		const q = (v: number) => Math.round(255 * (v > 1 ? 1 : v) ** GAMMA);
 		const seq = (sel: number, bg: boolean): string => {
 			let r = 0;
 			let g = 0;
@@ -896,8 +1066,7 @@ class TalkVisual {
 				b += px[o + 2]!;
 				n += 1;
 			}
-			const q = (v: number) => Math.round(255 * (v / n) ** GAMMA);
-			return `\x1b[${bg ? 48 : 38};2;${q(r)};${q(g)};${q(b)}m`;
+			return `\x1b[${bg ? 48 : 38};2;${q(r / n)};${q(g / n)};${q(b / n)}m`;
 		};
 		let curFg = "";
 		let curBg = "";
@@ -921,7 +1090,13 @@ class TalkVisual {
 			}
 			return out;
 		};
-		for (let cy = 0; cy < charRows; cy++) {
+		// A pixel counts as drawn when it is bright enough to beat the terminal
+		// background, not merely when something touched it. Keying off coverage
+		// instead emits near-black cells for the faintest atmosphere and ring
+		// samples, which on any non-black background punch dark specks out of the
+		// limb and leave the halo looking chewed.
+		const lit = (o: number) => px[o]! + px[o + 1]! + px[o + 2]! > 0.15;
+		for (let cy = 0; cy < CHAR_ROWS; cy++) {
 			let line = "";
 			curFg = "";
 			curBg = "";
@@ -932,23 +1107,38 @@ class TalkVisual {
 				offs[2] = ((cy * 2 + 1) * W + cx * 2) * 4;
 				offs[3] = offs[2]! + 4;
 				let mask = 0;
-				for (let i = 0; i < 4; i++) if (px[offs[i]! + 3]! > 0.12) mask |= 1 << i;
+				for (let i = 0; i < 4; i++) if (lit(offs[i]!)) mask |= 1 << i;
 				if (!mask) {
 					line += `${style("", "")} `;
-				} else if (mask === 15) {
-					// Interior: split pixels into bright/dark groups for detail.
-					for (let i = 0; i < 4; i++) lums[i] = px[offs[i]!]! + px[offs[i]! + 1]! + px[offs[i]! + 2]!;
-					const mean = (lums[0]! + lums[1]! + lums[2]! + lums[3]!) / 4;
-					let brightMask = 0;
-					for (let i = 0; i < 4; i++) if (lums[i]! >= mean) brightMask |= 1 << i;
-					line +=
-						brightMask === 15
-							? `${style(seq(15, false), "")}█`
-							: `${style(seq(brightMask, false), seq(15 & ~brightMask, true))}${QUAD[brightMask]}`;
-				} else {
+					continue;
+				}
+				if (mask !== 15) {
 					// Limb: draw only covered quadrants, background stays transparent.
 					line += `${style(seq(mask, false), "")}${QUAD[mask]}`;
+					continue;
 				}
+				// Interior: splitting the cell into bright and dark halves buys
+				// detail only where there is detail to keep. On smooth shading it
+				// just quantizes a gradient into speckle, so a flat cell takes one
+				// averaged color instead.
+				for (let i = 0; i < 4; i++) lums[i] = px[offs[i]!]! + px[offs[i]! + 1]! + px[offs[i]! + 2]!;
+				let lo = lums[0]!;
+				let hi = lums[0]!;
+				for (let i = 1; i < 4; i++) {
+					if (lums[i]! < lo) lo = lums[i]!;
+					if (lums[i]! > hi) hi = lums[i]!;
+				}
+				if (hi - lo < 0.12) {
+					line += `${style(seq(15, false), "")}█`;
+					continue;
+				}
+				const mean = (lums[0]! + lums[1]! + lums[2]! + lums[3]!) / 4;
+				let brightMask = 0;
+				for (let i = 0; i < 4; i++) if (lums[i]! >= mean) brightMask |= 1 << i;
+				line +=
+					brightMask === 15
+						? `${style(seq(15, false), "")}█`
+						: `${style(seq(brightMask, false), seq(15 & ~brightMask, true))}${QUAD[brightMask]}`;
 			}
 			if (curFg || curBg) line += "\x1b[0m";
 			rows.push(this.centered(line, width));
