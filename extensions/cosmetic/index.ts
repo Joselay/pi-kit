@@ -10,11 +10,11 @@ import { spawn, type ChildProcess } from "node:child_process";
 import type { EventEmitter } from "node:events";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { CODEX_FAST_STATUS_KEY, modelSupportsCodexFastMode } from "./fast";
-import { CODEX_USAGE_CHANGED_EVENT } from "./lib/codex.ts";
+import { CODEX_FAST_STATUS_KEY, modelSupportsCodexFastMode } from "../fast/index.ts";
+import { CODEX_USAGE_CHANGED_EVENT } from "../lib/codex.ts";
 
-const IMAGES_DIR = new URL("../assets/images/", import.meta.url);
-const WORKING_MESSAGES_PATH = new URL("../assets/working-messages.json", import.meta.url);
+const IMAGES_DIR = new URL("../../assets/images/", import.meta.url);
+const WORKING_MESSAGES_PATH = new URL("../../assets/working-messages.json", import.meta.url);
 const SOUND_PATH = join(getAgentDir(), "assets", "sounds", "notification.mp3");
 const AUDIO_PLAYER = "/usr/bin/afplay";
 

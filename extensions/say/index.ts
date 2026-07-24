@@ -18,10 +18,10 @@ import {
 	type ExtensionCommandContext,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { FfplayPipe, pcmChunkMs, SAMPLE_RATE } from "./lib/audio.ts";
-import { resolveRealtimeOAuth } from "./lib/codex.ts";
-import { openRealtimeSocket, parseServerEvent, realtimeHeaders, sendJson } from "./lib/realtime.ts";
-import { clip, errorText, messageText } from "./lib/util.ts";
+import { FfplayPipe, pcmChunkMs, SAMPLE_RATE } from "../lib/audio.ts";
+import { resolveRealtimeOAuth } from "../lib/codex.ts";
+import { openRealtimeSocket, parseServerEvent, realtimeHeaders, sendJson } from "../lib/realtime.ts";
+import { clip, errorText, messageText } from "../lib/util.ts";
 
 const REALTIME_URL = process.env.PI_SAY_ENDPOINT?.trim() || "wss://api.openai.com/v1/realtime";
 const MODEL = process.env.PI_SAY_MODEL?.trim() || "gpt-realtime-2.1-mini";

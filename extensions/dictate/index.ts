@@ -6,11 +6,11 @@ import {
 	type ExtensionContext,
 	type KeybindingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { SAMPLE_RATE } from "./lib/audio.ts";
-import { resolveRealtimeOAuth } from "./lib/codex.ts";
-import { realtimeHeaders } from "./lib/realtime.ts";
-import { statePath } from "./lib/state.ts";
-import { errorText } from "./lib/util.ts";
+import { SAMPLE_RATE } from "../lib/audio.ts";
+import { resolveRealtimeOAuth } from "../lib/codex.ts";
+import { realtimeHeaders } from "../lib/realtime.ts";
+import { statePath } from "../lib/state.ts";
+import { errorText } from "../lib/util.ts";
 import {
 	CURSOR_MARKER,
 	isKeyRelease,

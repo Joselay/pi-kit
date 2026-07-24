@@ -23,10 +23,10 @@ import {
 	type ExtensionCommandContext,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { ensureAecAudio, pcmChunkMs, SAMPLE_RATE, type AudioIO } from "./lib/audio.ts";
-import { resolveRealtimeOAuth } from "./lib/codex.ts";
-import { openRealtimeSocket, parseServerEvent, realtimeHeaders, sendJson } from "./lib/realtime.ts";
-import { clip, errorText, messageText } from "./lib/util.ts";
+import { ensureAecAudio, pcmChunkMs, SAMPLE_RATE, type AudioIO } from "../lib/audio.ts";
+import { resolveRealtimeOAuth } from "../lib/codex.ts";
+import { openRealtimeSocket, parseServerEvent, realtimeHeaders, sendJson } from "../lib/realtime.ts";
+import { clip, errorText, messageText } from "../lib/util.ts";
 
 const REALTIME_URL = "wss://api.openai.com/v1/realtime";
 // Newest realtime model (July 2026); upstream Codex still pins gpt-realtime-1.5.

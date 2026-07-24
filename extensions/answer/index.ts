@@ -24,7 +24,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import { errorText } from "./lib/util.ts";
+import { errorText } from "../lib/util.ts";
 
 // Structured output format for question extraction
 interface ExtractedQuestion {

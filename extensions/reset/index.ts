@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { BorderedLoader, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { CODEX_USAGE_CHANGED_EVENT, resolveCodexAuth, whamRequest, type CodexAuth } from "./lib/codex.ts";
-import { errorText } from "./lib/util.ts";
+import { CODEX_USAGE_CHANGED_EVENT, resolveCodexAuth, whamRequest, type CodexAuth } from "../lib/codex.ts";
+import { errorText } from "../lib/util.ts";
 
 const USER_AGENT = "pi-reset/0.1.0";
 const CANCEL_OPTION = "Cancel";

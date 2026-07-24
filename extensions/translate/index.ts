@@ -23,10 +23,10 @@
 // helper is unavailable.
 
 import { type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { ensureAecAudio, pcmChunkMs, type AudioIO } from "./lib/audio.ts";
-import { resolveRealtimeOAuth } from "./lib/codex.ts";
-import { openRealtimeSocket, parseServerEvent, realtimeHeaders, sendJson } from "./lib/realtime.ts";
-import { clip, errorText } from "./lib/util.ts";
+import { ensureAecAudio, pcmChunkMs, type AudioIO } from "../lib/audio.ts";
+import { resolveRealtimeOAuth } from "../lib/codex.ts";
+import { openRealtimeSocket, parseServerEvent, realtimeHeaders, sendJson } from "../lib/realtime.ts";
+import { clip, errorText } from "../lib/util.ts";
 
 const TRANSLATIONS_URL =
 	process.env.PI_TRANSLATE_ENDPOINT?.trim() || "wss://api.openai.com/v1/realtime/translations";

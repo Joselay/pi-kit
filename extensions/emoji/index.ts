@@ -3,7 +3,7 @@
  *
  * `:shortcode:` autocomplete in the editor (GitHub-style shortcodes) and an
  * /emoji picker overlay that inserts the selected emoji into the prompt.
- * Data lives in ../assets/emoji/emoji.json; regenerate with `uv run assets/emoji/build.py`.
+ * Data lives in ../../assets/emoji/emoji.json; regenerate with `uv run assets/emoji/build.py`.
  */
 
 import { readFileSync } from "node:fs";
@@ -18,9 +18,9 @@ import {
 	Spacer,
 	Text,
 } from "@earendil-works/pi-tui";
-import { errorText } from "./lib/util.ts";
+import { errorText } from "../lib/util.ts";
 
-const DATA_URL = new URL("../assets/emoji/emoji.json", import.meta.url);
+const DATA_URL = new URL("../../assets/emoji/emoji.json", import.meta.url);
 const MAX_SUGGESTIONS = 20;
 
 type EmojiEntry = {

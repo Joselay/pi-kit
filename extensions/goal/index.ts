@@ -11,7 +11,7 @@ import { randomUUID } from "node:crypto";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { errorText } from "./lib/util.ts";
+import { errorText } from "../lib/util.ts";
 
 const STATE_TYPE = "goal";
 const UI_MESSAGE_TYPE = "goal-ui";

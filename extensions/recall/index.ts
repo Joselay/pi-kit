@@ -2,8 +2,8 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { dirname, join, resolve } from "node:path";
 import { CustomEditor, type ExtensionAPI, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { statePath } from "./lib/state.ts";
-import { errorText } from "./lib/util.ts";
+import { statePath } from "../lib/state.ts";
+import { errorText } from "../lib/util.ts";
 
 const HISTORY_LIMIT = 100;
 const HISTORY_PATH = statePath("recall.json");

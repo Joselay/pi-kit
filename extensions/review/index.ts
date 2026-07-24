@@ -40,7 +40,7 @@ import {
 } from "@earendil-works/pi-tui";
 import path from "node:path";
 import { promises as fs } from "node:fs";
-import { errorText } from "./lib/util.ts";
+import { errorText } from "../lib/util.ts";
 
 // State to track fresh session review (where we branched from).
 // Module-level state means only one review can be active at a time.

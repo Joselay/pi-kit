@@ -17,8 +17,8 @@
  */
 
 import { type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { resolveCodexAuth, whamRequest, type CodexAuth } from "./lib/codex.ts";
-import { errorText } from "./lib/util.ts";
+import { resolveCodexAuth, whamRequest, type CodexAuth } from "../lib/codex.ts";
+import { errorText } from "../lib/util.ts";
 
 const USER_AGENT = "pi-account/0.1.0";
 
