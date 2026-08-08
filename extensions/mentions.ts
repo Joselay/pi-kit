@@ -7,15 +7,12 @@ import {
 import {
 	type AutocompleteProvider,
 	type EditorComponent,
-	truncateToWidth,
-	visibleWidth,
 } from "@earendil-works/pi-tui";
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { dirname } from "node:path";
 
 const SKILL_PREFIX = "skill:";
-const FILE_MENTION_PATTERN = /(^|[\s([{])(@[^\s"'`<>{}\[\]()]+)/g;
+const FILE_MENTION_PATTERN = /(^|[\s([{])(@[^\x00-\x20\x7f"'`<>{}\[\]()]+)/g;
 const TRAILING_FILE_PUNCTUATION = /[,:;!?]+$/;
 
 type SkillMeta = {
@@ -33,13 +30,6 @@ type SkillIndex = {
 type SkillToken = {
 	prefix: string;
 	query: string;
-};
-
-type SkillAwareEditor = EditorComponent & {
-	focused?: boolean;
-	getCursor?: () => { line: number; col: number };
-	getLines?: () => string[];
-	isShowingAutocomplete?: () => boolean;
 };
 
 function loadSkillIndex(pi: ExtensionAPI): SkillIndex {
@@ -142,90 +132,15 @@ function extractSkillToken(beforeCursor: string): SkillToken | undefined {
 	return { prefix: match[1], query: match[2] ?? "" };
 }
 
-function beforeCursorText(editor: SkillAwareEditor): string {
-	if (editor.getCursor && editor.getLines) {
-		const cursor = editor.getCursor();
-		return (editor.getLines()[cursor.line] ?? "").slice(0, cursor.col);
-	}
-	return editor.getText();
-}
-
-function needsSpacer(editor: SkillAwareEditor): boolean {
-	if (!editor.getCursor || !editor.getLines) return true;
-	const cursor = editor.getCursor();
-	const after = (editor.getLines()[cursor.line] ?? "").slice(cursor.col);
-	return !after.startsWith(" ");
-}
-
 export function inSlashPalette(cursorLine: number, beforeCursor: string): boolean {
 	return cursorLine === 0 && beforeCursor.trimStart().startsWith("/");
 }
 
-export function ghostCandidates(index: SkillIndex, query: string): string[] {
+export function skillCandidates(index: SkillIndex, query: string): string[] {
 	if (!query) return [];
 	return index.names
 		.filter((name) => name.length > query.length && name.startsWith(query))
 		.sort((a, b) => a.length - b.length || a.localeCompare(b));
-}
-
-function ghostSuffix(editor: SkillAwareEditor, index: SkillIndex): string | undefined {
-	if (editor.getCursor && editor.getLines) {
-		const cursor = editor.getCursor();
-		const line = editor.getLines()[cursor.line] ?? "";
-		if (inSlashPalette(cursor.line, line.slice(0, cursor.col))) return undefined;
-		const after = line.slice(cursor.col);
-		if (after !== "" && !after.startsWith(" ")) return undefined;
-	}
-
-	const token = extractSkillToken(beforeCursorText(editor));
-	if (!token) return undefined;
-	const best = ghostCandidates(index, token.query)[0];
-	return best?.slice(token.query.length);
-}
-
-const CURSOR_CELL_START = "\x1b[7m";
-const CURSOR_CELL_END = "\x1b[0m";
-
-export function injectGhost(
-	lines: string[],
-	ghost: string,
-	theme: ExtensionContext["ui"]["theme"],
-): string[] {
-	const lineIndex = lines.findIndex((line) => line.includes(CURSOR_CELL_START));
-	if (lineIndex === -1) return lines;
-
-	const line = lines[lineIndex]!;
-	const cellStart = line.indexOf(CURSOR_CELL_START);
-	const graphemeStart = cellStart + CURSOR_CELL_START.length;
-	const cellEnd = line.indexOf(CURSOR_CELL_END, graphemeStart);
-	if (cellEnd === -1) return lines;
-
-	const cursorGrapheme = line.slice(graphemeStart, cellEnd);
-	const after = line.slice(cellEnd + CURSOR_CELL_END.length);
-	const trailing = after.trimEnd();
-	const padding = visibleWidth(after) - visibleWidth(trailing);
-
-	const cursorAtLineEnd = cursorGrapheme === " " && trailing === "";
-	const budget = cursorAtLineEnd ? padding + 1 : padding;
-
-	const graphemes = [...ghost];
-	const head = graphemes[0];
-	if (!head || budget < 1) return lines;
-	const text = graphemes.slice(0, budget).join("");
-	const tail = text.slice(head.length);
-
-	const painted =
-		line.slice(0, cellStart) +
-		CURSOR_CELL_START +
-		head +
-		CURSOR_CELL_END +
-		(tail ? theme.fg("dim", tail) : "") +
-		(cursorAtLineEnd ? "" : cursorGrapheme) +
-		after;
-
-	const next = [...lines];
-	next[lineIndex] = truncateToWidth(painted, visibleWidth(line), "");
-	return next;
 }
 
 export function highlightSkillMentions(
@@ -248,7 +163,6 @@ export function highlightSkillMentions(
 
 export function highlightFileMentions(
 	lines: string[],
-	cwd: string,
 	theme: ExtensionContext["ui"]["theme"],
 ): string[] {
 	return lines.map((line) => {
@@ -258,17 +172,6 @@ export function highlightFileMentions(
 			(_match, boundary: string, rawToken: string) => {
 				const token = rawToken.replace(TRAILING_FILE_PUNCTUATION, "");
 				const suffix = rawToken.slice(token.length);
-				const mentionedPath = token.slice(1);
-				if (!mentionedPath) return `${boundary}${rawToken}`;
-
-				const expandedPath = mentionedPath.startsWith("~/")
-					? resolve(homedir(), mentionedPath.slice(2))
-					: mentionedPath;
-				const absolutePath = isAbsolute(expandedPath)
-					? expandedPath
-					: resolve(cwd, expandedPath);
-
-				if (!existsSync(absolutePath)) return `${boundary}${rawToken}`;
 				return `${boundary}${theme.fg("syntaxString", token)}${suffix}`;
 			},
 		);
@@ -286,8 +189,28 @@ function createSkillAutocompleteProvider(
 	return {
 		triggerCharacters: current.triggerCharacters,
 
-		getSuggestions(lines, cursorLine, cursorCol, options) {
-			return current.getSuggestions(lines, cursorLine, cursorCol, options);
+		async getSuggestions(lines, cursorLine, cursorCol, options) {
+			const beforeCursor = (lines[cursorLine] ?? "").slice(0, cursorCol);
+			const token = extractSkillToken(beforeCursor);
+			if (!token || inSlashPalette(cursorLine, beforeCursor)) {
+				return current.getSuggestions(lines, cursorLine, cursorCol, options);
+			}
+
+			const index = getIndex();
+			const names = skillCandidates(index, token.query);
+			if (names.length === 0) {
+				return current.getSuggestions(lines, cursorLine, cursorCol, options);
+			}
+
+			const explicitPrefix = token.prefix.startsWith(`/${SKILL_PREFIX}`);
+			return {
+				prefix: token.prefix,
+				items: names.map((name) => ({
+					value: explicitPrefix ? `/${SKILL_PREFIX}${name}` : `/${name}`,
+					label: name,
+					description: index.byName.get(name)?.description,
+				})),
+			};
 		},
 
 		applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
@@ -301,9 +224,9 @@ function createSkillAutocompleteProvider(
 				if (
 					token &&
 					!inSlashPalette(cursorLine, beforeCursor) &&
-					ghostCandidates(getIndex(), token.query).length > 0
+					skillCandidates(getIndex(), token.query).length > 0
 				) {
-					return false;
+					return true;
 				}
 			} catch {
 			}
@@ -317,7 +240,7 @@ function installEditor(ctx: ExtensionContext, getIndex: () => SkillIndex): void 
 
 	ctx.ui.setEditorComponent((tui, theme, keybindings) => {
 		const editor = (previousEditor?.(tui, theme, keybindings) ??
-			new CustomEditor(tui, theme, keybindings)) as SkillAwareEditor;
+			new CustomEditor(tui, theme, keybindings)) as EditorComponent;
 
 		const render = editor.render.bind(editor);
 		editor.render = (width: number): string[] => {
@@ -325,37 +248,11 @@ function installEditor(ctx: ExtensionContext, getIndex: () => SkillIndex): void 
 			let highlighted = base;
 			try {
 				highlighted = highlightSkillMentions(base, getIndex(), ctx.ui.theme);
-				highlighted = highlightFileMentions(highlighted, ctx.cwd, ctx.ui.theme);
+				highlighted = highlightFileMentions(highlighted, ctx.ui.theme);
 			} catch {
 			}
 
-			if (editor.focused === false || editor.isShowingAutocomplete?.()) return highlighted;
-			try {
-				const ghost = ghostSuffix(editor, getIndex());
-				return ghost ? injectGhost(highlighted, ghost, ctx.ui.theme) : highlighted;
-			} catch {
-				return highlighted;
-			}
-		};
-
-		const handleInput = editor.handleInput.bind(editor);
-		editor.handleInput = (data: string) => {
-			try {
-				if (
-					typeof editor.insertTextAtCursor === "function" &&
-					!editor.isShowingAutocomplete?.() &&
-					keybindings.matches(data, "tui.input.tab")
-				) {
-					const ghost = ghostSuffix(editor, getIndex());
-					if (ghost) {
-						editor.insertTextAtCursor(`${ghost}${needsSpacer(editor) ? " " : ""}`);
-						return;
-					}
-				}
-			} catch {
-			}
-
-			handleInput(data);
+			return highlighted;
 		};
 
 		return editor;
@@ -365,6 +262,10 @@ function installEditor(ctx: ExtensionContext, getIndex: () => SkillIndex): void 
 export default function mentionsExtension(pi: ExtensionAPI) {
 	const cache = createIndexCache(pi);
 	const getIndex = cache.get;
+
+	pi.on("resources_discover", () => {
+		cache.invalidate();
+	});
 
 	pi.on("session_start", (_event, ctx) => {
 		cache.invalidate();
