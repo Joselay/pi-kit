@@ -55,7 +55,7 @@ Pi extensions live in [`extensions`](extensions):
 - [`reset.ts`](extensions/reset.ts) - Display and redeem available OpenAI Codex usage-limit reset credits.
 - [`review.ts`](extensions/review.ts) - Run structured reviews of pull requests, branches, commits, uncommitted changes, or folders.
 - [`session-name.ts`](extensions/session-name.ts) - Display the current session name as an accent badge on the editor border.
-- [`skill-mentions.ts`](extensions/skill-mentions.ts) - Add skill autocomplete and expand `/skill-name` invocations into skill instructions.
+- [`mentions.ts`](extensions/mentions.ts) - Highlight skill and file mentions, autocomplete skills, and expand `/skill-name` invocations into skill instructions.
 - [`split-fork.ts`](extensions/split-fork.ts) - Fork the current session into a right-hand Ghostty split on macOS.
 - [`statusline.ts`](extensions/statusline.ts) - Replace the footer with project, branch, model, thinking, context, fast-mode, and Codex usage information.
 - [`subagent.ts`](extensions/subagent.ts) - Run serialized delegated tasks in observable tmux-backed Pi child sessions.

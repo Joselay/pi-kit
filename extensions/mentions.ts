@@ -10,10 +10,13 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
-import { readFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, resolve } from "node:path";
 
 const SKILL_PREFIX = "skill:";
+const FILE_MENTION_PATTERN = /(^|[\s([{])(@[^\s"'`<>{}\[\]()]+)/g;
+const TRAILING_FILE_PUNCTUATION = /[,:;!?]+$/;
 
 type SkillMeta = {
 	description: string;
@@ -225,6 +228,53 @@ export function injectGhost(
 	return next;
 }
 
+export function highlightSkillMentions(
+	lines: string[],
+	index: SkillIndex,
+	theme: ExtensionContext["ui"]["theme"],
+): string[] {
+	const pattern = index.pattern;
+	if (!pattern) return lines;
+
+	return lines.map((line) => {
+		pattern.lastIndex = 0;
+		return line.replace(
+			pattern,
+			(_match, boundary: string, token: string) =>
+				`${boundary}${theme.fg("accent", token)}`,
+		);
+	});
+}
+
+export function highlightFileMentions(
+	lines: string[],
+	cwd: string,
+	theme: ExtensionContext["ui"]["theme"],
+): string[] {
+	return lines.map((line) => {
+		FILE_MENTION_PATTERN.lastIndex = 0;
+		return line.replace(
+			FILE_MENTION_PATTERN,
+			(_match, boundary: string, rawToken: string) => {
+				const token = rawToken.replace(TRAILING_FILE_PUNCTUATION, "");
+				const suffix = rawToken.slice(token.length);
+				const mentionedPath = token.slice(1);
+				if (!mentionedPath) return `${boundary}${rawToken}`;
+
+				const expandedPath = mentionedPath.startsWith("~/")
+					? resolve(homedir(), mentionedPath.slice(2))
+					: mentionedPath;
+				const absolutePath = isAbsolute(expandedPath)
+					? expandedPath
+					: resolve(cwd, expandedPath);
+
+				if (!existsSync(absolutePath)) return `${boundary}${rawToken}`;
+				return `${boundary}${theme.fg("syntaxString", token)}${suffix}`;
+			},
+		);
+	});
+}
+
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -272,12 +322,19 @@ function installEditor(ctx: ExtensionContext, getIndex: () => SkillIndex): void 
 		const render = editor.render.bind(editor);
 		editor.render = (width: number): string[] => {
 			const base = render(width);
+			let highlighted = base;
 			try {
-				if (editor.focused === false || editor.isShowingAutocomplete?.()) return base;
-				const ghost = ghostSuffix(editor, getIndex());
-				return ghost ? injectGhost(base, ghost, ctx.ui.theme) : base;
+				highlighted = highlightSkillMentions(base, getIndex(), ctx.ui.theme);
+				highlighted = highlightFileMentions(highlighted, ctx.cwd, ctx.ui.theme);
 			} catch {
-				return base;
+			}
+
+			if (editor.focused === false || editor.isShowingAutocomplete?.()) return highlighted;
+			try {
+				const ghost = ghostSuffix(editor, getIndex());
+				return ghost ? injectGhost(highlighted, ghost, ctx.ui.theme) : highlighted;
+			} catch {
+				return highlighted;
 			}
 		};
 
@@ -305,7 +362,7 @@ function installEditor(ctx: ExtensionContext, getIndex: () => SkillIndex): void 
 	});
 }
 
-export default function skillsExtension(pi: ExtensionAPI) {
+export default function mentionsExtension(pi: ExtensionAPI) {
 	const cache = createIndexCache(pi);
 	const getIndex = cache.get;
 
