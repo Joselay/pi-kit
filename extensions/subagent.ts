@@ -445,7 +445,10 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			"Use subagent once per delegated task; subagent calls are serialized automatically, so prefer multiple simple calls over asking one child to orchestrate other children.",
 		],
 		parameters: Type.Object({
-			task: Type.String({ description: "The complete task for the child Pi process" }),
+			task: Type.String({
+				description: "The complete, non-empty task for the child Pi process.",
+				minLength: 1,
+			}),
 			cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to the current project." })),
 			provider: Type.Optional(Type.String({ description: "Provider override. Defaults to the current provider." })),
 			model: Type.Optional(
@@ -456,7 +459,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 					description: "Thinking level override. Defaults to the current thinking level.",
 				}),
 			),
-		}),
+		}, { additionalProperties: false }),
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			if (!params.task.trim()) throw new Error("Subagent task must not be empty.");

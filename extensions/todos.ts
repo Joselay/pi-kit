@@ -94,28 +94,45 @@ type KeybindingMatcher = {
 };
 
 const TodoParams = Type.Object({
-	action: StringEnum([
-		"list",
-		"list-all",
-		"get",
-		"create",
-		"update",
-		"append",
-		"delete",
-		"claim",
-		"release",
-	] as const),
+	action: StringEnum(
+		[
+			"list",
+			"list-all",
+			"get",
+			"create",
+			"update",
+			"append",
+			"delete",
+			"claim",
+			"release",
+		] as const,
+		{
+			description:
+				"Operation to perform. create requires title; get, update, append, delete, claim, and release require id; append also requires a non-empty body.",
+		},
+	),
 	id: Type.Optional(
-		Type.String({ description: "Todo id (TODO-<hex> or raw hex filename)" }),
+		Type.String({
+			description: "Todo id (TODO-<hex> or raw hex filename). Required except for list, list-all, and create.",
+			minLength: 1,
+		}),
 	),
-	title: Type.Optional(Type.String({ description: "Short summary shown in lists" })),
-	status: Type.Optional(Type.String({ description: "Todo status" })),
-	tags: Type.Optional(Type.Array(Type.String({ description: "Todo tag" }))),
+	title: Type.Optional(
+		Type.String({ description: "Short summary shown in lists. Required for create.", minLength: 1 }),
+	),
+	status: Type.Optional(Type.String({ description: "Todo status used by create or update." })),
+	tags: Type.Optional(
+		Type.Array(Type.String(), { description: "Todo tags used by create or update." }),
+	),
 	body: Type.Optional(
-		Type.String({ description: "Long-form details (markdown). Update replaces; append adds." }),
+		Type.String({
+			description: "Long-form markdown details. update replaces the body; append adds to it and requires non-empty text.",
+		}),
 	),
-	force: Type.Optional(Type.Boolean({ description: "Override another session's assignment" })),
-});
+	force: Type.Optional(
+		Type.Boolean({ description: "For claim or release, override another session's assignment lock." }),
+	),
+}, { additionalProperties: false });
 
 type TodoAction =
 	| "list"
@@ -1444,9 +1461,14 @@ export default function todosExtension(pi: ExtensionAPI) {
 		label: "Todo",
 		description:
 			`Manage file-based todos in ${todosDirLabel} (list, list-all, get, create, update, append, delete, claim, release). ` +
+			"create requires title; get, update, append, delete, claim, and release require id; append also requires a non-empty body. " +
 			"Title is the short summary; body is long-form markdown notes (update replaces, append adds). " +
 			"Todo ids are shown as TODO-<hex>; id parameters accept TODO-<hex> or the raw hex filename. " +
-			"Claim tasks before working on them to avoid conflicts, and close them when complete.", 
+			"Claim tasks before working on them to avoid conflicts, and close them when complete.",
+		promptSnippet: "Manage persistent file-based project todos",
+		promptGuidelines: [
+			"Use todo to track durable project tasks: claim a todo before working on it, append useful progress notes, and set its status to closed when complete.",
+		],
 		parameters: TodoParams,
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1617,13 +1639,14 @@ export default function todosExtension(pi: ExtensionAPI) {
 							details: { action: "append", error: "not found" },
 						};
 					}
+					const body = params.body;
+					if (!body?.trim()) {
+						throw new Error("body is required and must be non-empty for append");
+					}
 					const result = await withTodoLock(todosDir, normalizedId, ctx, async () => {
 						const existing = await ensureTodoExists(filePath, normalizedId);
 						if (!existing) return { error: `Todo ${displayId} not found` } as const;
-						if (!params.body || !params.body.trim()) {
-							return existing;
-						}
-						const updated = await appendTodoBody(filePath, existing, params.body);
+						const updated = await appendTodoBody(filePath, existing, body);
 						return updated;
 					});
 

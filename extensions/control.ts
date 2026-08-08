@@ -1133,28 +1133,43 @@ CLI bridge (for shell scripts/background jobs):
 Note: If you ask the target session to reply back via sender_info, do not use wait_until; waiting is redundant and can duplicate responses.
 
 Messages automatically include sender session info for replies. When you want a response, instruct the target session to reply directly to the sender by calling send_to_session with the sender_info reference (do not poll get_message).`,
+		promptSnippet: "Send messages to or inspect another controllable Pi session",
 		parameters: Type.Object({
-			sessionId: Type.Optional(Type.String({ description: "Target session id (UUID)" })),
-			sessionName: Type.Optional(Type.String({ description: "Target session name (alias)" })),
+			sessionId: Type.Optional(
+				Type.String({
+					description:
+						"Target session UUID. Supply sessionId or sessionName; when both are supplied, they must identify the same session.",
+					minLength: 1,
+				}),
+			),
+			sessionName: Type.Optional(
+				Type.String({
+					description:
+						"Target session alias from /name. Supply sessionName or sessionId; when both are supplied, they must identify the same session.",
+					minLength: 1,
+				}),
+			),
 			action: Type.Optional(
 				StringEnum(["send", "get_message", "get_summary", "clear"] as const, {
 					description: "Action to perform (default: send)",
 					default: "send",
 				}),
 			),
-			message: Type.Optional(Type.String({ description: "Message to send (required for action=send)" })),
+			message: Type.Optional(
+				Type.String({ description: "Non-empty message required when action is send.", minLength: 1 }),
+			),
 			mode: Type.Optional(
 				StringEnum(["steer", "follow_up"] as const, {
-					description: "Delivery mode for send: steer (immediate) or follow_up (after task)",
+					description: "For action=send, deliver via steer immediately or follow_up after the current task.",
 					default: "steer",
 				}),
 			),
 			wait_until: Type.Optional(
 				StringEnum(["turn_end", "message_processed"] as const, {
-					description: "Wait behavior for send action",
+					description: "For action=send, wait for the completed turn or only until the message is queued.",
 				}),
 			),
-		}),
+		}, { additionalProperties: false }),
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			const action = params.action ?? "send";
 			const sessionName = params.sessionName?.trim();
@@ -1165,38 +1180,22 @@ Messages automatically include sender session info for replies. When you want a 
 			if (sessionName) {
 				targetSessionId = await resolveSessionIdFromAlias(sessionName);
 				if (!targetSessionId) {
-					return {
-						content: [{ type: "text", text: "Unknown session name" }],
-						isError: true,
-						details: { error: "Unknown session name" },
-					};
+					throw new Error("Unknown session name");
 				}
 			}
 
 			if (sessionId) {
 				if (!isSafeSessionId(sessionId)) {
-					return {
-						content: [{ type: "text", text: "Invalid session id" }],
-						isError: true,
-						details: { error: "Invalid session id" },
-					};
+					throw new Error("Invalid session id");
 				}
 				if (targetSessionId && targetSessionId !== sessionId) {
-					return {
-						content: [{ type: "text", text: "Session name does not match session id" }],
-						isError: true,
-						details: { error: "Session name does not match session id" },
-					};
+					throw new Error("Session name does not match session id");
 				}
 				targetSessionId = sessionId;
 			}
 
 			if (!targetSessionId) {
-				return {
-					content: [{ type: "text", text: "Missing session id or session name" }],
-					isError: true,
-					details: { error: "Missing session id or session name" },
-				};
+				throw new Error("Missing session id or session name");
 			}
 
 			const socketPath = getSocketPath(targetSessionId);
@@ -1207,11 +1206,7 @@ Messages automatically include sender session info for replies. When you want a 
 				if (action === "get_message") {
 					const result = await sendRpcCommand(socketPath, { type: "get_message" });
 					if (!result.response.success) {
-						return {
-							content: [{ type: "text", text: `Failed: ${result.response.error ?? "unknown error"}` }],
-							isError: true,
-							details: result,
-						};
+						throw new Error(result.response.error ?? "get_message failed");
 					}
 					const data = result.response.data as { message?: ExtractedMessage };
 					if (!data?.message) {
@@ -1229,11 +1224,7 @@ Messages automatically include sender session info for replies. When you want a 
 				if (action === "get_summary") {
 					const result = await sendRpcCommand(socketPath, { type: "get_summary" }, { timeout: 60000 });
 					if (!result.response.success) {
-						return {
-							content: [{ type: "text", text: `Failed: ${result.response.error ?? "unknown error"}` }],
-							isError: true,
-							details: result,
-						};
+						throw new Error(result.response.error ?? "get_summary failed");
 					}
 					const data = result.response.data as { summary?: string; model?: string };
 					if (!data?.summary) {
@@ -1251,11 +1242,7 @@ Messages automatically include sender session info for replies. When you want a 
 				if (action === "clear") {
 					const result = await sendRpcCommand(socketPath, { type: "clear", summarize: false }, { timeout: 10000 });
 					if (!result.response.success) {
-						return {
-							content: [{ type: "text", text: `Failed to clear: ${result.response.error ?? "unknown error"}` }],
-							isError: true,
-							details: result,
-						};
+						throw new Error(result.response.error ?? "clear failed");
 					}
 					const data = result.response.data as { cleared?: boolean; alreadyAtRoot?: boolean };
 					const msg = data?.alreadyAtRoot ? "Session already at root" : "Session cleared";
@@ -1267,11 +1254,7 @@ Messages automatically include sender session info for replies. When you want a 
 
 				// action === "send"
 				if (!params.message || params.message.trim().length === 0) {
-					return {
-						content: [{ type: "text", text: "Missing message for send action" }],
-						isError: true,
-						details: { error: "Missing message" },
-					};
+					throw new Error("Missing message for send action");
 				}
 
 				const senderSessionName = state.context?.sessionManager.getSessionName()?.trim();
@@ -1293,11 +1276,7 @@ Messages automatically include sender session info for replies. When you want a 
 					// Just send and confirm delivery
 					const result = await sendRpcCommand(socketPath, sendCommand);
 					if (!result.response.success) {
-						return {
-							content: [{ type: "text", text: `Failed: ${result.response.error ?? "unknown error"}` }],
-							isError: true,
-							details: result,
-						};
+						throw new Error(result.response.error ?? "send failed");
 					}
 					return {
 						content: [{ type: "text", text: "Message delivered to session" }],
@@ -1313,11 +1292,7 @@ Messages automatically include sender session info for replies. When you want a 
 					});
 
 					if (!result.response.success) {
-						return {
-							content: [{ type: "text", text: `Failed: ${result.response.error ?? "unknown error"}` }],
-							isError: true,
-							details: result,
-						};
+						throw new Error(result.response.error ?? "send failed");
 					}
 
 					const lastMessage = result.event?.message;
@@ -1337,11 +1312,7 @@ Messages automatically include sender session info for replies. When you want a 
 				// No wait - just send
 				const result = await sendRpcCommand(socketPath, sendCommand);
 				if (!result.response.success) {
-					return {
-						content: [{ type: "text", text: `Failed: ${result.response.error ?? "unknown error"}` }],
-						isError: true,
-						details: result,
-					};
+					throw new Error(result.response.error ?? "send failed");
 				}
 
 				return {
@@ -1349,12 +1320,7 @@ Messages automatically include sender session info for replies. When you want a 
 					details: result.response.data,
 				};
 			} catch (error) {
-				const message = error instanceof Error ? error.message : "Unknown error";
-				return {
-					content: [{ type: "text", text: `Failed: ${message}` }],
-					isError: true,
-					details: { error: message },
-				};
+				throw error instanceof Error ? error : new Error("Unknown error");
 			}
 		},
 
@@ -1396,9 +1362,9 @@ Messages automatically include sender session info for replies. When you want a 
 			return new Text(header, 0, 0);
 		},
 
-		renderResult(result, { expanded }, theme) {
+		renderResult(result, { expanded }, theme, context) {
 			const details = result.details as Record<string, unknown> | undefined;
-			const isError = (result as { isError?: boolean }).isError === true;
+			const isError = context.isError;
 
 			// Error case
 			if (isError || details?.error) {
@@ -1504,7 +1470,8 @@ function registerListSessionsTool(pi: ExtensionAPI): void {
 		name: "list_sessions",
 		label: "List Sessions",
 		description: "List live sessions that expose a control socket (optionally with session names). Use this for discovery only; for the current session id in shell/bash use $PI_SESSION_ID.",
-		parameters: Type.Object({}),
+		promptSnippet: "List running Pi sessions exposing control sockets",
+		parameters: Type.Object({}, { additionalProperties: false }),
 		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
 			const sessions = await getLiveSessions();
 

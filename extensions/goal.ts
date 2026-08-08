@@ -10,7 +10,7 @@ import { randomUUID } from "node:crypto";
 
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import { Type, type Static } from "typebox";
 
 const STATE_TYPE = "goal";
 const UI_MESSAGE_TYPE = "goal-ui";
@@ -40,15 +40,25 @@ const CreateGoalParams = Type.Object({
 	objective: Type.String({
 		description:
 			"Required. The concrete objective to start pursuing. This starts a new active goal when no unfinished goal exists. If the previous goal is complete, it is replaced.",
+		minLength: 1,
+		maxLength: MAX_OBJECTIVE_CHARS,
 	}),
 	token_budget: Type.Optional(
-		Type.Number({ description: "Optional positive integer token budget for the new goal. Omit unless explicitly requested." }),
+		Type.Integer({
+			description: "Optional positive integer token budget for the new goal. Omit unless explicitly requested.",
+			minimum: 1,
+		}),
 	),
-});
+}, { additionalProperties: false });
 
 const UpdateGoalParams = Type.Object({
-	status: StringEnum(["complete", "blocked"] as const),
-});
+	status: StringEnum(["complete", "blocked"] as const, {
+		description:
+			"Final status to set: complete only when the objective is achieved with no required work remaining; blocked only after the same blocker has repeated for at least three consecutive goal turns.",
+	}),
+}, { additionalProperties: false });
+
+type CreateGoalInput = Static<typeof CreateGoalParams>;
 
 function nowSeconds(): number {
 	return Math.floor(Date.now() / 1000);
@@ -771,7 +781,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 		description:
 			"Get the current goal for this thread, including status, budgets, token and elapsed-time usage, and remaining token budget.",
 		promptSnippet: "Get the current long-running thread goal and its usage/budget state",
-		parameters: Type.Object({}),
+		parameters: Type.Object({}, { additionalProperties: false }),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			const snapshot = currentGoalSnapshot();
 			const response = goalResponse(snapshot, ctx.sessionManager.getSessionId());
@@ -794,6 +804,16 @@ export default function goalExtension(pi: ExtensionAPI) {
 			"Use update_goal with status blocked only when the strict blocked audit is satisfied.",
 		],
 		parameters: CreateGoalParams,
+		prepareArguments(args): CreateGoalInput {
+			if (!args || typeof args !== "object" || Array.isArray(args)) {
+				return args as CreateGoalInput;
+			}
+			const input = args as Record<string, unknown>;
+			return {
+				...input,
+				objective: typeof input.objective === "string" ? input.objective.trim() : input.objective,
+			} as CreateGoalInput;
+		},
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (goal && isUnfinishedGoal(goal)) {
 				throw new Error(
