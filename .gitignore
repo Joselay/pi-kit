@@ -1,0 +1,12 @@
+# Credentials and local authentication
+auth.json
+
+# Generated/runtime data
+sessions/
+models-store.json
+
+# Locally installed binaries
+bin/
+
+# OS files
+.DS_Store
