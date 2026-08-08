@@ -359,7 +359,7 @@ class QnAComponent implements Component, Focusable {
 
 		const lines: string[] = [];
 		const renderWidth = Math.max(1, width);
-		const boxWidth = Math.min(renderWidth, 120);
+		const boxWidth = renderWidth;
 		const contentWidth = Math.max(1, boxWidth - 4);
 
 		const horizontalLine = (count: number) => "─".repeat(Math.max(0, count));
