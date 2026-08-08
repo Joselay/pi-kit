@@ -4,6 +4,8 @@ auth.json
 # Generated/runtime data
 sessions/
 models-store.json
+tmux-subagents/
+tmux-subagents.sock
 
 # Locally installed binaries
 bin/
