@@ -270,7 +270,9 @@ class BtwOverlay extends Container implements Focusable {
 	}
 
 	override render(width: number): string[] {
-		const dialogWidth = Math.max(56, Math.min(width, Math.floor(width * 0.9)));
+		// Use the full width allocated by the overlay. Rendering a narrower
+		// dialog here left-aligns it inside the centered overlay bounds.
+		const dialogWidth = width;
 		const innerWidth = Math.max(40, dialogWidth - 2);
 		const terminalRows = process.stdout.rows ?? 30;
 		const dialogHeight = Math.max(16, Math.min(30, Math.floor(terminalRows * 0.75)));
@@ -712,8 +714,8 @@ export default function (pi: ExtensionAPI) {
 						width: "80%",
 						minWidth: 72,
 						maxHeight: "78%",
-						anchor: "top-center",
-						margin: { top: 1, left: 2, right: 2 },
+						anchor: "center",
+						margin: { top: 1, bottom: 1, left: 2, right: 2 },
 					},
 					onHandle: (handle) => {
 						runtime.handle = handle;
