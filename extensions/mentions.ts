@@ -6,7 +6,10 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import {
 	type AutocompleteProvider,
+	CURSOR_MARKER,
 	type EditorComponent,
+	truncateToWidth,
+	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { readFileSync } from "node:fs";
 import { dirname } from "node:path";
@@ -30,6 +33,13 @@ type SkillIndex = {
 type SkillToken = {
 	prefix: string;
 	query: string;
+};
+
+type CursorAwareEditor = EditorComponent & {
+	focused?: boolean;
+	getCursor: () => { line: number; col: number };
+	getLines: () => string[];
+	isShowingAutocomplete?: () => boolean;
 };
 
 function loadSkillIndex(pi: ExtensionAPI): SkillIndex {
@@ -56,7 +66,7 @@ function loadSkillIndex(pi: ExtensionAPI): SkillIndex {
 	const pattern =
 		names.length > 0
 			? new RegExp(
-					`(^|[\\s([{])(\\/(?:skill:)?(?:${names.map(escapeRegExp).join("|")}))(?=[\\s/]|$)`,
+					`(^|[\\s([{])(\\/(?:skill:)?(?:${names.map(escapeRegExp).join("|")}))(?=[\\s/]|${escapeRegExp(CURSOR_MARKER)}|$)`,
 					"g",
 				)
 			: undefined;
@@ -141,6 +151,70 @@ export function skillCandidates(index: SkillIndex, query: string): string[] {
 	return index.names
 		.filter((name) => name.length > query.length && name.startsWith(query))
 		.sort((a, b) => a.length - b.length || a.localeCompare(b));
+}
+
+function isCursorAwareEditor(editor: EditorComponent): editor is CursorAwareEditor {
+	const candidate = editor as Partial<CursorAwareEditor>;
+	return typeof candidate.getCursor === "function" && typeof candidate.getLines === "function";
+}
+
+function ghostSuffix(editor: CursorAwareEditor, index: SkillIndex): string | undefined {
+	const cursor = editor.getCursor();
+	const line = editor.getLines()[cursor.line] ?? "";
+	const beforeCursor = line.slice(0, cursor.col);
+	if (inSlashPalette(cursor.line, beforeCursor)) return undefined;
+
+	const afterCursor = line.slice(cursor.col);
+	if (afterCursor !== "" && !afterCursor.startsWith(" ")) return undefined;
+
+	const token = extractSkillToken(beforeCursor);
+	if (!token) return undefined;
+	const best = skillCandidates(index, token.query)[0];
+	return best?.slice(token.query.length);
+}
+
+const CURSOR_CELL_START = "\x1b[7m";
+const CURSOR_CELL_END = "\x1b[0m";
+
+export function injectGhost(
+	lines: string[],
+	ghost: string,
+	theme: ExtensionContext["ui"]["theme"],
+): string[] {
+	const lineIndex = lines.findIndex((line) => line.includes(CURSOR_MARKER));
+	if (lineIndex === -1) return lines;
+
+	const line = lines[lineIndex]!;
+	const markerEnd = line.indexOf(CURSOR_MARKER) + CURSOR_MARKER.length;
+	const cellStart = line.indexOf(CURSOR_CELL_START, markerEnd);
+	if (cellStart === -1) return lines;
+
+	const graphemeStart = cellStart + CURSOR_CELL_START.length;
+	const cellEnd = line.indexOf(CURSOR_CELL_END, graphemeStart);
+	if (cellEnd === -1) return lines;
+
+	const cursorGrapheme = line.slice(graphemeStart, cellEnd);
+	const after = line.slice(cellEnd + CURSOR_CELL_END.length);
+	const trailing = after.trimEnd();
+	const padding = visibleWidth(after) - visibleWidth(trailing);
+	const cursorAtLineEnd = cursorGrapheme === " " && trailing === "";
+	const budget = cursorAtLineEnd ? padding + 1 : padding;
+	const text = [...ghost].slice(0, budget).join("");
+	const head = text[0];
+	if (!head) return lines;
+
+	const painted =
+		line.slice(0, cellStart) +
+		CURSOR_CELL_START +
+		head +
+		CURSOR_CELL_END +
+		(text.length > head.length ? theme.fg("dim", text.slice(head.length)) : "") +
+		(cursorAtLineEnd ? "" : cursorGrapheme) +
+		after;
+
+	const next = [...lines];
+	next[lineIndex] = truncateToWidth(painted, visibleWidth(line), "");
+	return next;
 }
 
 export function highlightSkillMentions(
@@ -250,6 +324,15 @@ function installEditor(ctx: ExtensionContext, getIndex: () => SkillIndex): void 
 				highlighted = highlightSkillMentions(base, getIndex(), ctx.ui.theme);
 				highlighted = highlightFileMentions(highlighted, ctx.ui.theme);
 			} catch {
+			}
+
+			if (
+				isCursorAwareEditor(editor) &&
+				editor.focused !== false &&
+				!editor.isShowingAutocomplete?.()
+			) {
+				const ghost = ghostSuffix(editor, getIndex());
+				if (ghost) return injectGhost(highlighted, ghost, ctx.ui.theme);
 			}
 
 			return highlighted;
