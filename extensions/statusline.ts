@@ -160,10 +160,25 @@ function mergeUsage(current: Usage | undefined, update: Usage): Usage {
 	return { groups: [...groups.values()] };
 }
 
-function visibleGroups(usage: Usage | undefined, model: Model | undefined): UsageGroup[] {
-	if (!usage || model?.provider !== CODEX_PROVIDER) return [];
+function visibleGroup(usage: Usage | undefined, model: Model | undefined): UsageGroup | undefined {
+	if (!usage || model?.provider !== CODEX_PROVIDER) return undefined;
 	const activeKind: UsageKind = model.id.toLowerCase() === SPARK_MODEL ? "spark" : "codex";
-	return usage.groups.filter((group) => group.kind === activeKind);
+	const candidates = usage.groups.filter((group) => group.kind === activeKind);
+	const preferred = activeKind === "codex"
+		? candidates.find((group) => group.id === "codex")
+		: candidates.find((group) => group.id.includes("bengalfox") || group.id.includes("spark"));
+	return preferred ?? candidates[0];
+}
+
+function visibleParts(usage: Usage | undefined, model: Model | undefined): UsagePart[] {
+	const seen = new Set<string>();
+	return (visibleGroup(usage, model)?.parts ?? []).filter((part) => {
+		// Malformed or transitional payloads can repeat a duration in both slots.
+		const key = `${part.window}:${part.label.toLowerCase()}`;
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	});
 }
 
 async function fetchUsage(ctx: ExtensionContext): Promise<Usage | undefined> {
@@ -249,12 +264,12 @@ export default function statusline(pi: ExtensionAPI): void {
 					let modelText = color.model(model?.id || "no-model");
 					if (model?.reasoning) modelText += color.model(` (${thinkingLevel})`);
 					if (fastActive) modelText += separator() + color.session("fast");
-					const limits = visibleGroups(usage, model).flatMap((group) => group.parts.map((part) => {
+					const limits = visibleParts(usage, model).map((part) => {
 						const remaining = Math.max(0, 100 - part.used);
 						return (part.window === "weekly" ? color.weekly : color.session)(
 							`${part.label} [${renderBar(remaining)}] ${remaining}% left`,
 						);
-					}));
+					});
 					const line = [project.join(separator()), modelText, color.context(contextLeft(contextUsage, model?.contextWindow ?? 0)), ...limits].join(separator());
 					const lines = [truncateToWidth(line, width, dim("..."))];
 					const statuses = [...footerData.getExtensionStatuses().entries()]
