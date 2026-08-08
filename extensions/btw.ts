@@ -1,5 +1,5 @@
 import {
-	buildSessionContext,
+	BorderedLoader,
 	createAgentSession,
 	createExtensionRuntime,
 	getMarkdownTheme,
@@ -33,6 +33,13 @@ const BTW_SYSTEM_PROMPT = [
 	"Help with focused questions, planning, and quick explorations.",
 	"Be direct and practical.",
 ].join(" ");
+
+const BTW_OVERLAY_MARGIN = 1;
+const BTW_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const BTW_SPINNER_INTERVAL_MS = 80;
+
+const BTW_OVERLAY_WIDTH_PCT = 62;
+const BTW_OVERLAY_HEIGHT_PCT = 85;
 
 const BTW_SUMMARY_PROMPT =
 	"Summarize this side conversation for handoff into the main conversation. Keep key decisions, findings, risks, and next actions. Output only the summary.";
@@ -75,6 +82,41 @@ type ToolCallInfo = {
 	status: "running" | "done" | "error";
 };
 
+type NotifyLevel = "info" | "warning" | "error";
+
+function errorText(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function messageText(message: unknown): string {
+	const content = (message as { content?: unknown } | undefined)?.content;
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter(
+			(block): block is { type: "text"; text: string } =>
+				isRecord(block) && block.type === "text" && typeof block.text === "string",
+		)
+		.map((block) => block.text)
+		.join("\n");
+}
+
+function notify(ctx: ExtensionContext, message: string, level: NotifyLevel = "info"): void {
+	if (ctx.hasUI) ctx.ui.notify(message, level);
+}
+
+function lastAssistantIn<T extends { role?: string }>(messages: readonly T[]): T | undefined {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message?.role === "assistant") return message;
+	}
+	return undefined;
+}
+
 function stripDynamicSystemPromptFooter(systemPrompt: string): string {
 	return systemPrompt
 		.replace(/\nCurrent date and time:[^\n]*(?:\nCurrent working directory:[^\n]*)?$/u, "")
@@ -93,58 +135,38 @@ function createBtwResourceLoader(ctx: ExtensionContext, appendSystemPrompt: stri
 		getThemes: () => ({ themes: [], diagnostics: [] }),
 		getAgentsFiles: () => ({ agentsFiles: [] }),
 		getSystemPrompt: () => systemPrompt,
+		getSystemPromptSource: () => undefined,
 		getAppendSystemPrompt: () => appendSystemPrompt,
+		getAppendSystemPromptSources: () => [],
 		extendResources: () => {},
 		reload: async () => {},
 	};
 }
 
-function extractText(parts: AssistantMessage["content"]): string {
-	return parts
-		.filter((part) => part.type === "text")
-		.map((part) => part.text)
-		.join("\n")
-		.trim();
-}
-
-function extractEventAssistantText(message: unknown): string {
-	if (!message || typeof message !== "object") {
+function extractEventParts(message: unknown, kind: "text" | "thinking"): string {
+	const candidate = message as { role?: unknown; content?: unknown } | null | undefined;
+	if (!isRecord(candidate) || candidate.role !== "assistant" || !Array.isArray(candidate.content)) {
 		return "";
 	}
 
-	const maybeMessage = message as { role?: unknown; content?: unknown };
-	if (maybeMessage.role !== "assistant" || !Array.isArray(maybeMessage.content)) {
-		return "";
-	}
-
-	return maybeMessage.content
-		.filter((part): part is { type: "text"; text: string } => {
-			return !!part && typeof part === "object" && (part as { type?: unknown }).type === "text";
-		})
-		.map((part) => part.text)
+	return candidate.content
+		.map((part) => (isRecord(part) && part.type === kind && typeof part[kind] === "string" ? part[kind] : ""))
+		.filter((text) => text.length > 0)
 		.join("\n")
 		.trim();
 }
 
 function getLastAssistantMessage(session: AgentSession): AssistantMessage | null {
-	for (let i = session.state.messages.length - 1; i >= 0; i--) {
-		const message = session.state.messages[i];
-		if (message.role === "assistant") {
-			return message as AssistantMessage;
-		}
-	}
-
-	return null;
+	return (lastAssistantIn(session.state.messages) as AssistantMessage | undefined) ?? null;
 }
 
 function buildSeedMessages(ctx: ExtensionContext, thread: BtwDetails[]): Message[] {
 	const seed: Message[] = [];
 
 	try {
-		const contextMessages = buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId()).messages;
+		const contextMessages = ctx.sessionManager.buildSessionContext().messages;
 		seed.push(...(contextMessages.filter((message) => "role" in message) as Message[]));
 	} catch {
-		// Ignore context seed failures and continue with an empty side thread.
 	}
 
 	for (const item of thread) {
@@ -185,20 +207,12 @@ function formatThread(thread: BtwDetails[]): string {
 		.join("\n\n---\n\n");
 }
 
-function notify(ctx: ExtensionContext | ExtensionCommandContext, message: string, level: "info" | "warning" | "error"): void {
-	if (ctx.hasUI) {
-		ctx.ui.notify(message, level);
-	}
-}
-
-
-class BtwOverlay extends Container implements Focusable {
+export class BtwOverlay extends Container implements Focusable {
 	private readonly input: Input;
 	private readonly tui: TUI;
 	private readonly theme: ExtensionContext["ui"]["theme"];
 	private readonly keybindings: KeybindingsManager;
 	private readonly getTranscript: (width: number, theme: ExtensionContext["ui"]["theme"]) => string[];
-	private readonly getStatus: () => string;
 	private readonly onSubmitCallback: (value: string) => void;
 	private readonly onDismissCallback: () => void;
 	private _focused = false;
@@ -217,7 +231,6 @@ class BtwOverlay extends Container implements Focusable {
 		theme: ExtensionContext["ui"]["theme"],
 		keybindings: KeybindingsManager,
 		getTranscript: (width: number, theme: ExtensionContext["ui"]["theme"]) => string[],
-		getStatus: () => string,
 		onSubmit: (value: string) => void,
 		onDismiss: () => void,
 	) {
@@ -226,7 +239,6 @@ class BtwOverlay extends Container implements Focusable {
 		this.theme = theme;
 		this.keybindings = keybindings;
 		this.getTranscript = getTranscript;
-		this.getStatus = getStatus;
 		this.onSubmitCallback = onSubmit;
 		this.onDismissCallback = onDismiss;
 
@@ -257,60 +269,91 @@ class BtwOverlay extends Container implements Focusable {
 		return this.input.getValue();
 	}
 
-	private frameLine(content: string, innerWidth: number): string {
-		const truncated = truncateToWidth(content, innerWidth, "");
-		const padding = Math.max(0, innerWidth - visibleWidth(truncated));
-		return `${this.theme.fg("borderMuted", "│")}${truncated}${" ".repeat(padding)}${this.theme.fg("borderMuted", "│")}`;
+	private static readonly PAD = 1;
+
+	private frameLine(content: string, contentWidth: number): string {
+		const truncated = truncateToWidth(content, contentWidth, "");
+		const padding = Math.max(0, contentWidth - visibleWidth(truncated));
+		const gutter = " ".repeat(BtwOverlay.PAD);
+		const border = this.theme.fg("borderMuted", "│");
+		return `${border}${gutter}${truncated}${" ".repeat(padding)}${gutter}${border}`;
 	}
 
-	private borderLine(innerWidth: number, edge: "top" | "bottom"): string {
-		const left = edge === "top" ? "┌" : "└";
-		const right = edge === "top" ? "┐" : "┘";
+	private borderLine(innerWidth: number, edge: "top" | "bottom" | "middle"): string {
+		const [left, right] = edge === "top" ? ["┌", "┐"] : edge === "bottom" ? ["└", "┘"] : ["├", "┤"];
 		return this.theme.fg("borderMuted", `${left}${"─".repeat(innerWidth)}${right}`);
 	}
 
+	private shortcutHint(keybinding: "tui.select.confirm" | "tui.select.cancel", description: string): string {
+		const keys = this.keybindings.getKeys(keybinding).join("/");
+		return this.theme.fg("dim", keys) + this.theme.fg("muted", ` ${description}`);
+	}
+
 	override render(width: number): string[] {
-		// Use the full width allocated by the overlay. Rendering a narrower
-		// dialog here left-aligns it inside the centered overlay bounds.
+		if (width <= 0) return [];
+		if (width < 6) return [truncateToWidth("BTW", width, "")];
 		const dialogWidth = width;
-		const innerWidth = Math.max(40, dialogWidth - 2);
-		const terminalRows = process.stdout.rows ?? 30;
-		const dialogHeight = Math.max(16, Math.min(30, Math.floor(terminalRows * 0.75)));
+		const innerWidth = dialogWidth - 2;
+		const contentWidth = Math.max(1, innerWidth - BtwOverlay.PAD * 2);
+
+		const terminalRows = this.tui.terminal.rows || 30;
+		const availRows = Math.max(1, terminalRows - BTW_OVERLAY_MARGIN * 2);
+		const dialogHeight = Math.max(
+			1,
+			Math.min(Math.floor((terminalRows * BTW_OVERLAY_HEIGHT_PCT) / 100), availRows),
+		);
 		const chromeHeight = 7;
-		const transcriptHeight = Math.max(6, dialogHeight - chromeHeight);
-
-		// Markdown renders to innerWidth already — no manual wrapping needed
-		const transcript = this.getTranscript(innerWidth, this.theme);
-		const visibleTranscript = transcript.slice(-transcriptHeight);
-		const transcriptPadding = Math.max(0, transcriptHeight - visibleTranscript.length);
-
-		const status = this.getStatus();
 
 		const previousFocused = this.input.focused;
 		this.input.focused = false;
-		const inputLine = this.input.render(innerWidth)[0] ?? "";
+		const rendered = this.input.render(contentWidth)[0] ?? "";
+		const prompt = this.theme.fg("accent", "❯ ");
+		const body = rendered.startsWith("> ") ? rendered.slice(2) : rendered;
+		const placeholder = this.theme.fg("dim", "Ask on the side — stays out of the main chat");
+		const inputLine = this.input.getValue()
+			? prompt + body
+			: `${prompt}\x1b[7m \x1b[27m${placeholder}`;
 		this.input.focused = previousFocused;
+
+		if (dialogHeight < chromeHeight) {
+			const compact = [
+				this.borderLine(innerWidth, "top"),
+				this.frameLine(this.theme.fg("accent", this.theme.bold("BTW")), contentWidth),
+				this.frameLine(inputLine, contentWidth),
+				this.borderLine(innerWidth, "bottom"),
+			];
+			if (dialogHeight === 1) return [compact[2]!];
+			if (dialogHeight === 2) return [compact[1]!, compact[2]!];
+			return compact.slice(0, dialogHeight);
+		}
+
+		const transcriptHeight = dialogHeight - chromeHeight;
+		const transcript = this.getTranscript(contentWidth, this.theme);
+		const visibleTranscript = transcriptHeight > 0 ? transcript.slice(-transcriptHeight) : [];
+		const transcriptPadding = Math.max(0, transcriptHeight - visibleTranscript.length);
 
 		const lines = [
 			this.borderLine(innerWidth, "top"),
-			this.frameLine(this.theme.fg("accent", this.theme.bold(" BTW side chat ")), innerWidth),
-			this.frameLine(this.theme.fg("dim", "Separate side conversation. Esc closes."), innerWidth),
-			this.theme.fg("borderMuted", `├${"─".repeat(innerWidth)}┤`),
+			this.frameLine(this.theme.fg("accent", this.theme.bold("BTW side chat")), contentWidth),
+			this.frameLine(
+				this.theme.fg("muted", "Separate side conversation · ") +
+					this.shortcutHint("tui.select.confirm", "submit") +
+					this.theme.fg("muted", " · ") +
+					this.shortcutHint("tui.select.cancel", "close"),
+				contentWidth,
+			),
+			this.borderLine(innerWidth, "middle"),
 		];
 
 		for (const line of visibleTranscript) {
-			lines.push(this.frameLine(line, innerWidth));
+			lines.push(this.frameLine(line, contentWidth));
 		}
 		for (let i = 0; i < transcriptPadding; i++) {
-			lines.push(this.frameLine("", innerWidth));
+			lines.push(this.frameLine("", contentWidth));
 		}
 
-		lines.push(this.theme.fg("borderMuted", `├${"─".repeat(innerWidth)}┤`));
-		lines.push(this.frameLine(this.theme.fg("warning", status), innerWidth));
-		lines.push(
-			`${this.theme.fg("borderMuted", "│")}${inputLine}${this.theme.fg("borderMuted", "│")}`,
-		);
-		lines.push(this.frameLine(this.theme.fg("dim", "Enter submit · Esc close"), innerWidth));
+		lines.push(this.borderLine(innerWidth, "middle"));
+		lines.push(this.frameLine(inputLine, contentWidth));
 		lines.push(this.borderLine(innerWidth, "bottom"));
 
 		return lines;
@@ -322,19 +365,44 @@ export default function (pi: ExtensionAPI) {
 	let pendingQuestion: string | null = null;
 	let pendingAnswer = "";
 	let pendingError: string | null = null;
+	let pendingThinking = "";
 	let pendingToolCalls: ToolCallInfo[] = [];
 	let sideBusy = false;
-	let overlayStatus = "Ready";
 	let overlayDraft = "";
 	let overlayRuntime: OverlayRuntime | null = null;
 	let activeSideSession: SideSessionRuntime | null = null;
 	let overlayRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+	let spinnerFrame = 0;
+	let spinnerTimer: ReturnType<typeof setInterval> | null = null;
 
 	const mdTheme = getMarkdownTheme();
 
+	function spinner(): string {
+		return BTW_SPINNER_FRAMES[spinnerFrame % BTW_SPINNER_FRAMES.length];
+	}
+
+	function startSpinner(): void {
+		if (spinnerTimer) {
+			return;
+		}
+		spinnerFrame = 0;
+		spinnerTimer = setInterval(() => {
+			spinnerFrame = (spinnerFrame + 1) % BTW_SPINNER_FRAMES.length;
+			syncOverlay();
+		}, BTW_SPINNER_INTERVAL_MS);
+		spinnerTimer.unref?.();
+	}
+
+	function stopSpinner(): void {
+		if (spinnerTimer) {
+			clearInterval(spinnerTimer);
+			spinnerTimer = null;
+		}
+	}
+
 	function getModelKey(ctx: ExtensionContext): string {
 		const model = ctx.model;
-		return model ? `${model.provider}/${model.id}` : "none";
+		return model ? `${model.provider}/${model.id}/${pi.getThinkingLevel()}` : "none";
 	}
 
 	function renderMarkdownLines(text: string, width: number): string[] {
@@ -343,7 +411,6 @@ export default function (pi: ExtensionAPI) {
 			const md = new Markdown(text, 0, 0, mdTheme);
 			return md.render(width);
 		} catch {
-			// Fall back to plain text wrapping if Markdown rendering fails
 			return text.split("\n").flatMap((line) => {
 				if (!line) return [""];
 				const wrapped: string[] = [];
@@ -375,10 +442,10 @@ export default function (pi: ExtensionAPI) {
 	function renderToolCallLines(toolCalls: ToolCallInfo[], theme: ExtensionContext["ui"]["theme"], width: number): string[] {
 		const lines: string[] = [];
 		for (const tc of toolCalls) {
-			const icon = tc.status === "running" ? "⚙" : tc.status === "error" ? "✗" : "✓";
-			const color = tc.status === "error" ? "error" : tc.status === "done" ? "success" : "dim";
+			const icon = tc.status === "running" ? spinner() : tc.status === "error" ? "✗" : "✓";
+			const color = tc.status === "error" ? "error" : tc.status === "done" ? "success" : "accent";
 			const label = theme.fg(color, `${icon} `) + theme.fg("toolTitle", tc.toolName);
-			const argsText = tc.args ? theme.fg("dim", ` ${tc.args}`) : "";
+			const argsText = tc.args ? theme.fg("toolOutput", ` ${tc.args}`) : "";
 			lines.push(truncateToWidth(`  ${label}${argsText}`, width, ""));
 		}
 		return lines;
@@ -388,23 +455,21 @@ export default function (pi: ExtensionAPI) {
 		try {
 			return getTranscriptLinesInner(width, theme);
 		} catch (error) {
-			return [theme.fg("error", `Render error: ${error instanceof Error ? error.message : String(error)}`)];
+			return [theme.fg("error", `Render error: ${errorText(error)}`)];
 		}
 	}
 
 	function getTranscriptLinesInner(width: number, theme: ExtensionContext["ui"]["theme"]): string[] {
 		if (thread.length === 0 && !pendingQuestion && !pendingAnswer && !pendingError) {
-			return [theme.fg("dim", "No BTW messages yet. Type a question below.")];
+			return [theme.fg("muted", "No BTW messages yet. Type a question below.")];
 		}
 
 		const lines: string[] = [];
-		for (const item of thread.slice(-6)) {
-			// User message
+		for (const item of thread) {
 			const userText = item.question.trim().split("\n")[0];
-			lines.push(theme.fg("accent", theme.bold("You: ")) + truncateToWidth(userText, width - 5, "…"));
+			lines.push(theme.fg("mdHeading", theme.bold("You: ")) + truncateToWidth(userText, width - 5, "…"));
 			lines.push("");
 
-			// Assistant message rendered as markdown
 			const mdLines = renderMarkdownLines(item.answer, width);
 			lines.push(...mdLines);
 			lines.push("");
@@ -412,25 +477,32 @@ export default function (pi: ExtensionAPI) {
 
 		if (pendingQuestion) {
 			const userText = pendingQuestion.trim().split("\n")[0];
-			lines.push(theme.fg("accent", theme.bold("You: ")) + truncateToWidth(userText, width - 5, "…"));
+			lines.push(theme.fg("mdHeading", theme.bold("You: ")) + truncateToWidth(userText, width - 5, "…"));
 
-			// Show tool calls inline
 			if (pendingToolCalls.length > 0) {
 				lines.push(...renderToolCallLines(pendingToolCalls, theme, width));
 			}
 
 			if (pendingError) {
-				lines.push(theme.fg("error", `❌ ${pendingError}`));
+				lines.push(theme.fg("error", `✗ ${pendingError}`));
 			} else if (pendingAnswer) {
 				lines.push("");
 				const mdLines = renderMarkdownLines(pendingAnswer, width);
 				lines.push(...mdLines);
 			} else if (pendingToolCalls.length === 0) {
-				lines.push(theme.fg("dim", "…"));
+				lines.push("");
+				const reasoningTail = pendingThinking
+					.split("\n")
+					.map((line) => line.trim())
+					.filter(Boolean)
+					.pop();
+				lines.push(theme.fg("accent", spinner()) + theme.fg("muted", reasoningTail ? " Thinking…" : " Waiting for model…"));
+				if (reasoningTail) {
+					lines.push(theme.fg("thinkingText", truncateToWidth(reasoningTail, width, "…")));
+				}
 			}
 		}
 
-		// Trim trailing empty line
 		while (lines.length > 0 && lines[lines.length - 1] === "") {
 			lines.pop();
 		}
@@ -439,6 +511,14 @@ export default function (pi: ExtensionAPI) {
 
 	function syncOverlay(): void {
 		overlayRuntime?.refresh?.();
+	}
+
+	function stopOverlayActivity(): void {
+		stopSpinner();
+		if (overlayRefreshTimer) {
+			clearTimeout(overlayRefreshTimer);
+			overlayRefreshTimer = null;
+		}
 	}
 
 	function scheduleOverlayRefresh(): void {
@@ -452,27 +532,26 @@ export default function (pi: ExtensionAPI) {
 		}, 16);
 	}
 
-	function setOverlayStatus(status: string, throttled = false): void {
-		overlayStatus = status;
-		if (throttled) {
-			scheduleOverlayRefresh();
-		} else {
-			syncOverlay();
-		}
-	}
-
 	function dismissOverlay(): void {
 		overlayRuntime?.close?.();
 		overlayRuntime = null;
-		if (overlayRefreshTimer) {
-			clearTimeout(overlayRefreshTimer);
-			overlayRefreshTimer = null;
-		}
+		stopOverlayActivity();
 	}
 
 	function setOverlayDraft(value: string): void {
 		overlayDraft = value;
 		overlayRuntime?.setDraft?.(value);
+	}
+
+	function clearThreadState(): void {
+		thread = [];
+		pendingQuestion = null;
+		pendingAnswer = "";
+		pendingError = null;
+		pendingThinking = "";
+		pendingToolCalls = [];
+		sideBusy = false;
+		setOverlayDraft("");
 	}
 
 	async function disposeSideSession(): Promise<void> {
@@ -485,31 +564,19 @@ export default function (pi: ExtensionAPI) {
 		try {
 			current.unsubscribe();
 		} catch {
-			// Ignore unsubscribe errors during cleanup.
 		}
 
 		try {
 			await current.session.abort();
 		} catch {
-			// Ignore abort errors during cleanup.
 		}
 		current.session.dispose();
 
-		if (overlayRefreshTimer) {
-			clearTimeout(overlayRefreshTimer);
-			overlayRefreshTimer = null;
-		}
+		stopOverlayActivity();
 	}
 
-	async function resetThread(ctx: ExtensionContext | ExtensionCommandContext, persist = true): Promise<void> {
-		thread = [];
-		pendingQuestion = null;
-		pendingAnswer = "";
-		pendingError = null;
-		pendingToolCalls = [];
-		sideBusy = false;
-		setOverlayDraft("");
-		setOverlayStatus("Ready");
+	async function resetThread(_ctx: ExtensionContext | ExtensionCommandContext, persist = true): Promise<void> {
+		clearThreadState();
 		await disposeSideSession();
 		if (persist) {
 			const details: BtwResetDetails = { timestamp: Date.now() };
@@ -520,14 +587,7 @@ export default function (pi: ExtensionAPI) {
 
 	async function restoreThread(ctx: ExtensionContext): Promise<void> {
 		await disposeSideSession();
-		thread = [];
-		pendingQuestion = null;
-		pendingAnswer = "";
-		pendingError = null;
-		pendingToolCalls = [];
-		sideBusy = false;
-		overlayStatus = "Ready";
-		overlayDraft = "";
+		clearThreadState();
 		const branch = ctx.sessionManager.getBranch();
 		let lastResetIndex = -1;
 		for (let i = 0; i < branch.length; i++) {
@@ -559,7 +619,6 @@ export default function (pi: ExtensionAPI) {
 		const { session } = await createAgentSession({
 			sessionManager: SessionManager.inMemory(),
 			model: ctx.model,
-			modelRegistry: ctx.modelRegistry as AgentSession["modelRegistry"],
 			thinkingLevel: pi.getThinkingLevel() as SessionThinkingLevel,
 			tools: ["read", "bash", "edit", "write"],
 			resourceLoader: createBtwResourceLoader(ctx),
@@ -579,42 +638,38 @@ export default function (pi: ExtensionAPI) {
 				case "message_start":
 				case "message_update":
 				case "message_end": {
-					const streamed = extractEventAssistantText(event.message);
+					const streamed = extractEventParts(event.message, "text");
 					if (streamed) {
 						pendingAnswer = streamed;
 						pendingError = null;
 					}
-					setOverlayStatus(event.type === "message_end" ? "Finalizing side response..." : "Streaming side response...", true);
+					const reasoning = extractEventParts(event.message, "thinking");
+					if (reasoning) {
+						pendingThinking = reasoning;
+					}
+					scheduleOverlayRefresh();
 					return;
 				}
 				case "tool_execution_start": {
-					const toolName = (event as { toolName?: string }).toolName ?? "unknown";
-					try {
-						pendingToolCalls.push({
-							toolCallId: (event as { toolCallId?: string }).toolCallId ?? "",
-							toolName,
-							args: formatToolArgs(toolName, (event as { args?: unknown }).args),
-							status: "running",
-						});
-					} catch {
-						// Ignore tool tracking failures
-					}
-					setOverlayStatus(`Running tool: ${toolName}...`, true);
+					pendingToolCalls.push({
+						toolCallId: event.toolCallId,
+						toolName: event.toolName,
+						args: formatToolArgs(event.toolName, event.args),
+						status: "running",
+					});
+					scheduleOverlayRefresh();
 					return;
 				}
 				case "tool_execution_end": {
-					const endToolName = (event as { toolName?: string }).toolName ?? "unknown";
-					const tc = pendingToolCalls.find(
-						(t) => t.toolName === endToolName && t.status === "running",
-					);
+					const tc = pendingToolCalls.find((t) => t.toolCallId === event.toolCallId);
 					if (tc) {
-						tc.status = (event as { isError?: boolean }).isError ? "error" : "done";
+						tc.status = event.isError ? "error" : "done";
 					}
-					setOverlayStatus("Streaming side response...", true);
+					scheduleOverlayRefresh();
 					return;
 				}
 				case "turn_end": {
-					setOverlayStatus("Finalizing side response...", true);
+					scheduleOverlayRefresh();
 					return;
 				}
 				default:
@@ -644,14 +699,14 @@ export default function (pi: ExtensionAPI) {
 		return activeSideSession;
 	}
 
-	async function ensureOverlay(ctx: ExtensionCommandContext | ExtensionContext): Promise<void> {
-		if (!ctx.hasUI) {
+	async function ensureOverlay(ctx: ExtensionCommandContext): Promise<void> {
+		if (!ctx.hasUI || ctx.mode !== "tui") {
 			return;
 		}
 
-		if (overlayRuntime?.handle) {
-			overlayRuntime.handle.setHidden(false);
-			overlayRuntime.handle.focus();
+		if (overlayRuntime) {
+			overlayRuntime.handle?.setHidden(false);
+			overlayRuntime.handle?.focus();
 			overlayRuntime.refresh?.();
 			return;
 		}
@@ -681,7 +736,6 @@ export default function (pi: ExtensionAPI) {
 						theme,
 						keybindings,
 						(width, t) => getTranscriptLines(width, t),
-						() => overlayStatus,
 						(value) => {
 							void submitFromOverlay(ctx, value);
 						},
@@ -711,11 +765,11 @@ export default function (pi: ExtensionAPI) {
 				{
 					overlay: true,
 					overlayOptions: {
-						width: "80%",
-						minWidth: 72,
-						maxHeight: "78%",
+						width: `${BTW_OVERLAY_WIDTH_PCT}%`,
+						minWidth: 56,
+						maxHeight: `${BTW_OVERLAY_HEIGHT_PCT}%`,
 						anchor: "center",
-						margin: { top: 1, bottom: 1, left: 2, right: 2 },
+						margin: BTW_OVERLAY_MARGIN,
 					},
 					onHandle: (handle) => {
 						runtime.handle = handle;
@@ -730,11 +784,11 @@ export default function (pi: ExtensionAPI) {
 				if (overlayRuntime === runtime) {
 					overlayRuntime = null;
 				}
-				notify(ctx, error instanceof Error ? error.message : String(error), "error");
+				notify(ctx, errorText(error), "error");
 			});
 	}
 
-	async function summarizeThread(ctx: ExtensionContext, items: BtwDetails[]): Promise<string> {
+	async function summarizeThread(ctx: ExtensionCommandContext, items: BtwDetails[]): Promise<string | null> {
 		const model = ctx.model;
 		if (!model) {
 			throw new Error("No active model selected.");
@@ -745,48 +799,79 @@ export default function (pi: ExtensionAPI) {
 			throw new Error(auth.error);
 		}
 
-		const { session } = await createAgentSession({
-			sessionManager: SessionManager.inMemory(),
-			model,
-			modelRegistry: ctx.modelRegistry as AgentSession["modelRegistry"],
-			thinkingLevel: "off",
-			tools: [],
-			resourceLoader: createBtwResourceLoader(ctx, [BTW_SUMMARY_PROMPT]),
+		let summaryError: string | undefined;
+		const summary = await ctx.ui.custom<string | null>((tui, theme, _keybindings, done) => {
+			const loader = new BorderedLoader(tui, theme, "Summarizing BTW side chat...");
+			let settled = false;
+			const finish = (value: string | null) => {
+				if (settled) return;
+				settled = true;
+				done(value);
+			};
+			loader.onAbort = () => finish(null);
+
+			const message: Message = {
+				role: "user",
+				content: [{ type: "text", text: formatThread(items) }],
+				timestamp: Date.now(),
+			};
+			const systemPrompt = `${stripDynamicSystemPromptFooter(ctx.getSystemPrompt())}\n\n${BTW_SUMMARY_PROMPT}`;
+
+			void ctx.modelRegistry
+				.complete(
+					model,
+					{ systemPrompt, messages: [message] },
+					{
+						apiKey: auth.apiKey,
+						headers: auth.headers,
+						env: auth.env,
+						signal: loader.signal,
+						cacheRetention: "none",
+						sessionId: ctx.sessionManager.getSessionId(),
+					},
+				)
+				.then((response) => {
+					if (response.stopReason === "aborted") {
+						finish(null);
+						return;
+					}
+					if (response.stopReason === "error") {
+						summaryError = response.errorMessage || "Summary request failed.";
+						finish(null);
+						return;
+					}
+					const text = messageText(response).trim();
+					if (!text) {
+						summaryError = "Summary finished without a response.";
+						finish(null);
+						return;
+					}
+					finish(text);
+				})
+				.catch((error: unknown) => {
+					summaryError = errorText(error);
+					finish(null);
+				});
+
+			return loader;
 		});
 
-		try {
-			await session.prompt(formatThread(items), { source: "extension" });
-			const response = getLastAssistantMessage(session);
-			if (!response) {
-				throw new Error("Summary finished without a response.");
-			}
-			if (response.stopReason === "aborted") {
-				throw new Error("Summary request was aborted.");
-			}
-			if (response.stopReason === "error") {
-				throw new Error(response.errorMessage || "Summary request failed.");
-			}
-
-			return extractText(response.content) || "(No summary generated)";
-		} finally {
-			try {
-				await session.abort();
-			} catch {
-				// Ignore abort errors during temporary session teardown.
-			}
-			session.dispose();
-		}
+		if (summaryError) throw new Error(summaryError);
+		return summary;
 	}
 
-	async function injectSummaryIntoMain(ctx: ExtensionContext | ExtensionCommandContext): Promise<void> {
+	async function injectSummaryIntoMain(ctx: ExtensionCommandContext): Promise<void> {
 		if (thread.length === 0) {
 			notify(ctx, "No BTW thread to summarize.", "warning");
 			return;
 		}
 
-		setOverlayStatus("Summarizing BTW thread for injection...");
 		try {
 			const summary = await summarizeThread(ctx, thread);
+			if (summary === null) {
+				notify(ctx, "BTW summary cancelled.", "info");
+				return;
+			}
 			const message = `Summary of my BTW side conversation:\n\n${summary}`;
 			if (ctx.isIdle()) {
 				pi.sendUserMessage(message);
@@ -797,11 +882,11 @@ export default function (pi: ExtensionAPI) {
 			await resetThread(ctx);
 			notify(ctx, "Injected BTW summary into main chat.", "info");
 		} catch (error) {
-			notify(ctx, error instanceof Error ? error.message : String(error), "error");
+			notify(ctx, errorText(error), "error");
 		}
 	}
 
-	async function closeOverlayFlow(ctx: ExtensionContext | ExtensionCommandContext): Promise<void> {
+	async function closeOverlayFlow(ctx: ExtensionCommandContext): Promise<void> {
 		dismissOverlay();
 		if (!ctx.hasUI) {
 			return;
@@ -818,41 +903,40 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function runBtwPrompt(ctx: ExtensionCommandContext, question: string): Promise<void> {
-		const model = ctx.model;
-		if (!model) {
-			setOverlayStatus("No active model selected.");
-			notify(ctx, "No active model selected.", "error");
-			return;
-		}
-
-		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-		if (auth.ok === false) {
-			const message = auth.error;
-			setOverlayStatus(message);
-			notify(ctx, message, "error");
-			return;
-		}
-
 		if (sideBusy) {
 			notify(ctx, "BTW is still processing the previous message.", "warning");
 			return;
 		}
 
-		const side = await ensureSideSession(ctx);
-		if (!side) {
-			notify(ctx, "Unable to create BTW side session.", "error");
+		const model = ctx.model;
+		if (!model) {
+			notify(ctx, "No active model selected.", "error");
 			return;
 		}
 
 		sideBusy = true;
-		pendingQuestion = question;
-		pendingAnswer = "";
-		pendingError = null;
-		pendingToolCalls = [];
-		setOverlayStatus("Streaming side response...");
-		syncOverlay();
-
 		try {
+			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+			if (auth.ok === false) {
+				const message = auth.error;
+				notify(ctx, message, "error");
+				return;
+			}
+
+			const side = await ensureSideSession(ctx);
+			if (!side) {
+				notify(ctx, "Unable to create BTW side session.", "error");
+				return;
+			}
+
+			pendingQuestion = question;
+			pendingAnswer = "";
+			pendingError = null;
+			pendingThinking = "";
+			pendingToolCalls = [];
+			startSpinner();
+			syncOverlay();
+
 			await side.session.prompt(question, { source: "extension" });
 			const response = getLastAssistantMessage(side.session);
 			if (!response) {
@@ -865,7 +949,7 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(response.errorMessage || "BTW request failed.");
 			}
 
-			const answer = extractText(response.content) || "(No text response)";
+			const answer = messageText(response).trim() || "(No text response)";
 			pendingAnswer = answer;
 			const details: BtwDetails = {
 				question,
@@ -882,31 +966,24 @@ export default function (pi: ExtensionAPI) {
 			pendingQuestion = null;
 			pendingAnswer = "";
 			pendingToolCalls = [];
-			setOverlayStatus("Ready for the next side question.");
 		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
+			const message = errorText(error);
 			pendingError = message;
-			setOverlayStatus("BTW request failed.");
 			notify(ctx, message, "error");
 		} finally {
 			sideBusy = false;
+			stopSpinner();
 			syncOverlay();
 		}
 	}
 
-	async function submitFromOverlay(ctx: ExtensionContext | ExtensionCommandContext, rawValue: string): Promise<void> {
+	async function submitFromOverlay(ctx: ExtensionCommandContext, rawValue: string): Promise<void> {
 		const question = rawValue.trim();
 		if (!question) {
-			setOverlayStatus("Enter a question first.");
 			return;
 		}
 
 		setOverlayDraft("");
-		if (!("waitForIdle" in ctx)) {
-			setOverlayStatus("BTW submit requires command context. Re-open with /btw.");
-			return;
-		}
-
 		await runBtwPrompt(ctx, question);
 	}
 
@@ -922,19 +999,14 @@ export default function (pi: ExtensionAPI) {
 						"Start fresh",
 					]);
 					if (choice === "Continue previous conversation") {
-						// Dispose session so it's recreated with fresh main context on next submit
 						await disposeSideSession();
-						setOverlayStatus("Continuing BTW thread.");
 						await ensureOverlay(ctx);
 					} else if (choice === "Start fresh") {
 						await resetThread(ctx, true);
-						setOverlayStatus("Ready");
 						await ensureOverlay(ctx);
 					}
-					// null = user cancelled (Esc), do nothing
 				} else {
-					await resetThread(ctx, true);
-					setOverlayStatus("Ready");
+					await resetThread(ctx, thread.length > 0);
 					await ensureOverlay(ctx);
 				}
 				return;
