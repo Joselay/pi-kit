@@ -610,10 +610,8 @@ export type EditParams = Static<typeof EDIT_SCHEMA>;
 export function prepareEditArguments(args: unknown): EditParams {
 	if (typeof args === "string") return { input: args };
 	if (typeof args === "object" && args !== null && !Array.isArray(args)) {
-		for (const key of ["input", "patch", "text", "content"]) {
-			const value = (args as Record<string, unknown>)[key];
-			if (typeof value === "string") return { input: value };
-		}
+		const input = (args as Record<string, unknown>).input;
+		if (typeof input === "string") return { input };
 	}
 	return args as EditParams;
 }

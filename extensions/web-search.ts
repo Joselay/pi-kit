@@ -1066,21 +1066,6 @@ export default function (pi: ExtensionAPI) {
 		parameters: commandsSchema,
 		executionMode: "parallel",
 		renderShell: "self",
-		prepareArguments(args): SearchCommands {
-			if (!args || typeof args !== "object" || Array.isArray(args)) return args as SearchCommands;
-			const input = args as Record<string, unknown>;
-			if (!Array.isArray(input.sports)) return args as SearchCommands;
-			return {
-				...input,
-				sports: input.sports.map((operation) => {
-					if (!operation || typeof operation !== "object" || Array.isArray(operation)) return operation;
-					const record = operation as Record<string, unknown>;
-					if (record.tool !== "sports") return operation;
-					const { tool: _legacyTool, ...current } = record;
-					return current;
-				}),
-			} as SearchCommands;
-		},
 
 		async execute(toolCallId, params, signal, _onUpdate, ctx) {
 			const hasOperation = [

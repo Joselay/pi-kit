@@ -10,7 +10,7 @@ import { randomUUID } from "node:crypto";
 
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Type, type Static } from "typebox";
+import { Type } from "typebox";
 
 const STATE_TYPE = "goal";
 const UI_MESSAGE_TYPE = "goal-ui";
@@ -58,8 +58,6 @@ const UpdateGoalParams = Type.Object({
 	}),
 }, { additionalProperties: false });
 
-type CreateGoalInput = Static<typeof CreateGoalParams>;
-
 function nowSeconds(): number {
 	return Math.floor(Date.now() / 1000);
 }
@@ -105,10 +103,8 @@ function normalizeStatus(value: unknown): GoalStatus {
 		case "complete":
 			return value;
 		case "usageLimited":
-		case "usage_limited":
 			return "usageLimited";
 		case "budgetLimited":
-		case "budget_limited":
 			return "budgetLimited";
 		default:
 			return "active";
@@ -804,16 +800,6 @@ export default function goalExtension(pi: ExtensionAPI) {
 			"Use update_goal with status blocked only when the strict blocked audit is satisfied.",
 		],
 		parameters: CreateGoalParams,
-		prepareArguments(args): CreateGoalInput {
-			if (!args || typeof args !== "object" || Array.isArray(args)) {
-				return args as CreateGoalInput;
-			}
-			const input = args as Record<string, unknown>;
-			return {
-				...input,
-				objective: typeof input.objective === "string" ? input.objective.trim() : input.objective,
-			} as CreateGoalInput;
-		},
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (goal && isUnfinishedGoal(goal)) {
 				throw new Error(

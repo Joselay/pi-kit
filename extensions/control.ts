@@ -529,13 +529,8 @@ function parseSenderInfo(text: string): SenderInfo | null {
 				};
 			}
 		} catch {
-			// Ignore JSON parse errors, fall back to legacy parsing.
+			return null;
 		}
-	}
-
-	const legacyIdMatch = raw.match(/session\s+([a-f0-9-]{6,})/i);
-	if (legacyIdMatch) {
-		return { sessionId: legacyIdMatch[1] };
 	}
 
 	return null;

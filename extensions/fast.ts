@@ -96,8 +96,6 @@ function modelSupportsCodexFastMode(model: Model | undefined): boolean {
 		if (hasPriorityTier) return true;
 	}
 
-	const legacyTiers = catalogModel.additional_speed_tiers ?? catalogModel.additionalSpeedTiers;
-	if (Array.isArray(legacyTiers)) return legacyTiers.includes("fast");
 	if (Array.isArray(tiers)) return false;
 
 	return CODEX_FAST_MODE_MODELS.has(model.id);

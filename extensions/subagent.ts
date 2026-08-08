@@ -128,31 +128,12 @@ function attachToSubagentAndExit(rawTarget: string): never {
 		process.exit(2);
 	}
 
-	let socket = tmuxSocketPath();
-	let session: string;
-	if (target.startsWith("v1.")) {
-		// Keep attachment working for sessions started before session-id targets.
-		try {
-			const legacy = JSON.parse(Buffer.from(target.slice(3), "base64url").toString("utf8")) as {
-				s?: unknown;
-				p?: unknown;
-			};
-			if (typeof legacy.s !== "string" || !legacy.s || typeof legacy.p !== "string" || !legacy.p) {
-				throw new Error("missing tmux session or socket");
-			}
-			session = legacy.s;
-			socket = legacy.p;
-		} catch (error) {
-			console.error(`Error: invalid legacy subagent target: ${error instanceof Error ? error.message : String(error)}`);
-			process.exit(2);
-		}
-	} else {
-		if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(target)) {
-			console.error(`Error: invalid subagent session id: ${target}`);
-			process.exit(2);
-		}
-		session = tmuxSessionName(target);
+	const socket = tmuxSocketPath();
+	if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(target)) {
+		console.error(`Error: invalid subagent session id: ${target}`);
+		process.exit(2);
 	}
+	const session = tmuxSessionName(target);
 
 	const sameServer = currentTmuxSocket() === socket;
 	const args = ["-S", socket, sameServer ? "switch-client" : "attach-session", "-t", session];
