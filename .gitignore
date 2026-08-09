@@ -1,5 +1,6 @@
 # Credentials and local authentication
 auth.json
+trust.json
 
 # Generated/runtime data
 sessions/
