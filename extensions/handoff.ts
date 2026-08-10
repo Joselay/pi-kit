@@ -136,12 +136,15 @@ export default function handoffExtension(pi: ExtensionAPI) {
 				serializeConversation(convertToLlm(sessionContext.messages)),
 				ctx.cwd,
 			);
+			const generationMessage = args.trim()
+				? `Generating handoff document...\n\n${args}`
+				: "Generating handoff document...";
 			const focus = redactSensitiveText(args.trim(), ctx.cwd) || "None supplied.";
 			const availableSkills = redactSensitiveText(formatSkills(ctx.getSystemPromptOptions().skills), ctx.cwd);
 			let generationError: string | undefined;
 
 			const generated = await ctx.ui.custom<string | null>((tui, theme, _keybindings, done) => {
-				const loader = new BorderedLoader(tui, theme, "Generating handoff document...");
+				const loader = new BorderedLoader(tui, theme, generationMessage);
 				let settled = false;
 
 				const finish = (value: string | null) => {
