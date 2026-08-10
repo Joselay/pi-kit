@@ -382,6 +382,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 	let activeSinceMs: number | null = null;
 	let activeGoalIdAtAgentStart: string | null = null;
 	let continuationQueued = false;
+	let statusTimer: ReturnType<typeof setInterval> | null = null;
 
 	function currentGoalSnapshot(): Goal | null {
 		if (!goal) return null;
@@ -442,6 +443,21 @@ export default function goalExtension(pi: ExtensionAPI) {
 				ctx.ui.setStatus("goal", theme.fg("success", "Goal complete"));
 				break;
 		}
+	}
+
+	function stopStatusTimer(): void {
+		if (statusTimer === null) return;
+		clearInterval(statusTimer);
+		statusTimer = null;
+	}
+
+	function startStatusTimer(ctx: ExtensionContext): void {
+		stopStatusTimer();
+		if (!ctx.hasUI) return;
+		statusTimer = setInterval(() => {
+			if (goal?.status === "active") updateStatus(ctx);
+		}, 1_000);
+		statusTimer.unref();
 	}
 
 	function showGoalMessage(content: string): void {
@@ -573,8 +589,15 @@ export default function goalExtension(pi: ExtensionAPI) {
 		updateStatus(ctx);
 	}
 
-	pi.on("session_start", async (_event, ctx) => reconstructState(ctx));
+	pi.on("session_start", async (_event, ctx) => {
+		reconstructState(ctx);
+		startStatusTimer(ctx);
+	});
 	pi.on("session_tree", async (_event, ctx) => reconstructState(ctx));
+	pi.on("session_shutdown", async () => {
+		stopStatusTimer();
+		if (accountElapsed()) persist("account");
+	});
 
 	pi.on("before_agent_start", async (event) => {
 		const snapshot = currentGoalSnapshot();
