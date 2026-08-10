@@ -321,7 +321,6 @@ async function selectCurrent(ui, title, options, current, descriptions = {}) {
   return options[labels.indexOf(selected)];
 }
 var RECORDING_FRAMES = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
-var TRANSCRIBING_FRAMES = ["·  ", "·· ", "···"];
 var RAINBOW_COLORS = [
   [255, 80, 80],
   [255, 165, 60],
@@ -607,12 +606,9 @@ function decorateDictationEditor(editor, tui, isEnabled, setDictationActive, hol
     animationFrame = 0;
     rainbowFrame = 0;
     stopAnimation();
-    if (state !== "idle") {
+    if (state === "recording") {
       animationTimer = setInterval(() => {
-        if (dictationState === "recording")
-          rainbowFrame++;
-        else
-          animationFrame++;
+        rainbowFrame++;
         tui.requestRender();
       }, 120);
     }
@@ -677,19 +673,16 @@ function decorateDictationEditor(editor, tui, isEnabled, setDictationActive, hol
   const render = originalRender.bind(editor);
   editor.render = (width) => {
     const lines = render(width);
-    if (dictationState === "idle" || lines.length === 0)
+    if (dictationState !== "recording" || lines.length === 0)
       return lines;
-    const frames = dictationState === "recording" ? RECORDING_FRAMES : TRANSCRIBING_FRAMES;
-    const frame = frames[animationFrame % frames.length];
+    const frame = RECORDING_FRAMES[animationFrame % RECORDING_FRAMES.length];
     const transcriptLimit = Math.max(12, width - 20);
     const visibleTranscript = liveTranscript.length > transcriptLimit
       ? `\u2026${liveTranscript.slice(-(transcriptLimit - 1))}`
       : liveTranscript;
     const transcript = visibleTranscript ? ` ${visibleTranscript}\u258C` : "";
     const borderColor = (text) => editor.borderColor?.(text) ?? text;
-    const coloredFrame = dictationState === "recording"
-      ? rainbowColor(frame, rainbowFrame)
-      : borderColor(frame);
+    const coloredFrame = rainbowColor(frame, rainbowFrame);
     const label = `${borderColor(" ")}${coloredFrame}${borderColor(`${transcript} `)}`;
     for (let index = 1;index < lines.length - 1; index++) {
       const line = lines[index];
