@@ -320,8 +320,37 @@ async function selectCurrent(ui, title, options, current, descriptions = {}) {
     return;
   return options[labels.indexOf(selected)];
 }
-var RECORDING_FRAMES = ["▁▁▂▃▂▁▁", "▁▂▃▅▃▂▁", "▂▃▅▇▅▃▂", "▃▅▇█▇▅▃", "▂▃▅▇▅▃▂", "▁▂▃▅▃▂▁"];
+var RECORDING_FRAMES = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 var TRANSCRIBING_FRAMES = ["·  ", "·· ", "···"];
+var RAINBOW_COLORS = [
+  [255, 80, 80],
+  [255, 165, 60],
+  [255, 225, 70],
+  [80, 220, 120],
+  [70, 200, 255],
+  [100, 120, 255],
+  [200, 100, 255]
+];
+
+function rainbowColor(text, frame) {
+  const [red, green, blue] = RAINBOW_COLORS[frame % RAINBOW_COLORS.length];
+  return `\x1B[38;2;${red};${green};${blue}m${text}\x1B[0m`;
+}
+
+function recordingLevel(pcm) {
+  const samples = Math.floor(pcm.length / 2);
+  if (samples === 0)
+    return 0;
+  let sumSquares = 0;
+  for (let offset = 0;offset + 1 < pcm.length; offset += 2) {
+    const sample = pcm.readInt16LE(offset) / 32768;
+    sumSquares += sample * sample;
+  }
+  const rms = Math.sqrt(sumSquares / samples);
+  const decibels = 20 * Math.log10(Math.max(rms, 1e-7));
+  const voice = Math.max(0, Math.min(1, (decibels + 42) / 30));
+  return Math.round(voice * (RECORDING_FRAMES.length - 1));
+}
 
 export const DICTATE_EDITOR_BRIDGE = Symbol.for("pi.dictate.editorBridge");
 export interface DictateEditorBridge {
@@ -532,6 +561,7 @@ function decorateDictationEditor(editor, tui, isEnabled, setDictationActive, hol
   let dictationState = "idle";
   let liveTranscript = "";
   let animationFrame = 0;
+  let rainbowFrame = 0;
   let animationTimer;
   let holdTimer;
   let triggerHeld = false;
@@ -575,13 +605,23 @@ function decorateDictationEditor(editor, tui, isEnabled, setDictationActive, hol
     if (state === "idle" || state === "recording")
       liveTranscript = "";
     animationFrame = 0;
+    rainbowFrame = 0;
     stopAnimation();
     if (state !== "idle") {
       animationTimer = setInterval(() => {
-        animationFrame++;
+        if (dictationState === "recording")
+          rainbowFrame++;
+        else
+          animationFrame++;
         tui.requestRender();
       }, 120);
     }
+    tui.requestRender();
+  };
+  const setDictationLevel = (level) => {
+    if (dictationState !== "recording")
+      return;
+    animationFrame = Math.max(0, Math.min(RECORDING_FRAMES.length - 1, Math.round(level)));
     tui.requestRender();
   };
   const setDictationTranscript = (text) => {
@@ -646,7 +686,11 @@ function decorateDictationEditor(editor, tui, isEnabled, setDictationActive, hol
       ? `\u2026${liveTranscript.slice(-(transcriptLimit - 1))}`
       : liveTranscript;
     const transcript = visibleTranscript ? ` ${visibleTranscript}\u258C` : "";
-    const label = ` ${frame}${transcript} `;
+    const borderColor = (text) => editor.borderColor?.(text) ?? text;
+    const coloredFrame = dictationState === "recording"
+      ? rainbowColor(frame, rainbowFrame)
+      : borderColor(frame);
+    const label = `${borderColor(" ")}${coloredFrame}${borderColor(`${transcript} `)}`;
     for (let index = 1;index < lines.length - 1; index++) {
       const line = lines[index];
       const marker = line.indexOf(CURSOR_MARKER);
@@ -657,7 +701,7 @@ function decorateDictationEditor(editor, tui, isEnabled, setDictationActive, hol
       if (cursorStart === -1 || cursorEnd === -1)
         continue;
       const afterCursor = cursorEnd + "\x1B[0m".length;
-      lines[index] = truncateToWidth(line.slice(0, cursorStart) + (editor.borderColor?.(label) ?? label) + line.slice(afterCursor), width, "");
+      lines[index] = truncateToWidth(line.slice(0, cursorStart) + label + line.slice(afterCursor), width, "");
       break;
     }
     return lines;
@@ -666,6 +710,7 @@ function decorateDictationEditor(editor, tui, isEnabled, setDictationActive, hol
     insertTranscription,
     endTranscription,
     setDictationState,
+    setDictationLevel,
     setDictationTranscript,
     disposeDictation: () => {
       cancelHold();
@@ -736,11 +781,18 @@ function dictate(pi: ExtensionAPI) {
           startedAt: Date.now(),
           stderr: "",
           bytes: 0,
+          level: 0,
           buffered: [],
           closed: new Promise((resolve) => child.once("close", () => resolve()))
         };
         child.stdout?.on("data", (chunk) => {
           item.bytes += chunk.length;
+          const level = recordingLevel(chunk);
+          item.level = level > item.level
+            ? level
+            : Math.max(level, item.level - 1);
+          if (recording === item)
+            editor.setDictationLevel(item.level);
           if (item.session)
             item.session.push(chunk);
           else
