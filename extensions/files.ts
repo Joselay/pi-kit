@@ -25,7 +25,6 @@ import {
 	Container,
 	fuzzyFilter,
 	Input,
-	matchesKey,
 	type SelectItem,
 	SelectList,
 	Spacer,
@@ -277,11 +276,6 @@ const collectRecentFileReferences = (entries: SessionEntry[], cwd: string, limit
 	}
 
 	return results;
-};
-
-const findLatestFileReference = (entries: SessionEntry[], cwd: string): FileReference | null => {
-	const refs = collectRecentFileReferences(entries, cwd, 100);
-	return refs.find((ref) => ref.exists) ?? null;
 };
 
 const toCanonicalPath = (inputPath: string): { canonicalPath: string; isDirectory: boolean } | null => {
@@ -843,8 +837,7 @@ const showFileSelector = async (
 	ctx: ExtensionContext,
 	files: FileEntry[],
 	selectedPath?: string | null,
-	gitRoot?: string | null,
-): Promise<{ selected: FileEntry | null; quickAction: "diff" | null }> => {
+): Promise<FileEntry | null> => {
 	const items: SelectItem[] = files.map((file) => {
 		const directoryLabel = file.isDirectory ? " [directory]" : "";
 		const statusSuffix = file.status ? ` [${file.status}]` : "";
@@ -854,7 +847,6 @@ const showFileSelector = async (
 		};
 	});
 
-	let quickAction: "diff" | null = null;
 	const selection = await ctx.ui.custom<string | null>((tui, theme, keybindings, done) => {
 		const container = new Container();
 		container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
@@ -867,7 +859,7 @@ const showFileSelector = async (
 		const listContainer = new Container();
 		container.addChild(listContainer);
 		container.addChild(
-			new Text(theme.fg("dim", "Type to filter • enter to select • ctrl+shift+d diff • esc to cancel"), 0, 0),
+			new Text(theme.fg("dim", "Type to filter • enter to select • esc to cancel"), 0, 0),
 		);
 		container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
 
@@ -921,21 +913,6 @@ const showFileSelector = async (
 				container.invalidate();
 			},
 			handleInput(data: string) {
-				if (matchesKey(data, "ctrl+shift+d")) {
-					const selected = selectList?.getSelectedItem();
-					if (selected) {
-						const file = files.find((entry) => entry.canonicalPath === selected.value);
-						const canDiff = file?.isTracked && !file.isDirectory && Boolean(gitRoot);
-						if (!canDiff) {
-							ctx.ui.notify("Diff is only available for tracked files", "warning");
-							return;
-						}
-						quickAction = "diff";
-						done(selected.value as string);
-						return;
-					}
-				}
-
 				if (
 					keybindings.matches(data, "tui.select.up") ||
 					keybindings.matches(data, "tui.select.down") ||
@@ -958,8 +935,7 @@ const showFileSelector = async (
 		};
 	});
 
-	const selected = selection ? files.find((file) => file.canonicalPath === selection) ?? null : null;
-	return { selected, quickAction };
+	return selection ? files.find((file) => file.canonicalPath === selection) ?? null : null;
 };
 
 const runFileBrowser = async (pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> => {
@@ -976,7 +952,7 @@ const runFileBrowser = async (pi: ExtensionAPI, ctx: ExtensionContext): Promise<
 
 	let lastSelectedPath: string | null = null;
 	while (true) {
-		const { selected, quickAction } = await showFileSelector(ctx, files, lastSelectedPath, gitRoot);
+		const selected = await showFileSelector(ctx, files, lastSelectedPath);
 		if (!selected) {
 			ctx.ui.notify("Files cancelled", "info");
 			return;
@@ -987,11 +963,6 @@ const runFileBrowser = async (pi: ExtensionAPI, ctx: ExtensionContext): Promise<
 		const canQuickLook = process.platform === "darwin" && !selected.isDirectory;
 		const editCheck = getEditableContent(selected);
 		const canDiff = selected.isTracked && !selected.isDirectory && Boolean(gitRoot);
-
-		if (quickAction === "diff") {
-			await openDiff(pi, ctx, selected, gitRoot);
-			continue;
-		}
 
 		const action = await showActionSelector(ctx, {
 			canQuickLook,
@@ -1034,79 +1005,6 @@ export default function (pi: ExtensionAPI): void {
 		description: "Browse files with git status and session references",
 		handler: async (_args, ctx) => {
 			await runFileBrowser(pi, ctx);
-		},
-	});
-
-	pi.registerShortcut("ctrl+shift+o", {
-		description: "Browse files mentioned in the session",
-		handler: async (ctx) => {
-			await runFileBrowser(pi, ctx);
-		},
-	});
-
-	pi.registerShortcut("ctrl+shift+f", {
-		description: "Reveal the latest file reference in Finder",
-		handler: async (ctx) => {
-			const entries = ctx.sessionManager.getBranch();
-			const latest = findLatestFileReference(entries, ctx.cwd);
-
-			if (!latest) {
-				ctx.ui.notify("No file reference found in the session", "warning");
-				return;
-			}
-
-			const canonical = toCanonicalPath(latest.path);
-			if (!canonical) {
-				ctx.ui.notify(`File not found: ${latest.display}`, "error");
-				return;
-			}
-
-			await revealPath(pi, ctx, {
-				canonicalPath: canonical.canonicalPath,
-				resolvedPath: canonical.canonicalPath,
-				displayPath: latest.display,
-				exists: true,
-				isDirectory: canonical.isDirectory,
-				status: undefined,
-				inRepo: false,
-				isTracked: false,
-				isReferenced: true,
-				hasSessionChange: false,
-				lastTimestamp: 0,
-			});
-		},
-	});
-
-	pi.registerShortcut("ctrl+shift+r", {
-		description: "Quick Look the latest file reference",
-		handler: async (ctx) => {
-			const entries = ctx.sessionManager.getBranch();
-			const latest = findLatestFileReference(entries, ctx.cwd);
-
-			if (!latest) {
-				ctx.ui.notify("No file reference found in the session", "warning");
-				return;
-			}
-
-			const canonical = toCanonicalPath(latest.path);
-			if (!canonical) {
-				ctx.ui.notify(`File not found: ${latest.display}`, "error");
-				return;
-			}
-
-			await quickLookPath(pi, ctx, {
-				canonicalPath: canonical.canonicalPath,
-				resolvedPath: canonical.canonicalPath,
-				displayPath: latest.display,
-				exists: true,
-				isDirectory: canonical.isDirectory,
-				status: undefined,
-				inRepo: false,
-				isTracked: false,
-				isReferenced: true,
-				hasSessionChange: false,
-				lastTimestamp: 0,
-			});
 		},
 	});
 }
