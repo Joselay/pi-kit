@@ -57,22 +57,27 @@ fi
 list_sessions() {
   local label="$1"; shift
   local tmux_cmd=(tmux "$@")
+  local resolved_socket
 
   if ! sessions="$("${tmux_cmd[@]}" list-sessions -F $'#{session_name}\t#{session_attached}\t#{t:session_created}' 2>/dev/null)"; then
-    echo "No tmux server found on $label" >&2
+    [[ "$scan_all" == true ]] || echo "No tmux server found on $label" >&2
     return 1
   fi
+  resolved_socket="$("${tmux_cmd[@]}" display-message -p '#{socket_path}')"
 
   if [[ -n "$query" ]]; then
     sessions="$(printf '%s\n' "$sessions" | grep -iF -- "$query" || true)"
   fi
 
   if [[ -z "$sessions" ]]; then
-    echo "No sessions found on $label"
+    [[ "$scan_all" == true ]] || echo "No sessions found on $label"
     return 0
   fi
 
-  echo "Sessions on $label:"
+  printf 'Sessions on %s (%s):\n' "$label" "$resolved_socket"
+  printf '  Connect: '
+  printf '%q ' tmux -S "$resolved_socket"
+  printf '\n'
   printf '%s\n' "$sessions" | while IFS=$'\t' read -r name attached created; do
     if (( attached > 0 )); then
       attached_label="attached"
@@ -85,8 +90,11 @@ list_sessions() {
 
 if [[ "$scan_all" == true ]]; then
   successful_servers=0
+  seen_sockets=()
   if list_sessions "default socket" -L default; then
     ((successful_servers += 1))
+    default_socket="$(tmux -L default display-message -p '#{socket_path}')"
+    seen_sockets+=("$default_socket")
   fi
 
   sockets=()
@@ -96,12 +104,11 @@ if [[ "$scan_all" == true ]]; then
   fi
 
   if [[ -d "$socket_dir" ]]; then
-    shopt -s nullglob
-    sockets+=("$socket_dir"/*)
-    shopt -u nullglob
+    while IFS= read -r -d '' sock; do
+      sockets+=("$sock")
+    done < <(find "$socket_dir" -maxdepth 2 -type s -print0 2>/dev/null)
   fi
 
-  seen_sockets=()
   for sock in "${sockets[@]}"; do
     [[ -S "$sock" ]] || continue
     already_seen=false

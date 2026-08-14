@@ -107,8 +107,7 @@ elif [[ -n "$socket_path" ]]; then
   tmux_cmd+=(-S "$socket_path")
 fi
 
-start_epoch=$(date +%s)
-deadline=$((start_epoch + timeout))
+deadline=$((SECONDS + timeout))
 
 while true; do
   if ! pane_text="$("${tmux_cmd[@]}" capture-pane -p -J -t "$target" -S "-${lines}" 2>/dev/null)"; then
@@ -131,9 +130,8 @@ while true; do
     exit 0
   fi
 
-  now=$(date +%s)
-  if (( now >= deadline )); then
-    echo "Timed out after ${timeout}s waiting for $required_count occurrence(s) of: $pattern" >&2
+  if (( SECONDS >= deadline )); then
+    echo "Timed out after ${timeout}s waiting for $required_count matching line(s) of: $pattern" >&2
     echo "Last ${lines} lines from $target:" >&2
     printf '%s\n' "$pane_text" >&2
     exit 1

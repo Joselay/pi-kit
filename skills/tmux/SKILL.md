@@ -1,6 +1,6 @@
 ---
 name: tmux
-description: "Tmux operation for interactive CLIs, LLDB and other debuggers, full-screen TUIs, long-running commands, and reconnecting to live sessions."
+description: "Operate interactive CLIs, debuggers, full-screen TUIs, and long-running commands in tmux; reconnect to live sessions when work may already exist."
 ---
 
 # tmux
@@ -9,11 +9,11 @@ Drive one pane through a **checkpoint loop**:
 
 > observe → predict → send once → wait for fresh evidence → observe
 
-Resolve `<skill-dir>` to this file's directory. Keep the literal socket path, session name, and full `session:window.pane` target across tool calls; shell variables do not persist.
+Resolve `<skill-dir>` to this file's directory. Carry the literal socket path, session name, and full `session:window.pane` target across tool calls; shell variables do not persist.
 
-## Start or reconnect
+## Select a session
 
-Reconnect when the requested program may already exist:
+When the requested program may already exist, discover first:
 
 ```bash
 "<skill-dir>/scripts/find-sessions.sh" --all
@@ -22,29 +22,22 @@ tmux -S '<socket>' list-panes -a \
 tmux -S '<socket>' capture-pane -p -J -t '<target>' -S -200
 ```
 
-Otherwise create an isolated one-pane server. Replace the final command with the program itself so its initial screen is observable:
+The discovery output gives the literal socket path and copyable connection arguments. Reconnect only after the pane command and capture identify the requested program.
+
+Otherwise create a one-pane isolated server. Pass the program and each argument separately after `--`:
 
 ```bash
-SOCKET_DIR="${PI_TMUX_SOCKET_DIR:-/tmp/pi-tmux-$UID}"
-RUN_ID="${PI_SESSION_ID:-$(date +%s)-$$}"
-SOCKET="$SOCKET_DIR/${RUN_ID:0:12}.sock"
-SESSION="pi-$(date +%s)-$$"
-TARGET="$SESSION:0.0"
-umask 077
-mkdir -p "$SOCKET_DIR"
-tmux -S "$SOCKET" -f /dev/null new-session -d -s "$SESSION" -n main \
-  'exec env PYTHON_BASIC_REPL=1 python3 -q' \; \
-  set-option -t "$SESSION" remain-on-exit on
-printf 'SOCKET=%s\nSESSION=%s\nTARGET=%s\n' "$SOCKET" "$SESSION" "$TARGET"
+"<skill-dir>/scripts/start-session.sh" -c '<working-directory>' -- \
+  env PYTHON_BASIC_REPL=1 python3 -q
 ```
 
-Use `/dev/null` configuration for isolation; use the user's tmux configuration only when the task tests it. `remain-on-exit` preserves output from early failures.
+The helper uses a unique private socket, `/dev/null` tmux configuration, and `remain-on-exit` so early failure output survives. Use `--user-config` only when testing the user's tmux configuration.
 
-**Checkpoint:** `capture-pane` on one literal target shows the expected program, prompt, or preserved exit output.
+**Checkpoint:** a successful `capture-pane` on the printed `TARGET` shows the expected program, prompt, or preserved exit output.
 
-## Expose
+## Expose access
 
-Give the user literal copy/paste access before driving the program:
+Before driving the program, give the user the literal `MONITOR` and `SNAPSHOT` commands printed by the start helper. For a reconnected session, provide equivalents:
 
 ```text
 Monitor:  tmux -S '<socket>' attach-session -t '<session>'
@@ -52,80 +45,71 @@ Snapshot: tmux -S '<socket>' capture-pane -p -J -t '<target>' -S -200
 Detach:   Ctrl+b d
 ```
 
-**Checkpoint:** both monitor and snapshot commands identify the selected live session.
+**Checkpoint:** `has-session` and `capture-pane` both succeed for the reported identifiers.
 
 ## Drive
 
 ### Observe and predict
 
-Capture before every input:
+Capture immediately before every input:
 
 ```bash
 tmux -S '<socket>' capture-pane -p -J -t '<target>' -S -200
 ```
 
-Name the state expected after the next input: preferably a unique completion marker; otherwise a fresh prompt, output line, screen transition, or process exit. A visible prompt from before the input is stale evidence.
+Name the state expected after the input: preferably a unique completion marker; otherwise a fresh prompt, output line, screen transition, stop reason, or process exit. Existing pane text is stale evidence.
 
 ### Send once and wait
 
-For a prompt that may already occur in history, count it before sending and wait for one additional occurrence. Keep baseline, input, wait, and final capture in one fail-fast shell call:
+Send literal text and `Enter` separately. Send key names such as `C-c`, `C-d`, `Escape`, and arrows only as deliberate control input.
+
+```bash
+tmux -S '<socket>' send-keys -t '<target>' -l -- 'print("PI_DONE_a81f")'
+tmux -S '<socket>' send-keys -t '<target>' Enter
+"<skill-dir>/scripts/wait-for-text.sh" \
+  -S '<socket>' -t '<target>' -F -p 'PI_DONE_a81f' -T 15 -l 4000
+tmux -S '<socket>' capture-pane -p -J -t '<target>' -S -200
+```
+
+Choose a marker that cannot already exist in pane history. When the program cannot emit one and output is append-only, count matching lines before input and wait for one additional matching line:
 
 ```bash
 set -euo pipefail
-SOCKET='<socket>'
-TARGET='<target>'
-WAIT='<skill-dir>/scripts/wait-for-text.sh'
-PATTERN='^>>>'
+SOCKET='<socket>'; TARGET='<target>'; PATTERN='^>>>'
 PANE="$(tmux -S "$SOCKET" capture-pane -p -J -t "$TARGET" -S -4000)"
 SEEN="$(printf '%s\n' "$PANE" | grep -Ec -- "$PATTERN" || true)"
 tmux -S "$SOCKET" send-keys -t "$TARGET" -l -- '2 + 2'
 tmux -S "$SOCKET" send-keys -t "$TARGET" Enter
-"$WAIT" -S "$SOCKET" -t "$TARGET" -p "$PATTERN" \
-  -n "$((SEEN + 1))" -T 15 -l 4000
+"<skill-dir>/scripts/wait-for-text.sh" -S "$SOCKET" -t "$TARGET" \
+  -p "$PATTERN" -n "$((SEEN + 1))" -T 15 -l 4000
 tmux -S "$SOCKET" capture-pane -p -J -t "$TARGET" -S -200
 ```
 
-Send text with `-l --` and send `Enter` separately. Send key names such as `C-c`, `C-d`, `Escape`, or arrow keys only as deliberate control input.
+This fallback counts matching **lines**, so use it only while the baseline remains in retained history. For full-screen redraws, checkpoint on a visible state transition instead.
 
-For a unique marker that cannot predate the input, wait directly:
+A timeout's pane dump is the next observation. Diagnose it before choosing to wait longer, interrupt, or send different input. Retry an input only when fresh evidence proves the program did not receive it. `tmux wait-for` coordinates tmux events, not pane output.
 
-```bash
-"<skill-dir>/scripts/wait-for-text.sh" \
-  -S '<socket>' -t '<target>' -p '<marker>' -T 30 -l 4000
-tmux -S '<socket>' capture-pane -p -J -t '<target>' -S -200
-```
-
-On timeout, treat the helper's pane dump as the next observed state. Diagnose that state before deciding whether to wait longer, interrupt, or send different input. Never retry the same input blindly.
-
-Repeat until the final capture contains the requested outcome. `tmux wait-for` coordinates tmux events, not pane output; use the helper for text checkpoints.
-
-**Checkpoint:** every input has one preceding observation and one fresh resulting state; the final state proves the task outcome.
+**Checkpoint:** every input has one preceding capture and one fresh resulting state; the final capture proves the requested outcome.
 
 ## Close or preserve
 
-Preserve a created session while its program remains useful or when the user requested continued access. Report its monitor command and exact current state.
-
-Otherwise remove only sessions created during this run:
+Preserve a created session when the user requested continued access or its command is still running at handoff. Report its monitor command and exact observed state. Otherwise remove only the session created in this run:
 
 ```bash
-tmux -S '<socket>' kill-session -t '<session>'
-if tmux -S '<socket>' has-session -t '<session>' 2>/dev/null; then
-  echo 'session still exists' >&2
-  exit 1
-fi
+tmux -S '<socket>' kill-session -t '=<session>'
+! tmux -S '<socket>' has-session -t '=<session>' 2>/dev/null
 ```
 
-Leave pre-existing sessions alive unless the user explicitly requests termination.
+Leave reconnected sessions alive unless the user explicitly requests termination.
 
-**Checkpoint:** every created session is either reported live with a monitor command or confirmed absent.
+**Checkpoint:** each created session is either reported live with a working monitor command or confirmed absent.
 
-## Program reference
+## Program checkpoints
 
-- **Python:** start with `PYTHON_BASIC_REPL=1 python3 -q`; checkpoint on `^>>>`.
-- **Debugger selection:** use LLDB unless the user, project, or platform requires another debugger.
-- **LLDB:** start with `lldb -- <program> [args...]`; checkpoint on `^\(lldb\)`. After `run`, `continue`, `next`, or `step`, wait for a fresh stop reason, process exit, or prompt before sending more input. Inspect a stop with `thread list`, `bt`, `frame variable`, and `register read`. Before interrupting, observe that the inferior is running; send `C-c` once, then wait for a fresh stop and prompt. Exit with `quit` and answer a confirmation prompt deliberately.
-- **Other debuggers:** disable pagination where supported, checkpoint on the debugger prompt, observe before interrupting an inferior, and confirm destructive actions.
-- **Full-screen TUIs:** checkpoint on stable screen text or a deliberate state transition; capture after every key sequence.
-- **Long-running commands:** checkpoint on a task-specific marker. Preserve the session while work continues.
+- **Python:** `env PYTHON_BASIC_REPL=1 python3 -q`; prompt `^>>>`.
+- **LLDB:** `lldb -- <program> [args...]`; prompt `^\(lldb\)`. After `run`, `continue`, `next`, or `step`, wait for a fresh stop reason, exit, or prompt. Inspect with `thread list`, `bt`, `frame variable`, and `register read`. Observe that the inferior is running before sending `C-c` once; then wait for a fresh stop and prompt.
+- **Other debuggers:** disable pagination where supported; checkpoint on fresh stops and prompts; confirm destructive actions.
+- **Full-screen TUIs:** checkpoint on stable screen text or a deliberate screen transition; capture after each key sequence.
+- **Long-running commands:** checkpoint on a task-specific marker and preserve while work continues.
 
-Run either helper with `--help` for authoritative options and defaults.
+Run any helper with `--help` for authoritative options and defaults.
