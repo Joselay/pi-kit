@@ -1,97 +1,36 @@
 ---
 name: audio-transcription
-description: "Transcribe local audio/video and Apple Voice Memos quickly with cached MLX Whisper models, including bad/low-quality audio."
+description: Transcribe local audio, video, Voice Memos, dictation, lectures, and meetings with cached MLX Whisper, including rough recordings.
 ---
 
-Use this skill whenever the user asks to transcribe an audio/video file, a Voice Memos export, dictation, lecture, meeting recording, or "bad audio".
+## Workflow
 
-## Core rules
-
-1. **Preserve temporary inputs immediately.** Voice Memo share-sheet paths under `~/Library/Containers/com.apple.VoiceMemos/Data/tmp/.com.apple.uikit.itemprovider...` can disappear. Before probing or experimenting, copy the file to stable `/private/tmp/audio-transcription-inputs/`.
-2. **Use cached local models, not cloud APIs.** Prefer MLX Whisper via `uvx --from mlx-whisper mlx_whisper`; Hugging Face models must be cached in `~/.cache/huggingface/hub/`.
-3. **Force language when known.** For Armin's own dictations this is usually English with an Austrian/German accent, even when the filename is German. Do **not** infer language from filename alone.
-4. **For bad audio, run a hallucination-resistant pass.** Use `--condition-on-previous-text False`, `--word-timestamps True`, and `--hallucination-silence-threshold 2`.
-5. **Deliver a cleaned best-effort transcript.** Compare model output with timestamps/JSON, remove obvious Whisper loops, and mark uncertain spans as `[unclear]` rather than inventing words.
-
-## Fast path
-
-Run from this skill directory:
+1. **Stage first.** For a Voice Memo share-sheet path, run the helper before inspecting or probing the file. Paths under `~/Library/Containers/com.apple.VoiceMemos/Data/tmp/.com.apple.uikit.itemprovider...` can disappear; the helper's first operation copies the input to `/private/tmp/audio-transcription-inputs/`.
+2. **Choose the language.** Pass the user-stated or otherwise known language with `--language`. Use `auto` only when it is genuinely unknown; a filename is not evidence of the spoken language.
+3. **Transcribe.** Run the helper from this skill directory:
 
 ```bash
-cd /Users/mitsuhiko/Development/agent-stuff/skills/audio-transcription
 ./transcribe-audio.py "/path/to/audio.m4a" --language en --quality balanced
 ```
 
-The script:
-- stages a stable copy of the input under `/private/tmp/audio-transcription-inputs/`
-- ensures the selected model is cached (downloads only if missing)
-- writes `txt`, `srt`, `vtt`, `tsv`, and `json` to `/private/tmp/audio-transcriptions/<name>-<timestamp>/`
-- detects obvious hallucination loops and, in `balanced` mode, reruns with the full model if needed
-
-Useful variants:
+   Use `fast` for a draft, `balanced` by default, and `best` for rough or important audio. `balanced` automatically retries suspicious output with the full model. Add `--prompt` only with confirmed names, places, or jargon:
 
 ```bash
-# Quick draft, fastest cached model
-./transcribe-audio.py audio.m4a --language en --quality fast
-
-# Bad/important audio, slower full model
 ./transcribe-audio.py audio.m4a --language en --quality best \
-  --prompt "Armin Ronacher dictating about AI, data centers, Vienna, Donauinsel, shareholder value."
-
-# Auto language detection when language is genuinely unknown
-./transcribe-audio.py audio.m4a --language auto --quality balanced
+  --prompt "Meeting about Project Atlas with Nguyen and Kowalski."
 ```
 
-## Cached models
+   The helper uses local MLX Whisper, downloading a missing model into the Hugging Face cache. It writes `txt`, `srt`, `vtt`, `tsv`, and `json` under `/private/tmp/audio-transcriptions/<name>-<timestamp>/<model>/`.
 
-Default model IDs:
+4. **Review.** Read `transcript.txt`. Inspect the `.srt` or `.json` around uncertain passages and whenever the helper prints a quality warning. If `balanced` created both `turbo/` and `best/`, compare their suspicious passages. Remove obvious hallucination loops; preserve uncertain speech as `[unclear]`. Lightly repair punctuation and paragraphing while preserving meaning.
+5. **Deliver.** Return the cleaned transcript and the output directory. Completion means all text is accounted for, obvious loops are removed, and every unresolved span is marked `[unclear]`.
 
-- Fast/balanced: `mlx-community/whisper-large-v3-turbo`
-- Best fallback: `mlx-community/whisper-large-v3-mlx`
+## Offline preparation
 
-Pre-cache / refresh both models:
+To cache both default models before working offline, run:
 
 ```bash
-cd /Users/mitsuhiko/Development/agent-stuff/skills/audio-transcription
 ./precache-models.py
 ```
 
-Verify cache manually:
-
-```bash
-find ~/.cache/huggingface/hub -maxdepth 1 -type d -name 'models--mlx-community--whisper-large-v3*' -print
-```
-
-If a model is already cached, `mlx_whisper` should say `Fetching 4 files: 100%` almost instantly.
-
-## Manual command template
-
-If the helper script is not suitable, use this command directly:
-
-```bash
-mkdir -p /private/tmp/audio-transcriptions/manual
-uvx --from mlx-whisper mlx_whisper "/stable/copy/of/audio.m4a" \
-  --model mlx-community/whisper-large-v3-turbo \
-  --language en \
-  --condition-on-previous-text False \
-  --word-timestamps True \
-  --hallucination-silence-threshold 2 \
-  --output-format all \
-  --output-dir /private/tmp/audio-transcriptions/manual \
-  --output-name transcript \
-  --verbose False
-```
-
-For especially rough audio, replace the model with `mlx-community/whisper-large-v3-mlx`.
-
-## Quality checks
-
-Inspect the generated `.txt` first, then the `.srt`/`.json` around suspicious areas.
-
-Red flags that require rerun or cleanup:
-- repeated phrases for many lines (eg. `in nature` loops)
-- many zero-duration segments
-- `avg_logprob` is `NaN` or compression ratios are very high in JSON
-- text contradicts obvious context words supplied in the prompt
-
-When finalizing, lightly punctuate and paragraph the transcript, but do not over-edit uncertain content.
+The defaults are `mlx-community/whisper-large-v3-turbo` and `mlx-community/whisper-large-v3-mlx`.
