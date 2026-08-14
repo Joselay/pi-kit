@@ -5,7 +5,6 @@ import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { StringEnum } from "@earendil-works/pi-ai";
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
@@ -23,7 +22,6 @@ const RESULT_ENV = "PI_TMUX_SUBAGENT_RESULT";
 const RUNS_DIR = "tmux-subagents";
 const POLL_INTERVAL_MS = 500;
 const PANE_PREVIEW_LINES = 18;
-const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 const EXTENSION_PATH = fileURLToPath(import.meta.url);
 
 type RunStatus = "queued" | "running" | "completed" | "failed";
@@ -333,37 +331,6 @@ function isSameOrDescendant(base: string, candidate: string): boolean {
 	return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
-function resolveModel(
-	ctx: ExtensionContext,
-	providerOverride: string | undefined,
-	modelOverride: string | undefined,
-): { provider: string; model: string } {
-	const explicitProvider = providerOverride?.trim();
-	const explicitModel = modelOverride?.trim();
-	let provider = explicitProvider || ctx.model?.provider || "";
-	let model = explicitModel || ctx.model?.id || "";
-
-	// A slash in an inherited id can be part of the id itself (for example,
-	// OpenRouter's openai/gpt-* models). Only interpret an explicit model as
-	// provider/model when no separate provider was supplied. If both are given
-	// and the prefixes agree, accept the redundant canonical provider/model form.
-	const slashIndex = explicitModel?.indexOf("/") ?? -1;
-	if (explicitModel && slashIndex > 0) {
-		const modelProvider = explicitModel.slice(0, slashIndex);
-		if (!explicitProvider) {
-			provider = modelProvider;
-			model = explicitModel.slice(slashIndex + 1);
-		} else if (explicitProvider === modelProvider) {
-			model = explicitModel.slice(slashIndex + 1);
-		}
-	}
-
-	if (!provider || !model) {
-		throw new Error("No model is active. Pass both provider and model to the subagent tool.");
-	}
-	return { provider, model };
-}
-
 export default function subagentExtension(pi: ExtensionAPI): void {
 	pi.registerFlag(ATTACH_FLAG, {
 		description: "Attach using the child session id printed by the subagent tool",
@@ -420,7 +387,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 		name: "subagent",
 		label: "Subagent",
 		description:
-			"Run one delegated task in a separate interactive Pi process inside tmux. Calls are serialized: only one child works at a time, even if several calls are requested together. The child inherits the current provider, model, and thinking level unless overridden. Live pane output and a copy/paste pi --attach-subagent command are shown while it runs. Output is capped at 50KB or 2000 lines; the complete child session is preserved on disk.",
+			"Run one delegated task in a separate interactive Pi process inside tmux. Calls are serialized: only one child works at a time, even if several calls are requested together. The child always inherits the exact current provider, model, and thinking level. Live pane output and a copy/paste pi --attach-subagent command are shown while it runs. Output is capped at 50KB or 2000 lines; the complete child session is preserved on disk.",
 		promptSnippet: "Run one delegated task in an observable, tmux-backed Pi session",
 		promptGuidelines: [
 			"Use subagent once per delegated task; subagent calls are serialized automatically, so prefer multiple simple calls over asking one child to orchestrate other children.",
@@ -431,22 +398,14 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 				minLength: 1,
 			}),
 			cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to the current project." })),
-			provider: Type.Optional(Type.String({ description: "Provider override. Defaults to the current provider." })),
-			model: Type.Optional(
-				Type.String({ description: "Model id or provider/model override. Defaults to the current model." }),
-			),
-			thinking: Type.Optional(
-				StringEnum(THINKING_LEVELS, {
-					description: "Thinking level override. Defaults to the current thinking level.",
-				}),
-			),
 		}, { additionalProperties: false }),
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			if (!params.task.trim()) throw new Error("Subagent task must not be empty.");
 			const cwd = path.resolve(ctx.cwd, params.cwd?.trim() || ".");
-			const selectedModel = resolveModel(ctx, params.provider, params.model);
-			const thinking = params.thinking ?? pi.getThinkingLevel();
+			if (!ctx.model) throw new Error("No model is active in the parent session.");
+			const selectedModel = { provider: ctx.model.provider, model: ctx.model.id };
+			const thinking = ctx.thinkingLevel;
 			const childSessionId = randomUUID();
 			const runDir = path.join(getAgentDir(), RUNS_DIR, ctx.sessionManager.getSessionId(), childSessionId);
 			const resultPath = path.join(runDir, "result.json");
@@ -628,10 +587,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			const task = args.task?.trim() || "...";
 			const firstLine = task.split("\n", 1)[0] ?? task;
 			const preview = firstLine.length > 100 ? `${firstLine.slice(0, 100)}…` : firstLine;
-			let text = theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("dim", preview);
-			const overrides = [args.provider, args.model, args.thinking].filter(Boolean);
-			if (overrides.length > 0) text += `\n  ${theme.fg("muted", overrides.join(" · "))}`;
-			return new Text(text, 0, 0);
+			return new Text(theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("dim", preview), 0, 0);
 		},
 
 		renderResult(result, { expanded, isPartial }, theme) {

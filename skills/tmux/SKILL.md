@@ -1,6 +1,6 @@
 ---
 name: tmux
-description: "Tmux checkpoint loop for driving interactive REPLs, debuggers, and TTY applications; observing long-running commands; and reconnecting to live sessions."
+description: "Tmux operation for interactive CLIs, LLDB and other debuggers, full-screen TUIs, long-running commands, and reconnecting to live sessions."
 ---
 
 # tmux
@@ -122,7 +122,9 @@ Leave pre-existing sessions alive unless the user explicitly requests terminatio
 ## Program reference
 
 - **Python:** start with `PYTHON_BASIC_REPL=1 python3 -q`; checkpoint on `^>>>`.
-- **Debuggers:** disable pagination, checkpoint on the debugger prompt, observe before interrupting an inferior, and confirm destructive actions.
+- **Debugger selection:** use LLDB unless the user, project, or platform requires another debugger.
+- **LLDB:** start with `lldb -- <program> [args...]`; checkpoint on `^\(lldb\)`. After `run`, `continue`, `next`, or `step`, wait for a fresh stop reason, process exit, or prompt before sending more input. Inspect a stop with `thread list`, `bt`, `frame variable`, and `register read`. Before interrupting, observe that the inferior is running; send `C-c` once, then wait for a fresh stop and prompt. Exit with `quit` and answer a confirmation prompt deliberately.
+- **Other debuggers:** disable pagination where supported, checkpoint on the debugger prompt, observe before interrupting an inferior, and confirm destructive actions.
 - **Full-screen TUIs:** checkpoint on stable screen text or a deliberate state transition; capture after every key sequence.
 - **Long-running commands:** checkpoint on a task-specific marker. Preserve the session while work continues.
 
