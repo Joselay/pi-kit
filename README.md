@@ -1,21 +1,14 @@
 # Pi Kit
 
-Jose's personal [Pi Coding Agent](https://pi.dev/) toolkit: reusable extensions, skills, prompt commands, themes, and supporting utilities used across projects.
+Jose's personal [Pi Coding Agent](https://pi.dev/) toolkit: reusable extensions, skills, themes, and supporting utilities used across projects.
 
 The repository follows Pi's conventional agent-directory layout:
 
 - [`extensions`](extensions) contains Pi extensions
 - [`skills`](skills) contains agent skills
 - [`themes`](themes) contains Pi themes
-- [`prompts`](prompts) contains prompt commands
 
 Most items are tuned for my workflow and environment, so expect to adjust paths, credentials, account details, or defaults before reusing them elsewhere.
-
-## Prompt Commands
-
-Prompt commands live in [`prompts`](prompts):
-
-- [`/discuss`](prompts/discuss.md) - Planning interviewer mode. It inspects the project first, asks focused questions in short rounds, and stops once the plan is clear enough to implement.
 
 ## Skills
 
@@ -70,7 +63,6 @@ Pi extensions live in [`extensions`](extensions):
 
 Custom themes live in [`themes`](themes):
 
-- [`dayowl.json`](themes/dayowl.json) - Light Day Owl-inspired theme.
 - [`nightowl.json`](themes/nightowl.json) - Dark Night Owl-inspired theme.
 
 ## Support Files and Utilities
