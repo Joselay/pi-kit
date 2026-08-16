@@ -1,6 +1,7 @@
-import { mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { dirname, isAbsolute, resolve as resolvePath } from "node:path";
+import { createHash } from "node:crypto";
+import { mkdir, readFile, realpath, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, isAbsolute, relative, resolve as resolvePath } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
 	generateDiffString,
@@ -473,6 +474,15 @@ export function splitFileLines(contents: string): string[] {
 	return lines;
 }
 
+function detectLineEnding(contents: string): "\n" | "\r\n" | "\r" {
+	const match = contents.match(/\r\n|\r|\n/);
+	return (match?.[0] as "\n" | "\r\n" | "\r" | undefined) ?? "\n";
+}
+
+function normalizeLineEndings(contents: string): string {
+	return contents.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+}
+
 export function computeReplacements(originalLines: string[], path: string, chunks: UpdateFileChunk[]): Replacement[] {
 	const replacements: Replacement[] = [];
 	let lineIndex = 0;
@@ -530,10 +540,17 @@ export function applyReplacements(lines: string[], replacements: Replacement[]):
 }
 
 export function deriveNewContents(path: string, originalContents: string, chunks: UpdateFileChunk[]): string {
-	const originalLines = splitFileLines(originalContents);
+	const hasBom = originalContents.startsWith("\uFEFF");
+	const contentsWithoutBom = hasBom ? originalContents.slice(1) : originalContents;
+	const lineEnding = detectLineEnding(contentsWithoutBom);
+	const endsWithLineEnding = /(?:\r\n|\r|\n)$/.test(contentsWithoutBom);
+	const normalizedContents = normalizeLineEndings(contentsWithoutBom);
+	const originalLines = splitFileLines(normalizedContents);
 	const newLines = applyReplacements(originalLines, computeReplacements(originalLines, path, chunks));
-	if (newLines[newLines.length - 1] !== "") newLines.push("");
-	return newLines.join("\n");
+	let result = newLines.join("\n");
+	if (endsWithLineEnding && result !== "") result += "\n";
+	if (lineEnding !== "\n") result = result.replace(/\n/g, lineEnding);
+	return `${hasBom ? "\uFEFF" : ""}${result}`;
 }
 
 export interface AffectedPaths {
@@ -586,7 +603,8 @@ export const TOOL_DESCRIPTION = `The \`apply_patch\` tool can be used to edit fi
 *** Delete File: obsolete.txt
 *** End Patch
 
-- Paths are relative, never absolute.
+- Paths are relative to the working directory, never absolute, and may not escape it.
+- Add and move destinations must not already exist. Each path may appear in only one hunk per patch.
 - Every added line is prefixed with \`+\`, including under \`*** Add File:\`.
 - Give an update hunk 3 lines of unchanged context above and below each change, without repeating context shared with an adjacent change. Where 3 lines do not locate the snippet uniquely, head the hunk with \`@@ <enclosing class or function>\`, repeating \`@@\` lines to nest.`;
 
@@ -644,8 +662,58 @@ export type ParsedPlan = { changes: PlannedFileChange[] };
 
 export type Preview = { diff: string; files: string[]; firstChangedLine?: number } | { error: string };
 
+function pathEscapesRoot(root: string, target: string): boolean {
+	const relativePath = relative(root, target);
+	return (
+		relativePath === ".." ||
+		relativePath.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) ||
+		isAbsolute(relativePath)
+	);
+}
+
 export function resolveToCwd(cwd: string, path: string): string {
-	return isAbsolute(path) ? resolvePath(path) : resolvePath(cwd, path);
+	if (path === "") throw new Error("Patch paths must not be empty.");
+	if (path.includes("\0")) throw new Error("Patch paths must not contain NUL bytes.");
+	if (isAbsolute(path)) throw new Error(`Patch paths must be relative to the working directory: ${path}`);
+
+	const root = resolvePath(cwd);
+	const resolved = resolvePath(root, path);
+	if (pathEscapesRoot(root, resolved)) throw new Error(`Patch path escapes the working directory: ${path}`);
+	return resolved;
+}
+
+async function canonicalizeExistingAncestor(absolutePath: string): Promise<string> {
+	let current = absolutePath;
+	const missingParts: string[] = [];
+	while (true) {
+		try {
+			const canonical = await realpath(current);
+			return resolvePath(canonical, ...missingParts.reverse());
+		} catch (err) {
+			if (errorCode(err) !== "ENOENT" && errorCode(err) !== "ENOTDIR") throw err;
+			const parent = dirname(current);
+			if (parent === current) throw err;
+			missingParts.push(basename(current));
+			current = parent;
+		}
+	}
+}
+
+async function validatePathWithinCwd(cwd: string, path: string): Promise<string> {
+	const absolutePath = resolveToCwd(cwd, path);
+	const [canonicalRoot, canonicalPath] = await Promise.all([
+		realpath(resolvePath(cwd)),
+		canonicalizeExistingAncestor(absolutePath),
+	]);
+	if (pathEscapesRoot(canonicalRoot, canonicalPath)) {
+		throw new Error(`Patch path resolves outside the working directory: ${path}`);
+	}
+	return absolutePath;
+}
+
+async function pathIdentity(absolutePath: string): Promise<string> {
+	const canonical = await canonicalizeExistingAncestor(absolutePath);
+	return process.platform === "win32" || process.platform === "darwin" ? canonical.toLowerCase() : canonical;
 }
 
 export function uniquePaths(paths: string[]): string[] {
@@ -703,23 +771,175 @@ function utf8ErrorMessage(bytes: Uint8Array): string | undefined {
 	return undefined;
 }
 
-async function writeFileWithMissingParentRetry(absolutePath: string, contents: string): Promise<void> {
+async function writeFileWithMissingParentRetry(
+	absolutePath: string,
+	contents: string,
+	options?: { exclusive?: boolean },
+): Promise<void> {
+	const writeOptions = options?.exclusive ? ({ encoding: "utf-8", flag: "wx" } as const) : "utf-8";
 	try {
-		await writeFile(absolutePath, contents, "utf-8");
+		await writeFile(absolutePath, contents, writeOptions);
 		return;
 	} catch (err) {
-		if (errorCode(err) !== "ENOENT") throw new Error(`Failed to write file ${absolutePath}`);
+		if (errorCode(err) === "EEXIST") throw new Error(`Refusing to overwrite existing file ${absolutePath}`);
+		if (errorCode(err) !== "ENOENT") throw new Error(`Failed to write file ${absolutePath}: ${formatIoError(err)}`);
 	}
 	try {
 		await mkdir(dirname(absolutePath), { recursive: true });
-	} catch {
-		throw new Error(`Failed to create parent directories for ${absolutePath}`);
+	} catch (err) {
+		throw new Error(`Failed to create parent directories for ${absolutePath}: ${formatIoError(err)}`);
 	}
 	try {
-		await writeFile(absolutePath, contents, "utf-8");
-	} catch {
-		throw new Error(`Failed to write file ${absolutePath}`);
+		await writeFile(absolutePath, contents, writeOptions);
+	} catch (err) {
+		if (errorCode(err) === "EEXIST") throw new Error(`Refusing to overwrite existing file ${absolutePath}`);
+		throw new Error(`Failed to write file ${absolutePath}: ${formatIoError(err)}`);
 	}
+}
+
+async function pathExists(absolutePath: string): Promise<boolean> {
+	try {
+		await stat(absolutePath);
+		return true;
+	} catch (err) {
+		if (errorCode(err) === "ENOENT" || errorCode(err) === "ENOTDIR") return false;
+		throw err;
+	}
+}
+
+async function ensurePathDoesNotExist(absolutePath: string): Promise<void> {
+	if (await pathExists(absolutePath)) throw new Error(`Refusing to overwrite existing path ${absolutePath}`);
+}
+
+async function mutationQueuePath(absolutePath: string): Promise<string> {
+	try {
+		return await realpath(absolutePath);
+	} catch (err) {
+		if (errorCode(err) === "ENOENT" || errorCode(err) === "ENOTDIR") return resolvePath(absolutePath);
+		throw err;
+	}
+}
+
+const CROSS_PROCESS_LOCK_RETRY_MS = 15;
+const CROSS_PROCESS_LOCK_OWNER_GRACE_MS = 2_000;
+
+function crossProcessLockPath(key: string): string {
+	const user = typeof process.getuid === "function" ? String(process.getuid()) : "default";
+	const digest = createHash("sha256").update(key).digest("hex");
+	return resolvePath(tmpdir(), `pi-edit-locks-${user}`, digest);
+}
+
+function processIsAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (err) {
+		return errorCode(err) === "EPERM";
+	}
+}
+
+async function lockIsAbandoned(lockPath: string): Promise<boolean> {
+	try {
+		const owner = JSON.parse(await readFile(resolvePath(lockPath, "owner.json"), "utf8")) as {
+			pid?: unknown;
+		};
+		return typeof owner.pid === "number" && !processIsAlive(owner.pid);
+	} catch {
+		try {
+			const age = Date.now() - (await stat(lockPath)).mtimeMs;
+			return age >= CROSS_PROCESS_LOCK_OWNER_GRACE_MS;
+		} catch {
+			return false;
+		}
+	}
+}
+
+async function removeAbandonedLock(lockPath: string): Promise<boolean> {
+	const recoveryPath = `${lockPath}.recovery`;
+	try {
+		await mkdir(recoveryPath);
+	} catch (err) {
+		if (errorCode(err) === "EEXIST") return false;
+		throw err;
+	}
+
+	try {
+		if (!(await lockIsAbandoned(lockPath))) return false;
+		await rm(lockPath, { recursive: true, force: true });
+		return true;
+	} finally {
+		await rm(recoveryPath, { recursive: true, force: true });
+	}
+}
+
+async function acquireCrossProcessLock(key: string, signal?: AbortSignal): Promise<() => Promise<void>> {
+	const lockPath = crossProcessLockPath(key);
+	await mkdir(dirname(lockPath), { recursive: true });
+
+	while (true) {
+		throwIfAborted(signal);
+		try {
+			await mkdir(lockPath);
+			try {
+				await writeFile(
+					resolvePath(lockPath, "owner.json"),
+					JSON.stringify({ pid: process.pid, createdAt: Date.now() }),
+					"utf8",
+				);
+			} catch (err) {
+				await rm(lockPath, { recursive: true, force: true });
+				throw err;
+			}
+			return async () => {
+				await rm(lockPath, { recursive: true, force: true });
+			};
+		} catch (err) {
+			if (errorCode(err) !== "EEXIST") throw err;
+			if (await removeAbandonedLock(lockPath)) continue;
+			await new Promise<void>((resolve, reject) => {
+				const cleanup = () => signal?.removeEventListener("abort", onAbort);
+				const timer = setTimeout(() => {
+					cleanup();
+					resolve();
+				}, CROSS_PROCESS_LOCK_RETRY_MS);
+				const onAbort = () => {
+					clearTimeout(timer);
+					cleanup();
+					reject(new Error("Operation aborted"));
+				};
+				if (signal) {
+					signal.addEventListener("abort", onAbort, { once: true });
+					if (signal.aborted) onAbort();
+				}
+			});
+		}
+	}
+}
+
+async function withFileMutationQueues<T>(
+	absolutePaths: string[],
+	fn: () => Promise<T>,
+	signal?: AbortSignal,
+): Promise<T> {
+	const keyedPaths = await Promise.all(
+		uniquePaths(absolutePaths).map(async (path) => ({ path, key: await mutationQueuePath(path) })),
+	);
+	const entries = keyedPaths
+		.sort((a, b) => a.key.localeCompare(b.key))
+		.filter((entry, index, sorted) => index === 0 || entry.key !== sorted[index - 1].key);
+
+	const acquire = (index: number): Promise<T> =>
+		index >= entries.length
+			? fn()
+			: withFileMutationQueue(entries[index].path, async () => {
+					const release = await acquireCrossProcessLock(entries[index].key, signal);
+					try {
+						return await acquire(index + 1);
+					} finally {
+						await release();
+					}
+				});
+	return acquire(0);
 }
 
 async function ensureNotDirectory(absolutePath: string, context: string): Promise<void> {
@@ -737,12 +957,32 @@ function detailsForChange(path: string, oldText: string, newText: string): EditD
 	return { diff, patch: generateUnifiedPatch(path, oldText, newText), firstChangedLine };
 }
 
+async function validateHunkPaths(hunks: Hunk[], cwd: string): Promise<void> {
+	const claimedPaths = new Map<string, string>();
+	for (const hunk of hunks) {
+		const paths =
+			hunk.kind === "update" && hunk.movePath !== undefined ? [hunk.path, hunk.movePath] : [hunk.path];
+		for (const path of paths) {
+			const absolutePath = await validatePathWithinCwd(cwd, path);
+			const identity = await pathIdentity(absolutePath);
+			const previous = claimedPaths.get(identity);
+			if (previous !== undefined) {
+				throw new Error(
+					`Patch path '${path}' conflicts with '${previous}'. Combine changes to each path into one hunk.`,
+				);
+			}
+			claimedPaths.set(identity, path);
+		}
+	}
+}
+
 async function verifyHunks(hunks: Hunk[], cwd: string): Promise<ParsedPlan> {
 	const changes = new Map<string, PlannedFileChange>();
 
 	for (const hunk of hunks) {
 		const absolutePath = resolveToCwd(cwd, hunk.path);
 		if (hunk.kind === "add") {
+			await ensurePathDoesNotExist(absolutePath);
 			changes.set(absolutePath, { kind: "add", path: hunk.path, absolutePath, oldText: "", newText: hunk.contents });
 			continue;
 		}
@@ -758,13 +998,21 @@ async function verifyHunks(hunks: Hunk[], cwd: string): Promise<ParsedPlan> {
 		}
 
 		const original = await readFileToUpdate(absolutePath);
+		if (hunk.movePath !== undefined) {
+			const destination = resolveToCwd(cwd, hunk.movePath);
+			await ensurePathDoesNotExist(destination);
+		}
+		const newText = deriveNewContents(absolutePath, original, hunk.chunks);
+		if (hunk.movePath === undefined && newText === original) {
+			throw new Error(`No changes made to ${hunk.path}.`);
+		}
 		changes.set(absolutePath, {
 			kind: "update",
 			path: hunk.path,
 			absolutePath,
 			movePath: hunk.movePath,
 			oldText: original,
-			newText: deriveNewContents(absolutePath, original, hunk.chunks),
+			newText,
 		});
 	}
 
@@ -805,6 +1053,7 @@ async function readFileToUpdate(absolutePath: string): Promise<string> {
 
 export async function buildPreviewPlan(text: string, cwd: string, argsComplete: boolean): Promise<ParsedPlan> {
 	const hunks = argsComplete ? parsePatchOrThrow(text) : parsePartialPatch(text);
+	await validateHunkPaths(hunks, cwd);
 	return verifyHunks(hunks, cwd);
 }
 
@@ -839,6 +1088,11 @@ function displayPath(change: PlannedFileChange): string {
 export async function applyPatchText(text: string, cwd: string, signal?: AbortSignal): Promise<EditDetails> {
 	const hunks = parsePatchOrThrow(text);
 	if (hunks.length === 0) throw new Error("No files were modified.");
+	await validateHunkPaths(hunks, cwd);
+	throwIfAborted(signal);
+	// Validate every hunk before mutating any file. Files are checked again while
+	// holding their mutation queues to close races with parallel tool calls.
+	await verifyHunks(hunks, cwd);
 
 	const affected: AffectedPaths = { added: [], modified: [], deleted: [] };
 	const files: EditDetails["files"] = [];
@@ -849,23 +1103,37 @@ export async function applyPatchText(text: string, cwd: string, signal?: AbortSi
 		const absolutePath = resolveToCwd(cwd, hunk.path);
 
 		if (hunk.kind === "add") {
-			await withFileMutationQueue(absolutePath, () => writeFileWithMissingParentRetry(absolutePath, hunk.contents));
+			await withFileMutationQueues(
+				[absolutePath],
+				async () => {
+					throwIfAborted(signal);
+					await validatePathWithinCwd(cwd, hunk.path);
+					await writeFileWithMissingParentRetry(absolutePath, hunk.contents, { exclusive: true });
+				},
+				signal,
+			);
 			files.push({ path: affectedPath, kind: "add", details: detailsForChange(affectedPath, "", hunk.contents) });
 			affected.added.push(affectedPath);
 			continue;
 		}
 
 		if (hunk.kind === "delete") {
-			const oldText = await withFileMutationQueue(absolutePath, async () => {
-				const contents = await readFileText(absolutePath).catch(() => "");
-				await ensureNotDirectory(absolutePath, `Failed to delete file ${absolutePath}`);
-				try {
-					await unlink(absolutePath);
-				} catch {
-					throw new Error(`Failed to delete file ${absolutePath}`);
-				}
-				return contents;
-			});
+			const oldText = await withFileMutationQueues(
+				[absolutePath],
+				async () => {
+					await validatePathWithinCwd(cwd, hunk.path);
+					const contents = await readFileText(absolutePath);
+					throwIfAborted(signal);
+					await ensureNotDirectory(absolutePath, `Failed to delete file ${absolutePath}`);
+					try {
+						await unlink(absolutePath);
+					} catch (err) {
+						throw new Error(`Failed to delete file ${absolutePath}: ${formatIoError(err)}`);
+					}
+					return contents;
+				},
+				signal,
+			);
 			files.push({ path: affectedPath, kind: "delete", details: detailsForChange(affectedPath, oldText, "") });
 			affected.deleted.push(affectedPath);
 			continue;
@@ -885,30 +1153,45 @@ async function applyUpdateHunk(
 	cwd: string,
 	signal?: AbortSignal,
 ): Promise<EditDetailsLike> {
-	return withFileMutationQueue(absolutePath, async () => {
-		const original = await readFileToUpdate(absolutePath);
-		throwIfAborted(signal);
-		const newContents = deriveNewContents(absolutePath, original, hunk.chunks);
-
-		if (hunk.movePath === undefined) {
-			try {
-				await writeFile(absolutePath, newContents, "utf-8");
-			} catch {
-				throw new Error(`Failed to write file ${absolutePath}`);
+	const destination = hunk.movePath === undefined ? undefined : resolveToCwd(cwd, hunk.movePath);
+	return withFileMutationQueues(
+		destination === undefined ? [absolutePath] : [absolutePath, destination],
+		async () => {
+			await validatePathWithinCwd(cwd, hunk.path);
+			if (hunk.movePath !== undefined) await validatePathWithinCwd(cwd, hunk.movePath);
+			const original = await readFileToUpdate(absolutePath);
+			throwIfAborted(signal);
+			const newContents = deriveNewContents(absolutePath, original, hunk.chunks);
+			if (hunk.movePath === undefined && newContents === original) {
+				throw new Error(`No changes made to ${hunk.path}.`);
 			}
-			return detailsForChange(hunk.path, original, newContents);
-		}
 
-		const destination = resolveToCwd(cwd, hunk.movePath);
-		await writeFileWithMissingParentRetry(destination, newContents);
-		await ensureNotDirectory(absolutePath, `Failed to remove original ${absolutePath}`);
-		try {
-			await unlink(absolutePath);
-		} catch {
-			throw new Error(`Failed to remove original ${absolutePath}`);
-		}
-		return detailsForChange(hunk.movePath, original, newContents);
-	});
+			if (hunk.movePath === undefined) {
+				try {
+					await writeFile(absolutePath, newContents, "utf-8");
+				} catch (err) {
+					throw new Error(`Failed to write file ${absolutePath}: ${formatIoError(err)}`);
+				}
+				return detailsForChange(hunk.path, original, newContents);
+			}
+
+			if (destination === undefined) throw new Error("Move destination is missing.");
+			await ensurePathDoesNotExist(destination);
+			await writeFileWithMissingParentRetry(destination, newContents, { exclusive: true });
+			await ensureNotDirectory(absolutePath, `Failed to remove original ${absolutePath}`);
+			try {
+				await unlink(absolutePath);
+			} catch (err) {
+				try {
+					await unlink(destination);
+				} catch {
+				}
+				throw new Error(`Failed to remove original ${absolutePath}: ${formatIoError(err)}`);
+			}
+			return detailsForChange(hunk.movePath, original, newContents);
+		},
+		signal,
+	);
 }
 
 function combineDetails(files: EditDetails["files"]): Omit<EditDetails, "summary"> {
@@ -981,7 +1264,11 @@ function shortenPath(path: unknown): string {
 
 function linkPath(styledText: string, rawPath: string, cwd: string): string {
 	if (!getCapabilities().hyperlinks) return styledText;
-	return hyperlink(styledText, pathToFileURL(resolveToCwd(cwd, rawPath)).href);
+	try {
+		return hyperlink(styledText, pathToFileURL(resolveToCwd(cwd, rawPath)).href);
+	} catch {
+		return styledText;
+	}
 }
 
 function renderToolPath(rawPath: string | null, theme: Theme, cwd: string, options?: { emptyFallback?: string }): string {
