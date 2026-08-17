@@ -1,6 +1,7 @@
 ---
 name: audio-transcription
 description: Transcribe local audio, video, Voice Memos, dictation, lectures, and meetings with cached MLX Whisper, including rough recordings.
+disable-model-invocation: true
 ---
 
 ## Workflow

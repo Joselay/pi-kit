@@ -1,6 +1,7 @@
 ---
 name: summarize
 description: Convert document-like URLs and local PDF, Office, HTML, or text files to Markdown; use when their contents must be inspected, quoted, extracted, analyzed, or summarized.
+disable-model-invocation: true
 ---
 
 # Document extraction
