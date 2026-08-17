@@ -24,7 +24,7 @@ Skills live in [`skills`](skills). Each skill has a `SKILL.md` plus any helper s
 - [`/summarize`](skills/summarize) - Convert URLs and local documents into Markdown with MarkItDown, optionally summarizing them.
 - [`/tmux`](skills/tmux) - Drive interactive and long-running terminal applications through a tmux checkpoint loop.
 - [`/uv`](skills/uv) - Standardize Python execution, dependencies, scripts, and environments on `uv`.
-- [`/writing-for-agents`](skills/writing-for-agents) - Write reliable skills and agent instruction files such as `AGENTS.md` and `CLAUDE.md`.
+- [`/writing-for-agents`](skills/writing-for-agents) - Write reliable skills and `AGENTS.md` instruction files.
 
 ## Extensions
 
