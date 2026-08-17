@@ -53,7 +53,7 @@ function buildPiStartupInput(sessionFile: string | undefined, prompt: string): s
 	}
 
 	if (prompt.length > 0) {
-		commandParts.push("--", prompt);
+		commandParts.push(prompt);
 	}
 
 	return `${commandParts.map(shellQuote).join(" ")}\n`;
