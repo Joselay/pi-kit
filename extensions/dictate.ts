@@ -291,7 +291,8 @@ var MIN_RECORDING_MS = 150;
 var CLOSE_GRACE_MS2 = 400;
 var FINALIZE_TIMEOUT_MS = 15 * 1000;
 var STDERR_TAIL = 4000;
-var HOLD_TRIGGER_MS = 350;
+// Keep tap-to-type usable without making dictation feel like it starts late.
+var HOLD_TRIGGER_MS = 200;
 var AUTH_HINT2 = "run /login if this persists";
 var REALTIME_URL = "wss://api.openai.com/v1/realtime?intent=transcription";
 var TRANSCRIPTION_MODELS = [
@@ -617,11 +618,17 @@ function decorateDictationEditor(editor, tui, isEnabled, setDictationActive, hol
   const setDictationLevel = (level) => {
     if (dictationState !== "recording")
       return;
-    animationFrame = Math.max(0, Math.min(RECORDING_FRAMES.length - 1, Math.round(level)));
+    const nextFrame = Math.max(0, Math.min(RECORDING_FRAMES.length - 1, Math.round(level)));
+    if (animationFrame === nextFrame)
+      return;
+    animationFrame = nextFrame;
     tui.requestRender();
   };
   const setDictationTranscript = (text) => {
-    liveTranscript = String(text ?? "").replace(/\s+/g, " ").trim();
+    const nextTranscript = String(text ?? "").replace(/\s+/g, " ").trim();
+    if (liveTranscript === nextTranscript)
+      return;
+    liveTranscript = nextTranscript;
     tui.requestRender();
   };
   const originalHandleInput = editor.handleInput;
@@ -851,6 +858,12 @@ function dictate(pi: ExtensionAPI) {
     return pending;
   }
   async function take() {
+    // Stop capture immediately on key release. Previously this waited for auth
+    // and WebSocket setup to settle, recording unwanted trailing audio and
+    // making short dictations noticeably slow to finish.
+    const active = recording;
+    if (active)
+      stopChild(active.child);
     await settled();
     const item = recording;
     if (!item)
