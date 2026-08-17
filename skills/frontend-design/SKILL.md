@@ -1,105 +1,108 @@
 ---
 name: frontend-design
-description: Frontend design for creating new web UI or materially reshaping existing pages, components, and applications; use when visual direction, layout, typography, color, motion, or coded polish is a substantive part of the task.
+description: "Design and implement distinctive, production-ready frontend interfaces with strong aesthetic direction. Use when asked to create or restyle web pages, components, or applications (HTML/CSS/JS, React, Vue, etc.)."
 ---
 
-# Frontend Design
+# Frontend Design Skill
 
-Build a coherent, rendered interface whose visual choices belong to this subject and this brief.
+Design and implement memorable frontend interfaces with a clear, intentional aesthetic. The output must be real, working code — not just mood boards. This skill is about **design thinking + execution**: every visual choice should be rooted in purpose and context.
 
-## Priorities
+## When to Use
 
-1. **Brief wins.** Honor explicit requirements, brand rules, and requested references.
-2. **Task first.** Protect the primary user task, content hierarchy, usability, and accessibility.
-3. **Subject-specific.** Derive the direction from the subject's materials, artifacts, language, audience, and context.
-4. **Signature.** Concentrate distinction in one memorable move; keep supporting elements disciplined.
+Use this skill when the user wants to:
+- Create a new web page, landing page, dashboard, or app UI
+- Design or redesign frontend components or screens
+- Improve typography, layout, color, motion, or overall visual polish
+- Convert a concept or brief into a high‑fidelity, coded interface
 
-## Workflow
+## Inputs to Gather (or Assume)
 
-### 1. Frame
+Before coding, identify:
+- **Purpose & audience**: What problem does this UI solve? Who uses it?
+- **Brand/voice**: Any reference brands, tone, or visual inspiration?
+- **Technical constraints**: Framework, library, CSS strategy, accessibility, performance
+- **Content constraints**: Required copy, assets, data, features
 
-Inspect the existing implementation before proposing a direction. Find the current UI, assets, fonts, tokens, component conventions, and technical constraints. Preserve useful inherited decisions.
+If the user did not provide this, ask **2–4 targeted questions**, or state reasonable assumptions in a short preface.
 
-Identify:
+## Design Thinking (Required)
 
-- the subject and audience;
-- the interface's primary task;
-- whether the work is marketing/editorial, product/workflow, or component/system UI;
-- which constraints are explicit and which choices remain open.
+Commit to a **single, bold aesthetic direction**. Name it and execute it consistently. Examples:
+- Brutalist / raw / utilitarian
+- Editorial / magazine / typographic
+- Luxury / refined / minimal
+- Retro‑futuristic / cyber / neon
+- Art‑deco / geometric / ornamental
+- Handcrafted / organic / textured
 
-When the brief leaves these open, choose a concrete framing rather than designing for an abstract product, and record the assumption.
+**Avoid generic AI aesthetics.** No “default” fonts, color schemes, or stock layouts.
 
-**Done when:** the subject, audience, primary task, interface context, inherited system, and every explicit constraint are accounted for.
+Before writing code, define the system:
+1. **Visual direction** — one sentence that describes the vibe
+2. **Differentiator** — what should be memorable about this UI?
+3. **Typography system** — display + body fonts, scale, weight, casing
+4. **Color system** — dominant, accent, neutral; define as CSS variables
+5. **Layout strategy** — grid rhythm, spacing scale, hierarchy plan
+6. **Motion strategy** — 1–2 meaningful interaction moments
 
-### 2. Direct
+If the user wants code only, skip the explanation but still follow this internally.
 
-Consider at least two materially different directions, then select the one best supported by the frame. Present only the selected direction unless comparison would help the user decide.
+## Implementation Principles
 
-Create a compact plan:
+- **Working code**: HTML/CSS/JS or framework code that runs as‑is
+- **Semantic & accessible**: headings, labels, focus states, keyboard nav
+- **Responsive**: fluid layouts, breakpoints, responsive typography
+- **Tokenized styling**: CSS variables for colors, spacing, radii, shadows
+- **Modern layout**: prefer CSS Grid/Flex, avoid brittle positioning hacks
 
-- **Concept:** one sentence tying the aesthetic to the subject.
-- **Color:** named tokens with actual values and clear roles.
-- **Type:** display, body, and utility roles as needed, including weights, widths, and scale. One family may fill several roles when that choice is intentional.
-- **Layout:** the governing composition in prose; add a small ASCII wireframe when inventing a page structure.
-- **Signature:** one element or interaction the interface will be remembered by.
-- **Behavior:** the role of motion, including the valid choice of no motion.
+## Aesthetic Guidelines
 
-Apply the **traceability test**: every prominent choice must come from the brief, the subject, the content, or the inherited system. Revise any choice that could be transferred unchanged to an unrelated project.
+### Typography
+- Typography should define the voice of the design
+- Avoid default fonts (Inter, Roboto, Arial, system stacks)
+- Use a **distinct display font** + a **refined body font**
+- Implement a clear hierarchy (size, weight, spacing, casing)
 
-**Done when:** each prominent choice is traceable, the signature strengthens the concept without competing with the primary task, and the plan covers all open design axes.
+### Color & Theme
+- Commit to a palette with a strong point‑of‑view
+- Avoid timid, overused gradients (e.g., purple‑to‑pink on white)
+- Use contrast intentionally and check legibility
 
-### 3. Build
+### Composition & Layout
+- Encourage asymmetry, scale contrast, overlap, or grid breaks
+- Use negative space deliberately (or controlled density if maximalist)
+- Create visual rhythm and hierarchy through spacing and alignment
 
-Implement the selected direction in the project's existing stack. Treat the plan as a baseline and revise it when rendered evidence exposes a better solution.
+### Detail & Atmosphere
+- Add texture or depth when appropriate (noise, grain, subtle patterns)
+- Use shadows/glows only when they serve the concept
+- Consider unique borders, masks, or clip‑paths for distinct shapes
 
-- Use real subject matter and provided assets. When content is missing, create specific, credible content rather than generic filler.
-- Encode repeated decisions as tokens or shared primitives.
-- Make structure communicate: labels, dividers, numbering, and grouping should express real relationships in the content.
-- Give visual emphasis a hierarchy. Spend the boldest treatment on the signature and primary task.
-- Implement relevant states, including hover, focus, active, disabled, loading, empty, and error states where the interface needs them.
-- Make responsive behavior intentional rather than a scaled-down desktop composition.
-- Use motion to clarify change, guide attention, or express the concept. Favor one orchestrated moment over unrelated effects, and provide a reduced-motion path.
+### Motion & Interaction
+- Use motion sparingly but meaningfully
+- Favor one standout interaction over many tiny ones
+- Honor `prefers-reduced-motion`
 
-If creating or changing user-facing words, read [COPY.md](COPY.md) before writing them.
+## Avoid
 
-**Done when:** the required content, interactions, states, and responsive structure are implemented, with recurring visual decisions derived from the plan.
+- Cookie‑cutter hero + 3 card layouts
+- Generic gradients and default font choices
+- Unmotivated decorative elements
+- Overly flat, characterless component libraries
 
-### 4. Render and critique
+## Deliverables
 
-Render before declaring the work complete. When browser access exists, inspect screenshots at one representative wide viewport and one narrow viewport, plus the states central to the task.
+- Provide full code with file names or component boundaries
+- Make customization easy with CSS variables or config objects
+- If assets are needed, provide inline SVGs or generative CSS patterns
 
-Check every rendered surface for:
+## Quality Checklist (Self‑validate)
 
-- a clear primary task and hierarchy;
-- clipping, overflow, collisions, awkward wrapping, and dead space;
-- readable type, usable contrast, and consistent spacing;
-- keyboard operation and visible focus;
-- coherent hover, active, disabled, loading, empty, and error states where applicable;
-- reduced-motion behavior;
-- whether the signature still feels subject-specific and proportionate.
+- Aesthetic direction is unmistakable
+- Typography feels intentional and expressive
+- Layout and spacing are consistent and purposeful
+- Color palette feels cohesive and legible
+- Interactions enhance the experience without clutter
+- Code runs as provided and is production‑ready
 
-Simplify or remove any decorative choice that fails the traceability test. Fix issues and render again until the checks pass.
-
-**Done when:** representative wide and narrow renders pass every applicable check. If rendering or interaction testing is unavailable, report exactly what remains unverified.
-
-## Direction reference
-
-### Marketing and editorial pages
-
-Treat the opening as a thesis: lead with the most characteristic idea, artifact, image, demonstration, or interaction from the subject's world. Let the rest of the page prove that thesis. A conventional hero pattern is appropriate only when it communicates the subject better than a more specific composition.
-
-### Product and workflow UI
-
-Let task frequency, consequence, and state drive emphasis. Distinction should improve orientation and comprehension rather than turn routine controls into spectacle. Design the dense, empty, loading, and failure cases as parts of the same system.
-
-### Component and existing-system work
-
-Preserve surrounding conventions unless the brief explicitly changes them. Put novelty inside the component's available visual and behavioral budget so it still belongs in the host interface.
-
-### Visual language
-
-Typography carries personality: select faces and treatments for the subject, then tune scale, measure, weight, and spacing with equal care. Color and imagery should have roles, not merely atmosphere. Structural devices should encode meaning. Match execution complexity to the direction: expressive systems need enough detail to feel intentional; restrained systems depend on exact spacing, rhythm, and proportion.
-
-## Handoff
-
-Summarize the chosen direction, changed files, rendered checks, and any unverified limitations. Keep process notes internal unless the user asks for alternatives or rationale.
+**Remember:** a design is only as strong as its commitment. Choose a direction and execute it relentlessly.
