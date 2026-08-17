@@ -383,6 +383,10 @@ function executable(fallback, candidates) {
 }
 var FFMPEG = process.env.PI_DICTATE_FFMPEG?.trim() || executable("ffmpeg", ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]);
 var AUDIO_DEVICE = process.env.PI_DICTATE_AUDIO_DEVICE?.trim() || "0";
+// Remove low-frequency desk/fan rumble and moderately normalize quiet speech.
+// speechnorm is effectively zero-latency, unlike frame-based normalization.
+var AUDIO_FILTER = process.env.PI_DICTATE_AUDIO_FILTER?.trim()
+  || "highpass=f=80,speechnorm=e=6.25:r=0.00001";
 async function audioDeviceDescription() {
   if (!/^\d+$/.test(AUDIO_DEVICE))
     return AUDIO_DEVICE;
@@ -772,6 +776,8 @@ function dictate(pi: ExtensionAPI) {
           "1",
           "-ar",
           String(SAMPLE_RATE),
+          "-af",
+          AUDIO_FILTER,
           "-f",
           "s16le",
           "-"
