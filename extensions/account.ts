@@ -241,7 +241,10 @@ export default function accountExtension(pi: ExtensionAPI): void {
 		return ctx.ui.custom<string | undefined>((tui, theme, keybindings, done) => {
 			const items: SelectItem[] = snapshots.map((snapshot) => {
 				const email = snapshot.usage?.email ?? claims(snapshot.credential.access).email ?? snapshot.accountId;
-				return { value: snapshot.accountId, label: snapshot.accountId === current.activeAccountId ? `${email} (active)` : email, description: snapshotDescription(snapshot) };
+				const label = snapshot.accountId === current.activeAccountId
+					? `${email} ${theme.fg("muted", "(active)")}`
+					: email;
+				return { value: snapshot.accountId, label, description: snapshotDescription(snapshot) };
 			});
 			const container = new Container();
 			container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
@@ -250,7 +253,7 @@ export default function accountExtension(pi: ExtensionAPI): void {
 			const list = new SelectList(items, Math.min(items.length, 10), {
 				selectedPrefix: (text) => theme.fg("accent", text), selectedText: (text) => theme.fg("accent", text),
 				description: (text) => theme.fg("muted", text), scrollInfo: (text) => theme.fg("dim", text), noMatch: (text) => theme.fg("warning", text),
-			});
+			}, { minPrimaryColumnWidth: 32, maxPrimaryColumnWidth: 48 });
 			list.onSelect = (item) => done(item.value);
 			list.onCancel = () => done(undefined);
 			const listBox = new Box(2, 0);
