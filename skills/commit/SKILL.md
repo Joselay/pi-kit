@@ -5,7 +5,7 @@ description: Create or amend a git commit; read before any commit operation.
 
 # Commit
 
-Create one focused commit whose staged diff is the exact **boundary** requested by the user.
+Create one focused commit whose staged diff is the exact **boundary** requested by the user. Use one compound shell call per phase so independent Git reads do not incur separate round trips.
 
 ## Inputs
 
@@ -20,43 +20,50 @@ Ask one concise question when the boundary cannot be inferred safely. In particu
 
 ## Procedure
 
-1. **Inventory.** Run `git status --short --untracked-files=all`, then inspect both `git diff` and `git diff --cached`. Inspect intended untracked files separately because they do not appear in either diff. Limit pathspecs only when the caller supplied a path boundary.
+1. **Snapshot.** In one shell call, print labeled sections for `git status --short --untracked-files=all`, `git diff`, and `git diff --cached`. Read intended untracked files separately because Git diffs omit them. Apply pathspecs to diffs only when the caller supplied a boundary; keep status repository-wide so outside work remains visible. Include `git log -n 50 --pretty=format:%s` in the same call only when repository vocabulary would help choose a scope.
 
-   **Done when:** every staged, unstaged, and untracked item is classified as inside or outside the boundary.
+   Classify every item, read every in-boundary hunk, and check for generated files, debug output, credentials, or unrelated edits.
 
-2. **Understand.** Read the complete diff inside the boundary. Identify the user-visible purpose and check for accidental generated files, debug output, credentials, or unrelated edits. Use recent subjects such as `git log -n 50 --pretty=format:%s` only when repository vocabulary would help choose a scope.
+   **Done when:** every item is inside or outside the boundary, and one coherent purpose explains every selected change.
 
-   **Done when:** one coherent purpose explains every change selected for the commit.
+2. **Stage and audit.** Stage explicit files or hunks. Preserve outside work; when whole files can be staged safely, combine the staging command and these checks in one shell call:
 
-3. **Stage.** Stage explicit files or hunks inside the boundary. Preserve changes outside it. Avoid broad staging commands when the worktree contains anything outside the boundary. If the existing index includes outside changes, clarify rather than resetting or silently including them.
-
-   **Done when:** `git diff --cached --name-status` names only intended files.
-
-4. **Audit the index.** Read `git diff --cached` as the final source of truth and run `git diff --cached --check`. Resolve boundary mistakes before continuing. If nothing is staged, report that there is nothing to commit.
-
-   **Done when:** every staged hunk belongs, no intended hunk is missing, and the cached diff check passes.
-
-5. **Write the message.** Use this subject form:
-
-   ```text
-   <type>(<scope>): <summary>
+   ```sh
+   git add -- <paths> &&
+   git diff --cached --name-status &&
+   git diff --cached &&
+   git diff --cached --check
    ```
 
-   - `type` is required: prefer `feat` for a feature and `fix` for a bug; use `docs`, `refactor`, `test`, `perf`, `build`, `ci`, `style`, or `chore` when they fit better.
-   - `scope` is optional: use a short repository-native noun.
-   - `summary` is imperative, specific, at most 72 characters, and has no trailing period.
+   For partial files, stage interactively first, then run the three audit commands together. Treat the cached diff as the final source of truth. If the existing index contains outside changes, clarify rather than resetting or including them. If the index is empty, report that there is nothing to commit.
+
+   **Done when:** every staged hunk belongs, every intended hunk is present, and the cached diff check passes.
+
+3. **Write a Conventional Commit.** Every commit message must follow Conventional Commits:
+
+   ```text
+   <type>[optional scope]: <description>
+   ```
+
+   - `type` is required and lowercase: use `feat` for a feature, `fix` for a bug, or `docs`, `refactor`, `test`, `perf`, `build`, `ci`, `style`, or `chore` when they fit better.
+   - `scope` is optional and parenthesized: use a short repository-native noun, as in `fix(parser):`.
+   - `description` is imperative, specific, lowercase at the start, at most 72 characters including the prefix, and has no trailing period.
    - Add a body only when the rationale or a non-obvious consequence matters. Separate it from the subject with a blank line and keep it concise.
-   - Omit breaking-change markers, footers, and sign-offs.
+   - For a breaking change, add `!` before `:` and explain it in a `BREAKING CHANGE:` footer. Omit other footers and sign-offs.
 
-   **Done when:** the message describes the audited staged diff rather than the surrounding task.
+   **Done when:** the message is valid Conventional Commits syntax and describes the audited staged diff rather than the surrounding task.
 
-6. **Commit.** Run `git commit -m "<subject>"`, adding a second `-m` argument only for a body. Keep hooks enabled. Amend only when the user explicitly requested an amend. If a hook fails or modifies files, inspect the new status and cached diff before deciding whether a safe retry is possible.
+4. **Commit and verify.** Keep hooks enabled and amend only when explicitly requested. Run commit and verification in one shell call:
 
-   **Done when:** `git commit` succeeds without bypassing repository checks.
+   ```sh
+   git commit -m "<subject>" &&
+   git show --stat --oneline --decorate --no-renames HEAD &&
+   git status --short
+   ```
 
-7. **Verify.** Inspect the new commit with `git show --stat --oneline --decorate --no-renames HEAD` and check `git status --short` for residual work.
+   Add a second `-m` only when the message needs a body. If a hook fails or modifies files, the chain stops; inspect status and the cached diff together before deciding whether a safe retry is possible.
 
-   **Done when:** the new commit contains the audited boundary and all remaining changes are identified as uncommitted.
+   **Done when:** the commit succeeds, its displayed contents match the audited boundary, and all residual changes are identified.
 
 ## Guardrails
 
