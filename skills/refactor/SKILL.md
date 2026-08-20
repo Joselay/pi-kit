@@ -1,6 +1,7 @@
 ---
 name: refactor
-description: "Behavior-preserving maintainability cleanup: remove proven dead code and unused files, simplify implementations, reduce duplication, and extract reusable boundaries only where they lower complexity. Use for codebase cleanup, dead-code removal, or non-functional refactoring."
+description: Behavior-preserving, subtraction-first refactoring of an existing codebase.
+disable-model-invocation: true
 ---
 
 # Refactor
