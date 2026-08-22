@@ -1,39 +1,40 @@
-# Running Scripts with uv
+# Standalone scripts
 
-## Basic Usage
+Use this branch for a single Python file that owns its dependencies. Inline metadata isolates the script from a surrounding project's dependencies.
+
+## Run
 
 ```bash
-uv run script.py                   # Run a script
-uv run script.py arg1 arg2         # With arguments
-uv run --python 3.10 script.py     # Specific Python version
-echo 'print("hi")' | uv run -      # From stdin
+uv run script.py
+uv run script.py arg1 arg2
+uv run --python 3.10 script.py
+printf 'print("hi")\n' | uv run -
 ```
 
-In a project directory, use `--no-project` to skip installing the project:
+For an undeclared script inside a project, `uv run` includes the project environment. Select independence explicitly:
 
 ```bash
 uv run --no-project script.py
 ```
 
-## Syntax Verification (No `__pycache__`)
-
-Use the AST parser instead of `python -m py_compile`:
+For a disposable run, request dependencies per invocation:
 
 ```bash
-uv run python -m ast script.py >/dev/null
-```
-
-## Ad-hoc Dependencies
-
-```bash
-uv run --with requests script.py
+uv run --no-project --with requests script.py
 uv run --with 'requests>2,<3' script.py
 uv run --with requests --with rich script.py
 ```
 
-## Inline Script Metadata (Recommended)
+## Declare dependencies
 
-Declare dependencies directly in the script:
+Initialize metadata, then let `uv add` edit it:
+
+```bash
+uv init --script example.py --python 3.12
+uv add --script example.py 'requests<3' rich
+```
+
+The resulting PEP 723 block is the script's source of truth:
 
 ```python
 # /// script
@@ -48,16 +49,9 @@ import requests
 from rich import print
 ```
 
-Then just: `uv run script.py`
+The `dependencies` field is required, including when empty. Run the declared script with `uv run example.py`; its environment is isolated even when the file is inside a project.
 
-### Managing Dependencies
-
-```bash
-uv init --script example.py --python 3.12   # Create script with metadata
-uv add --script example.py requests rich    # Add dependencies
-```
-
-### Alternative Index
+### Alternative index
 
 ```bash
 uv add --index "https://example.com/simple" --script example.py requests
@@ -70,15 +64,13 @@ Adds to metadata:
 # url = "https://example.com/simple"
 ```
 
-## Locking Dependencies
-
-```bash
-uv lock --script example.py  # Creates example.py.lock
-```
-
 ## Reproducibility
 
-Pin resolution date:
+```bash
+uv lock --script example.py  # Creates example.py.lock beside the script
+```
+
+For a stable resolution horizon, add an RFC 3339 timestamp:
 
 ```python
 # /// script
@@ -88,7 +80,9 @@ Pin resolution date:
 # ///
 ```
 
-## Executable Scripts (Shebang)
+Subsequent script operations reuse and update the adjacent lockfile. Use `--locked` when an out-of-date lockfile must fail.
+
+## Executable script
 
 ```python
 #!/usr/bin/env -S uv run --script
@@ -104,3 +98,7 @@ print(httpx.get("https://example.com"))
 chmod +x myscript
 ./myscript
 ```
+
+## Completion
+
+Run the script through `uv`, and account for every imported third-party package in inline metadata. Commit the adjacent lockfile when reproducible resolution is required.

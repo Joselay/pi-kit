@@ -1,37 +1,30 @@
 ---
 name: uv
-description: "Use `uv` instead of pip/python/venv. Run scripts with `uv run script.py`, add deps with `uv add`, use inline script metadata for standalone scripts."
+description: "Python environment and dependency work with uv: run Python commands or scripts, manage project dependencies and lockfiles, create standalone scripts, or configure uv_build packages."
 ---
 
-## Quick Reference
+## Workflow
+
+1. Inspect `pyproject.toml`, `uv.lock`, and any inline script metadata. Preserve the repository's Python constraints, dependency groups, indexes, sources, and build backend.
+2. Choose the matching mode:
+   - **Project:** declare dependencies with `uv add` / `uv remove`; execute in the managed environment with `uv run`.
+   - **Standalone script:** declare dependencies as inline metadata. Read [scripts.md](scripts.md).
+   - **One-off tool:** use `uvx <tool>` so the tool stays isolated from the project.
+   - **Package build:** retain the configured backend. For a new pure-Python package using `uv_build`, read [build.md](build.md).
+3. Run the narrowest relevant check through `uv run`. Work is complete when dependency declarations and lockfiles agree and the check passes.
+
+## Project commands
 
 ```bash
-uv run script.py                   # Run a script
-uv run --with requests script.py   # Run with ad-hoc dependency
-uv run python -m ast foo.py >/dev/null  # Verify syntax without writing __pycache__
-uv add requests                    # Add dependency to project
-uv init --script foo.py            # Create script with inline metadata
+uv add requests                 # Published/runtime dependency
+uv add --dev pytest             # Development dependency
+uv remove requests
+uv run pytest
+uv run python -m ast foo.py >/dev/null  # Syntax check without __pycache__
+uv sync                         # Explicitly synchronize the environment
+uv lock --check                 # Verify that uv.lock matches project metadata
 ```
 
-## Inline Script Dependencies
+`uv run` locks and synchronizes a project automatically. Use `uv run --locked ...` in CI when a stale lockfile must fail rather than update.
 
-```python
-# /// script
-# requires-python = ">=3.12"
-# dependencies = ["requests"]
-# ///
-```
-
-See [scripts.md](scripts.md) for full details on running scripts, locking, and reproducibility.
-
-## Build Backend
-
-Use `uv_build` for pure Python packages:
-
-```toml
-[build-system]
-requires = ["uv_build>=0.9.28,<0.10.0"]
-build-backend = "uv_build"
-```
-
-See [build.md](build.md) for project structure, namespaces, and file inclusion.
+Treat `pyproject.toml` and `uv.lock` as the source of truth. Use `uv pip` only for pip-compatible workflows that intentionally do not manage project metadata.

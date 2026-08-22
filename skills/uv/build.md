@@ -1,24 +1,18 @@
-# uv Build Backend
+# `uv_build`
 
-Use `uv_build` for pure Python packages. For extension modules, use `hatchling` instead.
+Use `uv_build` for a new pure-Python package. Preserve another backend when the project already selected one.
 
-## pyproject.toml
+Initialize new libraries through uv so the generated `uv_build` constraint matches the installed uv release:
 
-```toml
-[project]
-name = "my-package"
-version = "0.1.0"
-requires-python = ">=3.12"
-dependencies = []
-
-[build-system]
-requires = ["uv_build>=0.9.28,<0.10.0"]
-build-backend = "uv_build"
+```bash
+uv init --lib --build-backend uv my-package
 ```
 
-## Project Structure
+The generated `[build-system]` uses `uv_build` with a lower and upper bound. Keep that bounded form; consult the [official backend documentation](https://docs.astral.sh/uv/concepts/build-backend/) before changing its version range.
 
-Default layout uses `src/<package_name>/__init__.py`:
+## Layout
+
+The default module is `src/<normalized_name>/__init__.py`:
 
 ```
 pyproject.toml
@@ -29,7 +23,7 @@ src/
 
 Package name is normalized: `Foo-Bar` → `foo_bar`.
 
-### Custom Module Location
+### Custom module location
 
 ```toml
 [tool.uv.build-backend]
@@ -50,7 +44,18 @@ src/foo/bar/__init__.py  # No __init__.py in foo/
 module-name = "foo.bar"
 ```
 
-## File Inclusion/Exclusion
+## Extensions
+
+`uv_build` supports pure Python only. Choose `maturin` for Rust or `scikit-build-core` for C, C++, Fortran, or Cython:
+
+```bash
+uv init --lib --build-backend maturin my-extension
+uv init --lib --build-backend scikit my-extension
+```
+
+Use Hatchling when a pure-Python package needs build hooks or a layout beyond `uv_build`'s model.
+
+## File inclusion and exclusion
 
 Excludes `__pycache__`, `*.pyc`, `*.pyo` by default.
 
@@ -63,3 +68,7 @@ source-exclude = ["/dist", "tests/**"]
 - Includes are anchored (`pyproject.toml` = only root)
 - Excludes are not anchored (`__pycache__` = all dirs named that)
 - Use `/prefix` to anchor excludes
+
+## Completion
+
+Run `uv build`, inspect both the sdist and wheel contents, and test installation/import from the built wheel. Every required package and data file must be present; generated and excluded files must be absent.
