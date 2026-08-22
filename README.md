@@ -40,7 +40,7 @@ Pi extensions live in [`extensions`](extensions):
 - [`edit.ts`](extensions/edit.ts) - Add a grammar-constrained `apply_patch` editing tool with validation and atomic file operations.
 - [`fast.ts`](extensions/fast.ts) - Toggle persistent OpenAI Codex priority processing for supported models with `/fast`.
 - [`files.ts`](extensions/files.ts) - Browse Git and session-referenced files, with actions for opening, editing, diffing, revealing, and Quick Look.
-- [`goal.ts`](extensions/goal.ts) - Manage session-backed long-running goals with automatic continuation and optional token budgets.
+- [`goal.ts`](extensions/goal.ts) - Manage session-backed long-running goals with automatic continuation and elapsed-time tracking.
 - [`handoff.ts`](extensions/handoff.ts) - Generate a redacted conversation handoff and start a linked session to continue the work.
 - [`no-sleep.ts`](extensions/no-sleep.ts) - Keep macOS awake with `caffeinate` while a Pi session is running.
 - [`notify.ts`](extensions/notify.ts) - Play a notification sound when an interactive agent run settles.
