@@ -1,9 +1,8 @@
 /**
  * Goal Extension
  *
- * A simplified Pi adaptation of OpenAI Codex's persisted thread goals. Goal
- * state is stored in custom session entries and reconstructed from the active
- * branch. It tracks status and elapsed wall-clock time.
+ * Goal state is stored in custom session entries and reconstructed from the
+ * active branch. It tracks status and elapsed wall-clock time.
  */
 
 import { randomUUID } from "node:crypto";
@@ -536,7 +535,7 @@ export default function goalExtension(pi: ExtensionAPI) {
 	});
 
 	// Pi can still retry or compact after agent_end. Queue continuation only once
-	// the run is fully settled, mirroring Codex's "continue if idle" behavior.
+	// the run is fully settled.
 	pi.on("agent_settled", async (_event, ctx) => {
 		// Recover if a previously accepted continuation was dropped before it
 		// could start an agent run.
@@ -554,8 +553,8 @@ export default function goalExtension(pi: ExtensionAPI) {
 				return;
 			}
 
-			// Match Codex TUI behavior: an explicit interactive interruption
-			// pauses the goal. Headless aborts leave it active for idle recovery.
+			// An explicit interactive interruption pauses the goal. Headless
+			// aborts leave it active for idle recovery.
 			if (ctx.mode === "tui" && goal?.id === stop.goalId && goal.status === "active") {
 				setGoalStatus("paused");
 				persist();
