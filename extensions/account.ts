@@ -254,6 +254,7 @@ export default function accountExtension(pi: ExtensionAPI): void {
 				selectedPrefix: (text) => theme.fg("accent", text), selectedText: (text) => theme.fg("accent", text),
 				description: (text) => theme.fg("muted", text), scrollInfo: (text) => theme.fg("dim", text), noMatch: (text) => theme.fg("warning", text),
 			}, { minPrimaryColumnWidth: 32, maxPrimaryColumnWidth: 48 });
+			list.setSelectedIndex(Math.max(0, items.findIndex((item) => item.value === current.activeAccountId)));
 			list.onSelect = (item) => done(item.value);
 			list.onCancel = () => done(undefined);
 			const listBox = new Box(2, 0);
