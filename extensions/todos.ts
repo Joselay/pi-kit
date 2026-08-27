@@ -1465,10 +1465,6 @@ export default function todosExtension(pi: ExtensionAPI) {
 			"Title is the short summary; body is long-form markdown notes (update replaces, append adds). " +
 			"Todo ids are shown as TODO-<hex>; id parameters accept TODO-<hex> or the raw hex filename. " +
 			"Claim tasks before working on them to avoid conflicts, and close them when complete.",
-		promptSnippet: "Manage persistent file-based project todos",
-		promptGuidelines: [
-			"Use todo to track durable project tasks: claim a todo before working on it, append useful progress notes, and set its status to closed when complete.",
-		],
 		parameters: TodoParams,
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
