@@ -1,9 +1,11 @@
-import { readFileSync, readdirSync } from "node:fs";
+import { open, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { CustomEditor, type ExtensionAPI, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, type EditorComponent } from "@earendil-works/pi-tui";
 
 const HISTORY_LIMIT = 100;
+const READ_CHUNK_SIZE = 256 * 1024;
+const USER_ROLE_PATTERN = /"role"\s*:\s*"user"/;
 
 function addPrompt(history: string[], text: string): void {
 	const prompt = text.trim();
@@ -19,13 +21,14 @@ function userPrompt(entry: SessionEntry): string | undefined {
 	if (entry.type !== "message" || entry.message.role !== "user") return undefined;
 
 	const { content } = entry.message;
-	const text =
-		typeof content === "string"
-			? content
-			: content
-					.filter((part) => part.type === "text")
-					.map((part) => part.text)
-					.join("");
+	let text = "";
+	if (typeof content === "string") {
+		text = content;
+	} else {
+		for (const part of content) {
+			if (part.type === "text") text += part.text;
+		}
+	}
 	return text.trim() || undefined;
 }
 
@@ -38,38 +41,88 @@ function collectPrompts(entries: SessionEntry[]): string[] {
 	return prompts;
 }
 
-function readSessionPrompts(directory: string): string[] {
-	const history: string[] = [];
-	const files = readdirSync(directory).filter((name) => name.endsWith(".jsonl")).sort();
+async function scanLinesBackwards(path: string, visit: (line: string) => boolean): Promise<boolean> {
+	const file = await open(path, "r");
+	try {
+		let position = (await file.stat()).size;
+		let remainder = Buffer.alloc(0);
+
+		while (position > 0) {
+			const length = Math.min(READ_CHUNK_SIZE, position);
+			position -= length;
+
+			const chunk = Buffer.allocUnsafe(length);
+			let bytesRead = 0;
+			while (bytesRead < length) {
+				const result = await file.read(chunk, bytesRead, length - bytesRead, position + bytesRead);
+				if (result.bytesRead === 0) break;
+				bytesRead += result.bytesRead;
+			}
+			const data = remainder.length
+				? Buffer.concat([chunk.subarray(0, bytesRead), remainder])
+				: chunk.subarray(0, bytesRead);
+			let lineEnd = data.length;
+
+			for (let index = data.length - 1; index >= 0; index--) {
+				if (data[index] !== 0x0a) continue;
+				if (index + 1 < lineEnd && visit(data.subarray(index + 1, lineEnd).toString("utf8"))) {
+					return true;
+				}
+				lineEnd = index;
+			}
+			remainder = Buffer.from(data.subarray(0, lineEnd));
+		}
+
+		return remainder.length > 0 && visit(remainder.toString("utf8"));
+	} finally {
+		await file.close();
+	}
+}
+
+async function readSessionPrompts(
+	directory: string,
+	excluded: Set<string>,
+	limit: number,
+): Promise<string[]> {
+	if (limit <= 0) return [];
+
+	const newest: string[] = [];
+	const seen = new Set(excluded);
+	const files = (await readdir(directory))
+		.filter((name) => name.endsWith(".jsonl"))
+		.sort()
+		.reverse();
 
 	for (const file of files) {
-		for (const line of readFileSync(join(directory, file), "utf8").split("\n")) {
-			if (!line) continue;
+		const complete = await scanLinesBackwards(join(directory, file), (line) => {
+			if (!USER_ROLE_PATTERN.test(line)) return false;
 			try {
 				const prompt = userPrompt(JSON.parse(line) as SessionEntry);
-				if (prompt) addPrompt(history, prompt);
+				if (!prompt || seen.has(prompt)) return false;
+
+				seen.add(prompt);
+				newest.push(prompt);
+				return newest.length === limit;
 			} catch {
 				// A session may end with a partially written line.
 			}
-		}
+			return false;
+		});
+		if (complete) return newest.reverse();
 	}
-	return history;
+	return newest.reverse();
 }
 
 function decorateEditor(
 	editor: EditorComponent,
 	history: string[],
-	onRender: (editor: EditorComponent, lines: string[], width: number) => void,
+	onRender: (editor: EditorComponent, lines: string[], width: number) => string[],
 	onInput: (editor: EditorComponent, data: string, before: string) => void,
 ): EditorComponent {
 	for (const prompt of history) editor.addToHistory?.(prompt);
 
 	const render = editor.render.bind(editor);
-	editor.render = (width) => {
-		const lines = [...render(width)];
-		onRender(editor, lines, width);
-		return lines;
-	};
+	editor.render = (width) => onRender(editor, render(width), width);
 
 	const handleInput = editor.handleInput.bind(editor);
 	editor.handleInput = (data) => {
@@ -85,7 +138,7 @@ export default function recall(pi: ExtensionAPI): void {
 	let historyTotal = 0;
 	let knownPrompts = new Set<string>();
 
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
 		browsePosition = 0;
 		if (ctx.mode !== "tui") return;
 
@@ -94,8 +147,10 @@ export default function recall(pi: ExtensionAPI): void {
 		let history: string[] = [];
 
 		try {
-			history = readSessionPrompts(ctx.sessionManager.getSessionDir()).filter(
-				(prompt) => !currentPrompts.has(prompt),
+			history = await readSessionPrompts(
+				ctx.sessionManager.getSessionDir(),
+				currentPrompts,
+				HISTORY_LIMIT - sessionPrompts.length,
 			);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -112,18 +167,20 @@ export default function recall(pi: ExtensionAPI): void {
 				editor,
 				history,
 				(editor, lines, width) => {
-					if (!browsePosition || !lines.length) return;
+					if (!browsePosition || !lines.length) return lines;
 
 					const border = "─── ";
 					const counter = `History ${historyTotal - browsePosition + 1}/${historyTotal} `;
 					const labelWidth = visibleWidth(border + counter);
-					if (labelWidth > width || visibleWidth(lines[0]!) < labelWidth) return;
+					if (labelWidth > width || visibleWidth(lines[0]!) < labelWidth) return lines;
 
 					const paint = editor.borderColor ?? ((text: string) => text);
-					lines[0] =
+					return [
 						paint(border) +
-						ctx.ui.theme.fg("dim", counter) +
-						truncateToWidth(lines[0]!, width - labelWidth, "");
+							ctx.ui.theme.fg("dim", counter) +
+							truncateToWidth(lines[0]!, width - labelWidth, ""),
+						...lines.slice(1),
+					];
 				},
 				(editor, data, before) => {
 					if (editor.getText() === before) return;
@@ -148,10 +205,12 @@ export default function recall(pi: ExtensionAPI): void {
 
 	pi.on("input", (event, ctx) => {
 		browsePosition = 0;
+		if (ctx.mode !== "tui" || historyTotal === HISTORY_LIMIT) return;
+
 		const prompt = event.text.trim();
 		if (!prompt || knownPrompts.has(prompt)) return;
 
 		knownPrompts.add(prompt);
-		if (ctx.mode === "tui") historyTotal = Math.min(HISTORY_LIMIT, historyTotal + 1);
+		historyTotal++;
 	});
 }
