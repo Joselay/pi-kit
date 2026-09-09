@@ -8,13 +8,17 @@ disable-model-invocation: true
 
 Use a **render loop**: prompt → render → inspect → refine → deliver. Run generative raster work through [the helper](scripts/imagegen.mjs). Resolve relative paths against this skill directory.
 
+The helper uses Pi's existing OpenAI OAuth login; API keys are not supported.
+
 This skill produces bitmaps, including mockups and logo concepts. Use native code for editable SVGs, existing-system icons, and HTML/CSS/canvas visuals.
 
 ## 1. Prompt
 
-Write a self-contained brief for each image or variant: subject, style, composition, intended use, exact text, and constraints. Preserve the user's details; fill gaps from the user or project context.
+Write a self-contained brief for each image or variant: subject, style, composition, intended use, exact text, and constraints. Normalize detailed prompts without adding creative requirements. For generic prompts, add only useful framing or intended-use cues supported by context; avoid invented characters, props, branding, slogans, palettes, or story beats.
 
 For input-guided work, open every input with `read` and identify its role in attachment order (`Image 1: edit target; Image 2: style reference`). Separate **change** from **preserve**. Ask for required inputs that are missing.
+
+Reference-only inputs guide a new image; they are not automatically edit targets. Conversation images must have readable local files for `--input`; if none is available, ask for the missing file rather than assuming `read` attaches it to the request.
 
 Load the matching reference:
 
@@ -25,18 +29,18 @@ Proceed when every requested image has a complete brief and its required inputs 
 
 ## 2. Render
 
-Read the CLI contract before the first call:
+Before the first render, use `bash` to read the helper's options:
 
 ```bash
 node <skill-directory>/scripts/imagegen.mjs --help
 ```
 
-Honor an explicit model request. Otherwise choose:
+Honor an explicit request for either supported model. Otherwise choose:
 
-- **Flare** (`gpt-image-2.5-flare`): everyday generation, concepts, variants, and quick edits.
-- **Sunburst** (`gpt-image-2.5-sunburst`): tightly constrained generation or precision edits preserving identity, product details, or layout.
+- **Flare** (`gpt-image-2.5-flare`): fast, high-quality everyday generation, concepts, and variants.
+- **Sunburst** (`gpt-image-2.5-sunburst`): the most capable option for generation and editing; prefer it when editing precision matters most.
 
-Both models generate and edit; choose by the brief, not attachment presence. Express output requirements in the prompt and pass the selected model:
+Both models support generation and editing; choose by the brief, not attachment presence. Use only the helper's supported controls; express output requirements in the prompt and pass the selected model:
 
 ```bash
 node <skill-directory>/scripts/imagegen.mjs \
@@ -44,9 +48,9 @@ node <skill-directory>/scripts/imagegen.mjs \
   --prompt "<complete brief>"
 ```
 
-Run one call per image, allowing at least 180 seconds. Use `--prompt-file` for long briefs and repeated `--input` flags for attachments in prompt order; filenames in a prompt do not attach images.
+Run one helper call per image through `bash`, allowing at least 180 seconds. Use `--prompt-file` for long briefs and repeated `--input` flags for attachments in prompt order; filenames in a prompt do not attach images.
 
-On helper errors, report the error and any request ID rather than switching models or runners. Ask the user to run `/login` for authentication failures. Stop on quota or moderation errors.
+On helper errors, report the error and any request ID rather than switching models or runners. For authentication failures, ask the user to run `/login` in Pi and select the OpenAI subscription login. Stop on quota or moderation errors.
 
 ## 3. Inspect and refine
 

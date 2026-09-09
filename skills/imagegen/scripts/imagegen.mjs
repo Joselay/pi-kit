@@ -24,11 +24,10 @@ Options:
   --help          Show this help
 
 Requests send the model, prompt, any input images, and explicit auto settings
-for background, quality, and size, matching Codex's native image tool.
-Describe the desired output in the prompt. This is ChatGPT OAuth only;
-public Image API options and model availability are not guaranteed here.
-The image is saved under ~/.pi/generated_images/ with a unique name and the
-path is printed.`);
+for background, quality, and size. Describe the desired output in the prompt.
+Uses Pi's existing OpenAI OAuth login; API keys are not supported.
+The image is saved under $PI_HOME/generated_images/ (default: ~/.pi/generated_images/)
+with a unique name, and the path is printed.`);
 }
 
 function fail(message) {
@@ -129,7 +128,7 @@ function endpointFor(baseUrl, editing) {
   if (url.origin !== "https://chatgpt.com" || url.username || url.password
       || url.search || url.hash
       || !["/backend-api", "/backend-api/codex"].includes(path)) {
-    fail("refusing to send ChatGPT OAuth to an unsupported provider URL");
+    fail("refusing to send OAuth credentials to an unsupported provider URL");
   }
   return `${url.origin}/backend-api/codex/images/${editing ? "edits" : "generations"}`;
 }
@@ -160,8 +159,9 @@ async function fetchWithRetries(url, options) {
       const payload = await response.clone().json().catch(() => undefined);
       const error = payload?.error;
       if (error?.type === "image_generation_user_error"
-          || ["moderation_blocked", "insufficient_quota", "usage_limit_reached"]
-            .includes(error?.code ?? error?.type)) return response;
+          || [error?.code, error?.type].some((value) =>
+            ["moderation_blocked", "insufficient_quota", "usage_limit_reached"]
+              .includes(value))) return response;
       await response.body?.cancel();
     } catch (error) {
       if (attempt === MAX_REQUEST_RETRIES) throw error;
@@ -228,6 +228,8 @@ async function main() {
       originator: "pi",
       accept: "application/json",
       "content-type": "application/json",
+      // One standalone invocation is one logical image turn; retain it across retries.
+      "x-codex-image-turn-id": randomUUID(),
       "user-agent": `pi-imagegen-skill (${process.platform}; ${process.arch})`,
     },
     redirect: "error",
