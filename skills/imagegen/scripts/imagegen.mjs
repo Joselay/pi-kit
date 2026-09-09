@@ -23,15 +23,16 @@ Options:
   --input <path>  Edit/use a source image; repeat up to ${MAX_EDIT_IMAGES} times
   --help          Show this help
 
-Requests send only the model, prompt, and any input images.
-Describe the desired output in the prompt; output controls use API defaults.
+Requests send the model, prompt, any input images, and explicit auto settings
+for background, quality, and size, matching Codex's native image tool.
+Describe the desired output in the prompt. This is ChatGPT OAuth only;
+public Image API options and model availability are not guaranteed here.
 The image is saved under ~/.pi/generated_images/ with a unique name and the
 path is printed.`);
 }
 
 function fail(message) {
-  console.error(`imagegen: ${message}`);
-  process.exit(1);
+  throw new Error(message);
 }
 
 function parseArgs(argv) {
@@ -123,9 +124,14 @@ function accountIdFromToken(token) {
 }
 
 function endpointFor(baseUrl, editing) {
-  const normalized = baseUrl.replace(/\/+$/, "");
-  const codexBase = normalized.endsWith("/codex") ? normalized : `${normalized}/codex`;
-  return `${codexBase}/images/${editing ? "edits" : "generations"}`;
+  const url = new URL(baseUrl);
+  const path = url.pathname.replace(/\/+$/, "");
+  if (url.origin !== "https://chatgpt.com" || url.username || url.password
+      || url.search || url.hash
+      || !["/backend-api", "/backend-api/codex"].includes(path)) {
+    fail("refusing to send ChatGPT OAuth to an unsupported provider URL");
+  }
+  return `${url.origin}/backend-api/codex/images/${editing ? "edits" : "generations"}`;
 }
 
 function imageMediaType(bytes) {
@@ -151,6 +157,11 @@ async function fetchWithRetries(url, options) {
     try {
       const response = await fetch(url, options);
       if (response.status < 500 || attempt === MAX_REQUEST_RETRIES) return response;
+      const payload = await response.clone().json().catch(() => undefined);
+      const error = payload?.error;
+      if (error?.type === "image_generation_user_error"
+          || ["moderation_blocked", "insufficient_quota", "usage_limit_reached"]
+            .includes(error?.code ?? error?.type)) return response;
       await response.body?.cancel();
     } catch (error) {
       if (attempt === MAX_REQUEST_RETRIES) throw error;
@@ -163,12 +174,29 @@ async function fetchWithRetries(url, options) {
 async function responseError(response) {
   const text = await response.text();
   const compact = text.replace(/\s+/g, " ").trim().slice(0, 2000);
-  return `request failed (${response.status} ${response.statusText})${compact ? `: ${compact}` : ""}`;
+  const requestId = response.headers.get("x-codex-imagegen-request-id")
+    ?? response.headers.get("x-request-id");
+  const loginHint = response.status === 401 ? "; run /login in pi" : "";
+  return `request failed (${response.status} ${response.statusText})${loginHint}`
+    + (requestId ? ` [request ID: ${requestId}]` : "")
+    + (compact ? `: ${compact}` : "");
 }
 
-const args = parseArgs(process.argv.slice(2));
+function decodeImage(encoded) {
+  if (typeof encoded !== "string" || encoded.trim().length === 0) {
+    fail("the image endpoint returned no base64 image data");
+  }
+  const normalized = encoded.trim();
+  const bytes = Buffer.from(normalized, "base64");
+  if (bytes.toString("base64") !== normalized) fail("the image endpoint returned invalid base64");
+  const type = imageMediaType(bytes);
+  const extension = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp" }[type];
+  if (!extension) fail("the image endpoint returned an unsupported output format");
+  return { bytes, extension };
+}
 
-try {
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
   if (args.model === undefined) fail("provide --model; choose the model that best fits the task");
   if (!IMAGE_MODELS.includes(args.model)) fail(`--model must be ${IMAGE_MODELS.join(" or ")}`);
   if (Boolean(args.prompt) === Boolean(args.promptFile)) {
@@ -187,6 +215,9 @@ try {
     ...(editing ? { images } : {}),
     model: args.model,
     prompt,
+    background: "auto",
+    quality: "auto",
+    size: "auto",
   };
 
   const response = await fetchWithRetries(endpointFor(baseUrl, editing), {
@@ -199,23 +230,26 @@ try {
       "content-type": "application/json",
       "user-agent": `pi-imagegen-skill (${process.platform}; ${process.arch})`,
     },
+    redirect: "error",
     body: JSON.stringify(requestBody),
   });
 
   if (!response.ok) fail(await responseError(response));
   const payload = await response.json();
-  const encoded = payload?.data?.[0]?.b64_json;
-  if (typeof encoded !== "string" || encoded.length === 0) {
-    fail("the image endpoint returned no base64 image data");
-  }
-
-  const imageBytes = Buffer.from(encoded, "base64");
+  const { bytes: imageBytes, extension } = decodeImage(payload?.data?.[0]?.b64_json);
 
   const piHome = process.env.PI_HOME || join(homedir(), ".pi");
-  const outputPath = join(piHome, "generated_images", `${randomUUID()}.png`);
+  const outputPath = join(piHome, "generated_images", `${randomUUID()}.${extension}`);
   await mkdir(dirname(outputPath), { recursive: true });
   await writeFile(outputPath, imageBytes, { mode: 0o600, flag: "wx" });
   console.log(outputPath);
-} catch (error) {
-  fail(error instanceof Error ? error.message : String(error));
+}
+
+export { decodeImage, endpointFor, fetchWithRetries, imageMediaType, responseError };
+
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  main().catch((error) => {
+    console.error(`imagegen: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
+  });
 }

@@ -36,7 +36,7 @@ Honor an explicit model request. Otherwise select by the task's priorities:
 - **Flare** (`gpt-image-2.5-flare`) for everyday image generation and speed-first work: concepts, variants, routine assets, and quick edits.
 - **Sunburst** (`gpt-image-2.5-sunburst`) when capability and editing precision take priority: tightly constrained generation or edits where specific features must survive unchanged, such as a person's identity, product details, or an existing layout.
 
-Both models generate and edit; select by the brief, not merely whether inputs are attached. Pass the selected `--model` on every call; there is no default model. Express output requirements in the prompt and leave output settings to the image model.
+Both models generate and edit; select by the brief, not merely whether inputs are attached. Pass the selected `--model` on every call; there is no default model. Express output requirements in the prompt; the helper sends explicit automatic background, quality, and size settings.
 
 ```bash
 node <skill-directory>/scripts/imagegen.mjs \
@@ -46,7 +46,7 @@ node <skill-directory>/scripts/imagegen.mjs \
 
 Run one call per image with at least 180 seconds allowed. For long prompts, use `--prompt-file <absolute-path>` instead. Attach inputs with repeated `--input <absolute-image-path>` flags in prompt order; mentioning a filename does not attach it.
 
-Use the existing OAuth session. On authentication failure, ask the user to run `/login`; leave credentials untouched and undisclosed. Report helper errors without substituting providers, models, API keys, or ad hoc runners.
+On authentication failure, ask the user to run `/login`. Report helper errors and request IDs without switching models or runners. Stop on quota or moderation errors; repeated unchanged requests are not refinements.
 
 ## 3. Inspect and refine
 
