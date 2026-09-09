@@ -6,22 +6,22 @@ disable-model-invocation: true
 
 # Image generation
 
-Use a **render loop**: prompt → render → inspect → refine → deliver. Run generative raster operations through [the helper](scripts/imagegen.mjs). Resolve relative paths against this skill directory.
+Use a **render loop**: prompt → render → inspect → refine → deliver. Run generative raster work through [the helper](scripts/imagegen.mjs). Resolve relative paths against this skill directory.
 
-This skill produces bitmaps, including mockups and logo concepts. Build editable SVGs, existing-system icons, and HTML/CSS/canvas visuals in native code instead.
+This skill produces bitmaps, including mockups and logo concepts. Use native code for editable SVGs, existing-system icons, and HTML/CSS/canvas visuals.
 
 ## 1. Prompt
 
-Write a self-contained prompt for each requested image or variant: subject, style, composition, intended use, exact text, and constraints that matter. The prompt is the brief. Preserve detailed requests; fill gaps in generic requests with useful visual detail grounded in the user or project.
+Write a self-contained brief for each image or variant: subject, style, composition, intended use, exact text, and constraints. Preserve the user's details; fill gaps from the user or project context.
 
-For reference-guided work or edits, open every input with `read`. Ask for missing required inputs. Name each attachment's role in order (`Image 1: edit target; Image 2: style reference`). For edits, separate **change** from **preserve**.
+For input-guided work, open every input with `read` and identify its role in attachment order (`Image 1: edit target; Image 2: style reference`). Separate **change** from **preserve**. Ask for required inputs that are missing.
 
-Load references only as needed:
+Load the matching reference:
 
-- [Prompting](references/prompting.md) for photography, exact text, layouts, game assets, or input-guided work.
-- [Transparency](references/transparency.md) for transparent backgrounds, including alpha validation.
+- [Prompting](references/prompting.md): photography, exact text, layouts, game assets, or input-guided work.
+- [Transparency](references/transparency.md): transparent backgrounds and alpha validation.
 
-Proceed when every requested image has a clear prompt and all required inputs are readable.
+Proceed when every requested image has a complete brief and its required inputs are readable.
 
 ## 2. Render
 
@@ -31,12 +31,12 @@ Read the CLI contract before the first call:
 node <skill-directory>/scripts/imagegen.mjs --help
 ```
 
-Honor an explicit model request. Otherwise select by the task's priorities:
+Honor an explicit model request. Otherwise choose:
 
-- **Flare** (`gpt-image-2.5-flare`) for everyday image generation and speed-first work: concepts, variants, routine assets, and quick edits.
-- **Sunburst** (`gpt-image-2.5-sunburst`) when capability and editing precision take priority: tightly constrained generation or edits where specific features must survive unchanged, such as a person's identity, product details, or an existing layout.
+- **Flare** (`gpt-image-2.5-flare`): everyday generation, concepts, variants, and quick edits.
+- **Sunburst** (`gpt-image-2.5-sunburst`): tightly constrained generation or precision edits preserving identity, product details, or layout.
 
-Both models generate and edit; select by the brief, not merely whether inputs are attached. Pass the selected `--model` on every call; there is no default model. Express output requirements in the prompt; the helper sends explicit automatic background, quality, and size settings.
+Both models generate and edit; choose by the brief, not attachment presence. Express output requirements in the prompt and pass the selected model:
 
 ```bash
 node <skill-directory>/scripts/imagegen.mjs \
@@ -44,22 +44,22 @@ node <skill-directory>/scripts/imagegen.mjs \
   --prompt "<complete brief>"
 ```
 
-Run one call per image with at least 180 seconds allowed. For long prompts, use `--prompt-file <absolute-path>` instead. Attach inputs with repeated `--input <absolute-image-path>` flags in prompt order; mentioning a filename does not attach it.
+Run one call per image, allowing at least 180 seconds. Use `--prompt-file` for long briefs and repeated `--input` flags for attachments in prompt order; filenames in a prompt do not attach images.
 
-On authentication failure, ask the user to run `/login`. Report helper errors and request IDs without switching models or runners. Stop on quota or moderation errors; repeated unchanged requests are not refinements.
+On helper errors, report the error and any request ID rather than switching models or runners. Ask the user to run `/login` for authentication failures. Stop on quota or moderation errors.
 
 ## 3. Inspect and refine
 
-Open every output with `read` and check it against the full prompt, including exact text, preserved features, and any reference-specific checks.
+Open every output with `read`. Check the full brief, exact text, preserved features, and applicable reference checks.
 
-For a visible miss, rerun with a targeted correction, the complete brief, and all preserved features. When refining an output, attach it as the edit target and identify any retained references; compare against original inputs for drift.
+For a visible miss, attach the output as the edit target and rerun with a targeted correction plus the complete brief. Identify retained references and compare with original inputs for drift.
 
-Stop when the image passes or the same requirement fails in two consecutive inspected outputs. Report persistent defects as limitations. A helper error is not an inspected attempt; report it directly.
+Stop when the image passes or the same requirement fails in two consecutive inspected outputs. Report persistent defects as limitations; helper errors are not inspected attempts.
 
 ## 4. Deliver
 
-Use the helper's returned path as the source. Copy selected images to the requested destination; for project use, keep them inside the workspace and update their consumers. Preview-only images may stay at the helper path.
+Copy selected images from the helper's returned paths to the requested destination. For project use, keep them in the workspace and update their consumers; previews may stay at the helper path.
 
-Preserve originals. If a destination exists, use a versioned filename unless replacement is authorized. Verify copied files and updated project references resolve.
+Preserve originals and version existing destinations unless replacement is authorized. Verify copied files and updated project references resolve.
 
-Return final image paths and any limitations or failures. Include prompts or model details when requested. Finish only when every requested image is delivered and inspected, or explicitly reported as unsuccessful.
+Return final paths and any limitations or failures; include prompts or model details when requested. Finish when every requested image is inspected and delivered, or explicitly reported as unsuccessful.
