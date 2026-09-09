@@ -1,19 +1,28 @@
-# Transparent images
+# Transparency
 
-Request genuine transparency directly through `imagegen.mjs`, keeping its tested `background=auto` request shape. Preserve the returned PNG and its alpha channel.
+Use these rules inside the main render loop when a bitmap needs a transparent background. Request alpha through the helper's existing request shape and preserve the returned PNG's alpha channel.
 
-1. **Render.** Include the transparency brief below with the complete subject requirements and edit invariants. Use the model selected under `SKILL.md`. Complete when the helper returns an image path or a concrete error.
-2. **Validate.** Inspect the file's alpha channel with an image inspection tool: verify fully transparent background pixels, transparent corners where the composition leaves them empty, and appropriately opaque subject regions. Open the image with `read` and inspect subject coverage, holes, fine edges, halos, and stray speckles. A painted checkerboard or plain background is not transparency. Complete when both alpha inspection and visual inspection pass, or a specific defect is identified.
-3. **Refine.** For a defect, request a targeted correction through the same helper while preserving the complete brief and invariants. Follow the render loop's retry bound in `SKILL.md`; report persistent failure rather than switching to local background removal. Complete when the result passes validation or the limitation is reported.
+## Brief
 
-## Transparency brief
+Add the following requirements to the subject brief:
 
 ```text
-Render the requested subject isolated on a genuinely transparent background with an alpha channel.
-Keep the subject intact with clean edges and generous transparent padding.
-Preserve appropriate opacity within the subject and transparency through open spaces.
-No backdrop, floor plane, cast shadow, checkerboard pattern, edge halo, or stray pixels.
-No watermark or text unless explicitly requested.
+Isolate the subject on a genuinely transparent background with an alpha channel.
+Keep the complete silhouette inside the canvas with generous transparent padding.
+Keep solid subject regions opaque and open spaces transparent, with clean fine edges.
+The background is empty: no backdrop, floor plane, painted checkerboard, or cast shadow.
+Edges are free of halos and stray pixels. Include text only where the brief requests it.
 ```
 
-For edits, explicitly preserve identity, geometry, colors, and label text. For translucent subjects or requested shadows, adapt the opacity and shadow requirements to the brief rather than forcing those regions opaque or removing them.
+For extraction, name the identity, geometry, colors, and label text to preserve. Adapt opacity requirements for translucent materials and shadow requirements for requested shadows; those features belong to the subject brief.
+
+## Acceptance
+
+Perform both checks on every candidate selected for transparent delivery:
+
+1. **Alpha inspection.** Use an available image inspection tool to examine channel values, not just metadata. Verify fully transparent background pixels, transparent corners where empty, and appropriate opacity within the subject. Channel presence alone is insufficient: an alpha channel can be opaque everywhere.
+2. **Visual inspection.** Open with `read` and check the complete subject, open spaces, hair or other fine edges, halos, and stray speckles. If the viewer obscures edge defects, inspect previews composited over contrasting light and dark backgrounds while preserving the original PNG.
+
+**Pass:** actual alpha values and visible edges both satisfy the brief. A painted checkerboard or solid backdrop fails, even if it looks like a cutout. If channel inspection is unavailable, report transparency as unverified.
+
+For a defect, return its specific correction to the main loop and use that loop's retry bound. Keep extraction generative through the helper; do not substitute local background removal. Report persistent alpha defects as limitations rather than claiming transparent delivery.

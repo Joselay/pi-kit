@@ -1,78 +1,69 @@
-# Prompting best practices
+# Prompting
 
-Before each helper call, choose the matching generate/edit slug under **Use-case tips** and write a creative brief using only useful fields:
+Use the sections matching the asset. These are prompt-writing cues, not helper options or extra acceptance requirements.
+
+## Creative brief
+
+Use only fields that affect the result:
 
 ```text
-Use case: <taxonomy slug>
-Asset type: <where the asset will be used>
-Primary request: <user's main prompt>
-Input images: <Image 1: role; Image 2: role>
-Scene/backdrop: <environment>
-Subject: <main subject>
-Style/medium: <photo/illustration/3D/etc>
-Composition/framing: <wide/close/top-down; placement>
-Lighting/mood: <lighting + mood>
-Color palette: <palette notes>
-Materials/textures: <surface details>
-Text (verbatim): "<exact text>"
-Constraints: <required state and hard exclusions>
+Asset: <intended use>
+Request: <subject and requested result>
+Inputs: <Image 1: role; Image 2: role, in attachment order>
+Scene: <setting and relevant objects>
+Style: <medium, materials, lighting, palette>
+Composition: <framing, viewpoint, hierarchy, usable negative space>
+Text (verbatim): "<literal copy>"
+Change: <specific edit>
+Preserve: <edit invariants>
+Constraints: <other required visible states or hard exclusions>
 ```
 
-`Asset type`, `Input images`, and `Scene/backdrop` are prompt fields, not helper flags. Ask only when a missing critical detail blocks success.
+Prefer the desired visible state: `unretouched skin texture`, `plain white backdrop`, `only the supplied labels`. Use exclusions when they define an exact failure boundary. Examples illustrate structure; their scene details are not defaults.
 
-## Specificity policy
-- If the user prompt is already specific and detailed, normalize it into a clean spec without adding creative requirements.
-- If the prompt is generic, you may add tasteful detail when it materially improves the output.
-- Treat examples in `sample-prompts.md` as fully-authored recipes, not as the default amount of augmentation to add to every request.
-- For photorealism, include `photorealistic` directly when that is the goal, plus concrete real-world texture such as pores, wrinkles, fabric wear, material grain, or imperfect everyday detail.
+## Photography and products
 
-## Prompt augmentation
+Say `photorealistic` when that is the target. Describe plausible capture conditions: viewpoint, framing, lighting, and focus. Ground realism in relevant texture—skin pores, fabric wear, wood grain—rather than generic claims of quality.
 
-For generic prompts, add only:
-- composition and framing cues
-- intended-use or polish-level hints
-- practical layout guidance
-- reasonable scene concreteness that supports the request
+For people, specify body framing, scale, gaze, and object interaction when acceptance depends on them. For products, specify materials, silhouette, packaging, and label readability. Add studio polish only when the intended use calls for it.
 
-Keep the brief faithful to the request: its cast, props, brand language, story, and directional placement come from the user or surrounding layout. Phrase constraints as the desired visible state; add a hard exclusion when the unwanted element is an exact failure boundary.
+## Exact text
 
-Additions requiring explicit support:
-- extra characters, props, or objects that are not implied
-- brand palettes, slogans, or story beats that are not implied
-- arbitrary side-specific placement unless the surrounding layout supports it
+Quote each literal string and specify typography, placement, and hierarchy. Require verbatim rendering with only the requested copy; spell uncommon words letter-by-letter when useful.
 
-## Composition and layout
-- Specify framing and viewpoint (close-up, wide, top-down) and placement only when it materially helps.
-- Call out negative space if the asset clearly needs room for UI or copy.
-- Avoid making left/right layout decisions unless the user or surrounding layout supports them.
-- For people, describe body framing, scale, gaze, and object interactions when they matter (`full body visible`, `looking down at the book`, `hands naturally gripping the handlebars`).
+Dense labels, legends, axes, and footnotes need explicit readability and spacing. Provide real labels and data for charts or slides; request missing data when it blocks correctness rather than inventing facts. Visual inspection must check every required string, not merely the overall layout.
 
-## Text in images
-- Put literal text in quotes or ALL CAPS and specify typography (font style, size, color, placement).
-- Spell uncommon words letter-by-letter if accuracy matters.
-- For in-image copy, require verbatim rendering and no extra characters.
-- For small text, dense infographics, data-heavy slides, multi-font layouts, legends, axes, and footnotes, make readable typography and hierarchy especially explicit.
+For localization, map each source string to its replacement. Preserve imagery, layout, typography, spacing, and hierarchy; allow reflow only where the replacement requires it.
 
-## Use-case tips
-Generate:
-- photorealistic-natural: Prompt as if a real photo is captured in the moment; use photography language (lens, lighting, framing); call for real texture; avoid over-stylized polish unless requested.
-- product-mockup: Describe the product/packaging and materials; ensure clean silhouette and label clarity; if in-image text is needed, require verbatim rendering and specify typography.
-- ui-mockup: Describe the target fidelity first (shippable mockup or low-fi wireframe), then focus on layout, hierarchy, and practical UI elements; avoid concept-art language.
-- infographic-diagram: Define the audience and layout flow; label parts explicitly; require verbatim text; make dense labels and hierarchy explicit.
-- logo-brand: Keep it simple and scalable; ask for a strong silhouette and balanced negative space; avoid decorative flourishes unless requested.
-- ads-marketing: Write like a creative brief; include brand positioning, audience, desired vibe, scene, and exact tagline if text must appear.
-- productivity-visual: Name the exact artifact (slide, chart, workflow diagram), define the canvas and hierarchy, provide real labels/data, and ask for readable typography and polished spacing.
-- scientific-educational: Define audience, lesson objective, required labels, scientific constraints, arrows, and scan-friendly whitespace.
-- illustration-story: Define panels or scene beats; keep each action concrete.
-- stylized-concept: Specify style cues, material finish, and rendering approach (3D, painterly, clay) without inventing new story elements.
-- historical-scene: State the location/date and required period accuracy; constrain clothing, props, and environment to match the era.
+## Layout and domain cues
 
-Edit:
-- text-localization: Change only the text; preserve layout, typography, spacing, and hierarchy; no extra words or reflow unless needed.
-- identity-preserve: Lock identity (face, body, pose, hair, expression); change only the specified elements; match lighting and shadows.
-- precise-object-edit: Specify exactly what to remove/replace; preserve surrounding texture and lighting; keep everything else unchanged.
-- lighting-weather: Change only environmental conditions (light, shadows, atmosphere, precipitation); keep geometry, framing, and subject identity.
-- background-extraction: Request a clean cutout with genuine alpha transparency per `transparency.md`; crisp silhouette; generous padding; preserve label text exactly; no restyling.
-- style-transfer: Specify style cues to preserve (palette, texture, brushwork) and what must change; add `no extra elements` to prevent drift.
-- compositing: Reference inputs by index; specify what moves where; match lighting, perspective, and scale; keep the base framing unchanged.
-- sketch-to-render: Preserve layout, proportions, and perspective; choose materials and lighting that support the supplied sketch without adding new elements.
+| Asset | Brief must resolve |
+| --- | --- |
+| UI mockup or wireframe | Fidelity first, then device, sections, hierarchy, controls, and labels. Distinguish a low-fi sketch from a polished raster mockup. |
+| Infographic or workflow | Audience, reading order, labeled parts, and the meaning and direction of connections. |
+| Slide or chart | Canvas, supplied data, visual hierarchy, readable labels, and spacing. |
+| Scientific illustration | Audience, lesson objective, accurate relationships, required labels, and arrow meanings. |
+| Historical scene | Place, date, and period constraints on clothing, objects, and environment. |
+| Advertisement | Supplied brand positioning, audience, mood, and exact copy. |
+| Raster logo concept | Strong silhouette, balanced negative space, and simplicity at small sizes. A vector-like style still yields a bitmap. |
+| Story illustration | Concrete action in each scene or panel and a clear reading order. |
+| Stylized concept | Rendering medium, palette, surface finish, and lighting; keep story elements grounded in the request. |
+
+For website assets, reserve space for copy or UI where the surrounding layout requires it. Choose left/right placement from that layout, not habit.
+
+## Inputs and invariants
+
+Distinguish an **anchor** (features to retain) from a **reference** (features to borrow). Name each image's role and which of its properties matter; a style reference need not contribute its subject or composition.
+
+| Operation | State the change and lock the unaffected properties |
+| --- | --- |
+| Identity-preserving edit | Preserve facial features, body proportions, and other identity cues. Lock pose, hair, expression, and clothing only where the requested change leaves them invariant. |
+| Object replacement or removal | Identify the exact object or region. Preserve surrounding objects, texture, framing, and lighting; integrate the edit's shadows. |
+| Lighting or weather | Change environmental conditions while preserving subject identity, geometry, and camera framing. |
+| Style transfer | Identify the palette, texture, brushwork, or rendering cues to borrow and the content to retain. |
+| Compositing | Identify the base and inserted subject by index. Specify placement and reconcile perspective, scale, lighting, and shadows while retaining base framing. |
+| Sketch to render | Preserve layout, proportions, and perspective; specify materials and lighting for the rendered result. |
+| Character continuity | Attach a previous character anchor. Preserve identity, proportions, outfit, and palette unless the new scene explicitly changes them; allow the requested action and pose. |
+| Background extraction | Preserve subject identity, geometry, colors, and label text; use [Transparency](transparency.md) for the background and alpha checks. |
+
+For every edit, distinguish intentional changes from drift during inspection. A new pose cannot simultaneously be an invariant.
