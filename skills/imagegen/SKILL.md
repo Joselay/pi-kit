@@ -31,7 +31,12 @@ Read the CLI contract before the first call:
 node <skill-directory>/scripts/imagegen.mjs --help
 ```
 
-Use the documented default model unless the user requests another supported model. Pass it explicitly and retain it through refinements. Use `--help` for supported models, input limits, and request controls.
+Honor an explicit model request. Otherwise select by the task's priorities:
+
+- **Flare** (`gpt-image-2.5-flare`) for everyday image generation and speed-first work: concepts, variants, routine assets, and quick edits.
+- **Sunburst** (`gpt-image-2.5-sunburst`) when capability and editing precision take priority: tightly constrained generation or edits where specific features must survive unchanged, such as a person's identity, product details, or an existing layout.
+
+Both models generate and edit; select by the brief, not merely whether inputs are attached. Pass the selected `--model` on every call; there is no default model. Express output requirements in the prompt and leave output settings to the image model.
 
 ```bash
 node <skill-directory>/scripts/imagegen.mjs \

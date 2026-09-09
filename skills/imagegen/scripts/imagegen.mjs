@@ -7,8 +7,7 @@ import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const PROVIDER_ID = "openai-codex";
-const DEFAULT_IMAGE_MODEL = "gpt-image-2.5-flare";
-const IMAGE_MODELS = [DEFAULT_IMAGE_MODEL, "gpt-image-2.5-sunburst"];
+const IMAGE_MODELS = ["gpt-image-2.5-flare", "gpt-image-2.5-sunburst"];
 const MAX_EDIT_IMAGES = 5;
 const MAX_REQUEST_RETRIES = 4;
 const RETRY_BASE_DELAY_MS = 200;
@@ -20,13 +19,12 @@ function usage() {
   imagegen.mjs --model <model> --prompt <text> --input <image> [--input <image> ...]
 
 Options:
-  --model <model> Required: ${IMAGE_MODELS.join(" or ")}
-                  Default choice: ${DEFAULT_IMAGE_MODEL}; pass it explicitly
+  --model <model> Required: ${IMAGE_MODELS.join(" or ")}; no default
   --input <path>  Edit/use a source image; repeat up to ${MAX_EDIT_IMAGES} times
   --help          Show this help
 
-Requests use the selected model, background auto, quality auto, size auto,
-and one result. The selected model is printed to stderr before the request.
+Requests send only the model, prompt, and any input images.
+Describe the desired output in the prompt; output controls use API defaults.
 The image is saved under ~/.pi/generated_images/ with a unique name and the
 path is printed.`);
 }
@@ -171,7 +169,7 @@ async function responseError(response) {
 const args = parseArgs(process.argv.slice(2));
 
 try {
-  if (!args.model) fail(`provide --model explicitly (default choice: ${DEFAULT_IMAGE_MODEL})`);
+  if (args.model === undefined) fail("provide --model; choose the model that best fits the task");
   if (!IMAGE_MODELS.includes(args.model)) fail(`--model must be ${IMAGE_MODELS.join(" or ")}`);
   if (Boolean(args.prompt) === Boolean(args.promptFile)) {
     fail("provide exactly one of --prompt or --prompt-file");
@@ -184,15 +182,11 @@ try {
   const editing = args.inputs.length > 0;
   const images = editing ? await Promise.all(args.inputs.map(imageDataUrl)) : undefined;
 
-  console.error(`imagegen: model=${args.model}`);
   const { token, baseUrl } = await resolveOAuth();
   const requestBody = {
     ...(editing ? { images } : {}),
     model: args.model,
     prompt,
-    background: "auto",
-    quality: "auto",
-    size: "auto",
   };
 
   const response = await fetchWithRetries(endpointFor(baseUrl, editing), {

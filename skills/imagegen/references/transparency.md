@@ -1,6 +1,6 @@
 # Transparency
 
-Use these rules inside the main render loop when a bitmap needs a transparent background. Request alpha through the helper's existing request shape and preserve the returned PNG's alpha channel.
+Use these rules inside the main render loop when a bitmap needs a transparent background. Request transparency in the prompt on every render and refinement; verify actual alpha before delivery.
 
 ## Brief
 
