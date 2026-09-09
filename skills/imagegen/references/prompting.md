@@ -51,6 +51,17 @@ For localization, map each source string to its replacement. Preserve imagery, l
 
 For website assets, reserve space for copy or UI where the surrounding layout requires it. Choose left/right placement from that layout, not habit.
 
+For multi-screen flows, generate each screen separately unless the request calls for one overview image.
+
+## Game assets
+
+Match the game's rendering style and check the cues relevant to the asset:
+
+- **Environment:** focal point and camera perspective.
+- **Character:** body coverage, silhouette, equipment, and continuity with attached anchors.
+- **Icon or sprite:** clarity at display size, padding, and [verified transparency](transparency.md) when alpha is required.
+- **Tileable texture:** consistent scale and lighting; inspect a repeated-grid preview for seams and distracting repetition.
+
 ## Inputs and invariants
 
 Distinguish an **anchor** (features to retain) from a **reference** (features to borrow). Name each image's role and which of its properties matter; a style reference need not contribute its subject or composition.
