@@ -369,11 +369,11 @@ Constraints: preserve subject identity, geometry, camera angle, and composition;
 Use case: background-extraction
 Input images: Image 1: product photo
 Primary request: isolate the product on a clean transparent background
-Scene/backdrop: perfectly flat solid #00ff00 chroma-key background for local background removal
-Constraints: background must be one uniform color with no shadows, gradients, texture, reflections, floor plane, or lighting variation; crisp silhouette; generous padding; no halos or fringing; preserve label text exactly; no restyling; do not use #00ff00 anywhere in the subject
+Scene/backdrop: genuinely transparent background with an alpha channel
+Constraints: no backdrop, floor plane, cast shadows, or checkerboard pattern; crisp silhouette; generous padding; no halos or fringing; preserve label text exactly; no restyling
 ```
 
-Post-process note: after generation, follow `transparency.md` to convert the key color to alpha locally.
+Validation: follow `transparency.md` to verify the returned alpha and inspect edges.
 
 ### style-transfer
 ```

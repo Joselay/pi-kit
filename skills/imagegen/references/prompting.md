@@ -72,7 +72,7 @@ Edit:
 - identity-preserve: Lock identity (face, body, pose, hair, expression); change only the specified elements; match lighting and shadows.
 - precise-object-edit: Specify exactly what to remove/replace; preserve surrounding texture and lighting; keep everything else unchanged.
 - lighting-weather: Change only environmental conditions (light, shadows, atmosphere, precipitation); keep geometry, framing, and subject identity.
-- background-extraction: Request a clean cutout on a perfectly flat chroma-key background per `transparency.md`; crisp silhouette; generous padding; preserve label text exactly; no restyling.
+- background-extraction: Request a clean cutout with genuine alpha transparency per `transparency.md`; crisp silhouette; generous padding; preserve label text exactly; no restyling.
 - style-transfer: Specify style cues to preserve (palette, texture, brushwork) and what must change; add `no extra elements` to prevent drift.
 - compositing: Reference inputs by index; specify what moves where; match lighting, perspective, and scale; keep the base framing unchanged.
 - sketch-to-render: Preserve layout, proportions, and perspective; choose materials and lighting that support the supplied sketch without adding new elements.

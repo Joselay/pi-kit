@@ -1,29 +1,19 @@
 # Transparent images
 
-The helper fixes `background=auto` and exposes no explicit native-transparency control. Generate a chroma-key source image, then convert the key color to alpha locally.
+Request genuine transparency directly through `imagegen.mjs`, keeping its tested `background=auto` request shape. Preserve the returned PNG and its alpha channel.
 
-1. Generate the subject on a perfectly flat solid chroma-key background. Default key `#00ff00`; use `#ff00ff` for green subjects and avoid `#0000ff` for blue subjects.
-2. Remove the background locally, writing the alpha result to a new name under `~/.pi/generated_images/`:
-   ```bash
-   uv run --with Pillow <skill-directory>/scripts/remove_chroma_key.py \
-     --input <source> \
-     --out <final.png> \
-     --auto-key border \
-     --soft-matte \
-     --transparent-threshold 12 \
-     --opaque-threshold 220 \
-     --despill
-   ```
-3. Validate with `read`: alpha channel present, transparent corners, plausible subject coverage, no key-color fringe. If a thin fringe remains, retry once with `--edge-contract 1`; add `--edge-feather 0.25` only when the edge is visibly stair-stepped and the subject is not shiny or reflective.
+1. **Render.** Include the transparency brief below with the complete subject requirements and edit invariants. Use the model selected under `SKILL.md`. Complete when the helper returns an image path or a concrete error.
+2. **Validate.** Inspect the file's alpha channel with an image inspection tool: verify fully transparent background pixels, transparent corners where the composition leaves them empty, and appropriately opaque subject regions. Open the image with `read` and inspect subject coverage, holes, fine edges, halos, and stray speckles. A painted checkerboard or plain background is not transparency. Complete when both alpha inspection and visual inspection pass, or a specific defect is identified.
+3. **Refine.** For a defect, request a targeted correction through the same helper while preserving the complete brief and invariants. Follow the render loop's retry bound in `SKILL.md`; report persistent failure rather than switching to local background removal. Complete when the result passes validation or the limitation is reported.
 
-Prompt transparent requests like this:
+## Transparency brief
 
 ```text
-Create the requested subject on a perfectly flat solid #00ff00 chroma-key background for background removal.
-The background must be one uniform color with no shadows, gradients, texture, reflections, floor plane, or lighting variation.
-Keep the subject fully separated from the background with crisp edges and generous padding.
-Do not use #00ff00 anywhere in the subject.
-No cast shadow, no contact shadow, no reflection, no watermark, and no text unless explicitly requested.
+Render the requested subject isolated on a genuinely transparent background with an alpha channel.
+Keep the subject intact with clean edges and generous transparent padding.
+Preserve appropriate opacity within the subject and transparency through open spaces.
+No backdrop, floor plane, cast shadow, checkerboard pattern, edge halo, or stray pixels.
+No watermark or text unless explicitly requested.
 ```
 
-Chroma keying may be imperfect for hair, fur, feathers, smoke, glass, liquids, translucent or reflective materials, soft shadows, realistic product grounding, or subject colors that conflict with practical key colors. Explain the limitation when it applies.
+For edits, explicitly preserve identity, geometry, colors, and label text. For translucent subjects or requested shadows, adapt the opacity and shadow requirements to the brief rather than forcing those regions opaque or removing them.
