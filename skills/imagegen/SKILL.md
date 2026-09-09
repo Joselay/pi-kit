@@ -11,7 +11,8 @@ Use `scripts/imagegen.mjs` for every generative raster operation. Work as a rend
 ## Guardrails
 
 - Use OAuth. When authentication fails, ask the user to run `/login`; keep authentication storage untouched and undisclosed. The supported recovery path is `/login`, rather than API keys, alternate providers, or one-off SDK runners.
-- Keep the helper's fixed request shape: `gpt-image-2`; `background`, `quality`, and `size` set to `auto`; one result; at most five high-fidelity inputs. Explain requests these controls cannot satisfy.
+- Always pass `--model` explicitly: choose `gpt-image-2.5-flare` by default and `gpt-image-2.5-sunburst` when the user requests it. Keep that choice across refinements and report it with the final paths. If the OAuth endpoint rejects the model, report the error rather than switching models.
+- Keep the helper's fixed request shape: `background`, `quality`, and `size` set to `auto`; one result; at most five inputs. Explain requests these controls cannot satisfy.
 - Use `imagegen.mjs` for generative work. Use Python only for local post-processing, running the supplied helper with `uv run --with Pillow`.
 - Render each requested asset and variant with its own call and tailored brief.
 - Deliver bitmap files. Build repo-native SVG/vector, existing-system icons or logos, and HTML/CSS/canvas visuals in native code instead.
@@ -36,13 +37,14 @@ Use `scripts/imagegen.mjs` for every generative raster operation. Work as a rend
 Generate:
 
 ```bash
-node <skill-directory>/scripts/imagegen.mjs --prompt "<complete prompt>"
+node <skill-directory>/scripts/imagegen.mjs --model gpt-image-2.5-flare --prompt "<complete prompt>"
 ```
 
 Edit or use references:
 
 ```bash
 node <skill-directory>/scripts/imagegen.mjs \
+  --model gpt-image-2.5-flare \
   --prompt "<complete prompt with indexed roles and invariants>" \
   --input "<absolute-image-1>" \
   --input "<absolute-image-2>"
