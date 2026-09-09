@@ -43,7 +43,7 @@ Match the game's rendering style, then resolve:
 
 ## Inputs and invariants
 
-An **anchor** supplies features to retain; a **reference** supplies features to borrow. Specify which properties matter: a style reference need not contribute its subject or composition. Preserve only properties unaffected by the requested change—a new pose cannot also be an invariant.
+An **invariant** is a feature that must survive the edit. State invariants explicitly and carry them into each refinement. An **anchor** supplies features to retain; a **reference** supplies features to borrow. Specify which properties matter: a style reference need not contribute its subject or composition. Preserve only properties unaffected by the requested change—a new pose cannot also be an invariant.
 
 | Operation | Edit-specific cues |
 | --- | --- |
