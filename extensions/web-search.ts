@@ -17,7 +17,7 @@ import {
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { Container, Spacer, Text } from "@earendil-works/pi-tui";
+import { Container, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
 
@@ -803,6 +803,7 @@ interface WebSearchRenderState {
 	status?: "complete" | "error";
 	sourceCount?: number;
 	error?: string;
+	hasResultBranch?: boolean;
 }
 
 const WEB_SEARCH_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
@@ -922,7 +923,6 @@ function textOutput(content: Array<{ type: string; text?: string }>): string {
 }
 
 function renderCallText(
-	args: SearchCommands,
 	state: WebSearchRenderState,
 	theme: Theme,
 	pendingFrame: string = WEB_SEARCH_SPINNER_FRAMES[0],
@@ -933,8 +933,9 @@ function renderCallText(
 			: state.status === "error"
 				? theme.fg("error", "✗")
 				: theme.fg("accent", pendingFrame);
-	const description =
-		state.status === "error" ? "Search failed" : describeSearchCall(args, state.status === "complete");
+	const description = state.status === "error"
+		? "Search failed"
+		: state.status === "complete" ? "Searched web" : "Searching web";
 	const renderedDescription = state.status
 		? theme.fg("toolTitle", theme.bold(description))
 		: theme.fg("muted", description);
@@ -942,13 +943,67 @@ function renderCallText(
 	if (state.status === "complete" && state.sourceCount) {
 		text += theme.fg("dim", ` · ${state.sourceCount} source${state.sourceCount === 1 ? "" : "s"}`);
 	}
-	if (state.status === "error" && state.error) {
-		text += theme.fg("error", ` · ${compactText(state.error, 72)}`);
-	}
 	return text;
 }
 
-class WebSearchCallComponent extends Text {
+function operationLabels(args: SearchCommands): string[] {
+	const labels: string[] = [];
+	// Arguments may still be streaming: tolerate missing fields and partial arrays.
+	const add = <T>(items: T[] | undefined, label: (item: T) => string): void => {
+		if (Array.isArray(items)) {
+			for (const item of items) {
+				if (item && typeof item === "object") labels.push(compactText(label(item), 240));
+			}
+		}
+	};
+	add(args.search_query, (item) => `Search “${item.q ?? ""}”`);
+	add(args.image_query, (item) => `Images “${item.q ?? ""}”`);
+	add(args.open, (item) => `Open ${item.ref_id ?? ""}${item.lineno !== undefined ? ` · line ${item.lineno}` : ""}`);
+	add(args.click, (item) => `Click ${item.ref_id ?? ""} · link ${item.id ?? "…"}`);
+	add(args.find, (item) => `Find “${item.pattern ?? ""}” in ${item.ref_id ?? ""}`);
+	add(args.screenshot, (item) => `Screenshot ${item.ref_id ?? ""} · page ${item.pageno ?? "…"} (zero-based)`);
+	add(args.finance, (item) => `Finance ${item.ticker ?? ""}${item.market ? ` · ${item.market}` : ""}`);
+	add(args.weather, (item) => `Weather ${item.location ?? ""}${item.start ? ` · ${item.start}` : ""}`);
+	add(args.sports, (item) => `Sports ${item.league ?? ""} ${item.fn ?? ""}${item.team ? ` · ${item.team}` : ""}${item.opponent ? ` vs ${item.opponent}` : ""}`);
+	add(args.time, (item) => `Time UTC${item.utc_offset ?? ""}`);
+	return labels;
+}
+
+interface TreeRow {
+	text: string;
+	prefix: string;
+	continuation: string;
+	color: "toolOutput" | "error" | "warning";
+}
+
+function branchRow(text: string, last: boolean, indent = "", color: TreeRow["color"] = "toolOutput"): TreeRow {
+	return { text, prefix: `${indent}${last ? "└─ " : "├─ "}`, continuation: `${indent}${last ? "   " : "│  "}`, color };
+}
+
+class SearchTreeComponent {
+	constructor(protected rows: TreeRow[] = [], protected treeTheme?: Theme) {}
+
+	invalidate(): void {}
+
+	render(width: number): string[] {
+		if (width <= 0 || !this.treeTheme) return [];
+		const theme = this.treeTheme;
+		return this.rows.flatMap((row) => {
+			const available = width - Math.max(visibleWidth(row.prefix), visibleWidth(row.continuation));
+			if (available <= 0) {
+				return [truncateToWidth(theme.fg("dim", row.prefix) + theme.fg(row.color, row.text), width, "")];
+			}
+			return wrapTextWithAnsi(row.text, available).map((line, index) =>
+				truncateToWidth(
+					theme.fg("dim", index === 0 ? row.prefix : row.continuation) + theme.fg(row.color, line),
+					width,
+				),
+			);
+		});
+	}
+}
+
+class WebSearchCallComponent extends SearchTreeComponent {
 	private readonly frames = [...WEB_SEARCH_SPINNER_FRAMES];
 	private readonly intervalMs = WEB_SEARCH_SPINNER_INTERVAL_MS;
 	private currentFrame = 0;
@@ -959,7 +1014,7 @@ class WebSearchCallComponent extends Text {
 	private invalidateRow: () => void = () => {};
 
 	constructor() {
-		super("", 0, 0);
+		super();
 	}
 
 	update(args: SearchCommands, state: WebSearchRenderState, theme: Theme, invalidateRow: () => void): void {
@@ -1000,7 +1055,14 @@ class WebSearchCallComponent extends Text {
 	private updateDisplay(): void {
 		if (!this.theme) return;
 		const frame = this.frames[this.currentFrame] ?? "";
-		this.setText(renderCallText(this.args, this.state, this.theme, frame));
+		this.treeTheme = this.theme;
+		const labels = operationLabels(this.args);
+		this.rows = [
+			{ text: renderCallText(this.state, this.theme, frame), prefix: "", continuation: "  ", color: "toolOutput" },
+			...labels.map((label, index) =>
+				branchRow(label, index === labels.length - 1 && !this.state.hasResultBranch),
+			),
+		];
 	}
 }
 
@@ -1150,6 +1212,7 @@ export default function (pi: ExtensionAPI) {
 		renderResult(result, { expanded, isPartial }, theme, context) {
 			const component = (context.lastComponent as Container | undefined) ?? new Container();
 			component.clear();
+			context.state.hasResultBranch = false;
 			if (isPartial) {
 				context.state.status = undefined;
 				context.state.sourceCount = undefined;
@@ -1162,32 +1225,40 @@ export default function (pi: ExtensionAPI) {
 			if (context.isError) {
 				context.state.status = "error";
 				context.state.error = output || "Web search failed";
+				context.state.hasResultBranch = true;
 				context.state.callComponent?.update(context.args, context.state, theme, context.invalidate);
 				if (context.state.callComponent) activeCalls.delete(context.state.callComponent);
-				if (expanded && output) {
-					component.addChild(new Spacer(1));
-					component.addChild(new Text(theme.fg("error", expandedPreview(output)), 2, 0));
-				}
+				const error = context.state.error;
+				component.addChild(new SearchTreeComponent(
+					expanded
+						? [
+							branchRow("Error", true, "", "error"),
+							...expandedPreview(error).split("\n").map((line, index, lines) =>
+								branchRow(line, index === lines.length - 1, "   ", "error")),
+						]
+						: [branchRow(`Error: ${compactText(error, 120)}`, true, "", "error")],
+					theme,
+				));
 				return component;
 			}
 
 			context.state.status = "complete";
 			context.state.sourceCount = result.details?.sourceCount ?? 0;
 			context.state.error = undefined;
+			context.state.hasResultBranch = expanded && Boolean(output || result.details?.fullOutputPath);
 			context.state.callComponent?.update(context.args, context.state, theme, context.invalidate);
 			if (context.state.callComponent) activeCalls.delete(context.state.callComponent);
-			if (expanded && output) {
-				component.addChild(new Spacer(1));
-				component.addChild(new Text(theme.fg("toolOutput", expandedPreview(output)), 2, 0));
+			if (context.state.hasResultBranch) {
+				const lines = output ? expandedPreview(output).split("\n") : [];
+				const rows = [
+					branchRow("Output", true),
+					...lines.map((line, index) =>
+						branchRow(line, index === lines.length - 1 && !result.details?.fullOutputPath, "   ")),
+				];
 				if (result.details?.fullOutputPath) {
-					component.addChild(
-						new Text(
-							theme.fg("warning", `Full output: ${result.details.fullOutputPath}`),
-							2,
-							0,
-						),
-					);
+					rows.push(branchRow(`Full output: ${safeDisplayText(result.details.fullOutputPath)}`, true, "   ", "warning"));
 				}
+				component.addChild(new SearchTreeComponent(rows, theme));
 			}
 			return component;
 		},
