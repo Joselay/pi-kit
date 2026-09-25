@@ -155,7 +155,7 @@ interface SocketState {
 // Summarization
 // ============================================================================
 
-const CODEX_MODEL_ID = "gpt-5.6-luna";
+const CODEX_MODEL_ID = "gpt-6-luna";
 
 const SUMMARIZATION_SYSTEM_PROMPT = `You are a conversation summarizer. Create concise, accurate summaries that preserve key information, decisions, and outcomes.`;
 
@@ -169,7 +169,6 @@ const TURN_SUMMARY_PROMPT = `Summarize what happened in this conversation since 
 Be concise but comprehensive. Preserve exact file paths, function names, and error messages.`;
 
 async function selectSummarizationModel(
-	currentModel: Model<Api> | undefined,
 	modelRegistry: ModelRegistry,
 ): Promise<Model<Api> | undefined> {
 	const codexModel = modelRegistry.find("openai-codex", CODEX_MODEL_ID);
@@ -178,7 +177,7 @@ async function selectSummarizationModel(
 		if (auth.ok) return codexModel;
 	}
 
-	return currentModel;
+	throw new Error(`Required model openai-codex/${CODEX_MODEL_ID} is unavailable or unauthenticated.`);
 }
 
 // ============================================================================
@@ -644,7 +643,7 @@ async function handleCommand(
 			return;
 		}
 
-		const model = await selectSummarizationModel(ctx.model, ctx.modelRegistry);
+		const model = await selectSummarizationModel(ctx.modelRegistry);
 		if (!model) {
 			respond(false, "get_summary", undefined, "No model available for summarization");
 			return;

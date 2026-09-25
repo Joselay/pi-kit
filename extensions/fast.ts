@@ -61,13 +61,6 @@ function writeState(value: unknown): void {
 	}
 }
 
-const CODEX_FAST_MODE_MODEL_IDS = [
-	"gpt-5.6-sol",
-	"gpt-5.6-terra",
-	"gpt-5.6-luna",
-] as const;
-const CODEX_FAST_MODE_MODELS = new Set<string>(CODEX_FAST_MODE_MODEL_IDS);
-
 function isEnabledByEnv(): boolean {
 	const value = process.env.PI_CODEX_FAST_MODE?.trim().toLowerCase();
 	if (!value) return false;
@@ -98,7 +91,8 @@ function modelSupportsCodexFastMode(model: Model | undefined): boolean {
 
 	if (Array.isArray(tiers)) return false;
 
-	return CODEX_FAST_MODE_MODELS.has(model.id);
+	// Do not assume priority support when the catalog does not advertise it.
+	return false;
 }
 
 function unsupportedModelMessage(model: Model | undefined): string {

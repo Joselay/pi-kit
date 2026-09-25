@@ -51,10 +51,9 @@ Rules:
 - Return {"questions": []} when no unresolved user input is requested.
 - Emit no markdown or text outside the JSON object.`;
 
-const EXTRACTION_MODEL_ID = "gpt-5.6-luna";
+const EXTRACTION_MODEL_ID = "gpt-6-luna";
 
 async function selectExtractionModel(
-	currentModel: Model<Api>,
 	modelRegistry: ModelRegistry,
 ): Promise<Model<Api>> {
 	const model = modelRegistry.find("openai-codex", EXTRACTION_MODEL_ID);
@@ -65,7 +64,7 @@ async function selectExtractionModel(
 		}
 	}
 
-	return currentModel;
+	throw new Error(`Required model openai-codex/${EXTRACTION_MODEL_ID} is unavailable or unauthenticated.`);
 }
 
 function toExtractedQuestion(value: unknown): ExtractedQuestion | null {
@@ -480,7 +479,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const extractionModel = await selectExtractionModel(ctx.model, ctx.modelRegistry);
+			const extractionModel = await selectExtractionModel(ctx.modelRegistry);
 
 			const extractionOutcome = await ctx.ui.custom<ExtractionOutcome>((tui, theme, _kb, done) => {
 				const loader = new BorderedLoader(tui, theme, `Extracting questions using ${extractionModel.id}...`);
